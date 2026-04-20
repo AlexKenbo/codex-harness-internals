@@ -1,0 +1,909 @@
+{
+  "src": "SRC-0016",
+  "schema_version": "2.0",
+  "lens": "structural",
+  "compositions": [
+    {
+      "id": "SRC-0016/entity/tool-handler-registry",
+      "src": "SRC-0016",
+      "composition": "entity",
+      "terms": {
+        "object": "ToolHandler set (core handlers)",
+        "attributes": [
+          "ApplyPatchHandler: kind=Function, is_mutating=true, accepts Function|Custom payload",
+          "DynamicToolHandler: kind=Function, is_mutating=true, accepts Function payload",
+          "JsReplHandler: kind=Function, accepts Function|Custom payload, feature-gated by JsRepl",
+          "JsReplResetHandler: kind=Function, feature-gated by JsRepl",
+          "ListDirHandler: kind=Function, accepts Function payload",
+          "McpHandler: kind=Mcp, accepts Mcp payload",
+          "McpResourceHandler: kind=Function, accepts Function payload, dispatches by tool_name",
+          "PlanHandler: kind=Function, accepts Function payload",
+          "RequestPermissionsHandler: kind=Function, accepts Function payload",
+          "RequestUserInputHandler: kind=Function, accepts Function payload, root-thread-only",
+          "ShellHandler: kind=Function, accepts Function|LocalShell payload, is_mutating=based on is_known_safe_command",
+          "ShellCommandHandler: kind=Function, accepts Function payload, backend: Classic|ZshFork",
+          "TestSyncHandler: kind=Function, accepts Function payload",
+          "ToolSearchHandler: kind=Function, accepts ToolSearch payload",
+          "ToolSuggestHandler: kind=Function, accepts Function payload",
+          "UnavailableToolHandler: kind=Function, accepts Function payload, success=false",
+          "UnifiedExecHandler: kind=Function, accepts Function payload, is_mutating=based on is_known_safe_command, dispatches exec_command|write_stdin",
+          "ViewImageHandler: kind=Function, accepts Function payload, requires Image modality support"
+        ],
+        "relationships": [
+          {"to": "SRC-0016/entity/tool-invocation", "rel": "consumes", "card": "N:1"},
+          {"to": "SRC-0016/entity/tool-payload", "rel": "dispatches_on", "card": "N:1"}
+        ],
+        "enumerations": {
+          "ToolKind": ["Function", "Mcp"],
+          "ShellCommandBackend": ["Classic", "ZshFork"],
+          "ShellRuntimeBackend": ["Generic", "ShellCommandClassic", "ShellCommandZshFork"]
+        },
+        "data_flows": [
+          {"source": "ToolInvocation", "transform": "handler.handle()", "sink": "handler-specific Output (FunctionToolOutput | McpToolOutput | ApplyPatchToolOutput | ExecCommandToolOutput | ToolSearchOutput | ViewImageOutput | PlanToolOutput)"}
+        ],
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0016/entity/tool-invocation",
+      "src": "SRC-0016",
+      "composition": "entity",
+      "terms": {
+        "object": "ToolInvocation",
+        "attributes": [
+          "session: Arc<Session>",
+          "turn: Arc<TurnContext>",
+          "tracker: SharedTurnDiffTracker",
+          "call_id: String",
+          "tool_name: { name, namespace }",
+          "payload: ToolPayload"
+        ],
+        "relationships": [
+          {"to": "SRC-0016/entity/tool-payload", "rel": "contains", "card": "1:1"}
+        ],
+        "enumerations": null,
+        "data_flows": null,
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0016/entity/tool-payload",
+      "src": "SRC-0016",
+      "composition": "entity",
+      "terms": {
+        "object": "ToolPayload",
+        "attributes": [
+          "variant Function { arguments: String (JSON) }",
+          "variant Custom { input: String (freeform text) }",
+          "variant Mcp { server, tool, raw_arguments }",
+          "variant LocalShell { params: ShellToolCallParams }",
+          "variant ToolSearch { arguments: ToolSearchArgs }"
+        ],
+        "relationships": [],
+        "enumerations": {
+          "ToolPayload variants": ["Function", "Custom", "Mcp", "LocalShell", "ToolSearch"]
+        },
+        "data_flows": [
+          {"source": "ToolPayload::Function.arguments", "transform": "parse_arguments (serde_json::from_str)", "sink": "typed args struct"},
+          {"source": "ToolPayload::Function.arguments", "transform": "parse_arguments_with_base_path (guarded by AbsolutePathBufGuard)", "sink": "typed args struct with relative-path resolution"}
+        ],
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0016/entity/apply-patch-invocation",
+      "src": "SRC-0016",
+      "composition": "entity",
+      "terms": {
+        "object": "ApplyPatch invocation",
+        "attributes": [
+          "patch_input: String (from ApplyPatchToolArgs.input or Custom.input)",
+          "cwd: AbsolutePathBuf (from turn.cwd)",
+          "file_paths: Vec<AbsolutePathBuf> (derived via file_paths_for_action)",
+          "action: ApplyPatchAction (changes: map of path -> ApplyPatchFileChange)",
+          "effective_additional_permissions: EffectiveAdditionalPermissions",
+          "file_system_sandbox_policy: FileSystemSandboxPolicy",
+          "auto_approved: bool"
+        ],
+        "relationships": [
+          {"to": "SRC-0016/entity/effective-additional-permissions", "rel": "uses", "card": "1:1"},
+          {"to": "SRC-0016/entity/apply-patch-request", "rel": "converts_to", "card": "1:1"}
+        ],
+        "enumerations": {
+          "ApplyPatchFileChange variants (referenced)": ["Add", "Delete", "Update (with optional move_path)"],
+          "MaybeApplyPatchVerified variants": ["Body", "CorrectnessError", "ShellParseError", "NotApplyPatch"],
+          "InternalApplyPatchInvocation variants": ["Output", "DelegateToRuntime"]
+        },
+        "data_flows": [
+          {"source": "patch_input", "transform": "maybe_parse_apply_patch_verified(cwd, fs, sandbox)", "sink": "ApplyPatchAction.changes"},
+          {"source": "ApplyPatchAction.changes", "transform": "file_paths_for_action (collects paths + Update.move_path via to_abs_path)", "sink": "file_paths"},
+          {"source": "file_paths", "transform": "write_permissions_for_paths (filter paths whose parent cannot write per sandbox policy) + normalize_additional_permissions", "sink": "PermissionProfile (write-only)"},
+          {"source": "ApplyPatchAction", "transform": "convert_apply_patch_to_protocol", "sink": "protocol-level changes for emitter"}
+        ],
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0016/entity/apply-patch-request",
+      "src": "SRC-0016",
+      "composition": "entity",
+      "terms": {
+        "object": "ApplyPatchRequest (delegated to ApplyPatchRuntime)",
+        "attributes": [
+          "action: ApplyPatchAction",
+          "file_paths: Vec<AbsolutePathBuf>",
+          "changes: protocol changes",
+          "exec_approval_requirement",
+          "additional_permissions: Option<PermissionProfile>",
+          "permissions_preapproved: bool"
+        ],
+        "relationships": [
+          {"to": "SRC-0016/entity/apply-patch-invocation", "rel": "derived_from", "card": "1:1"}
+        ],
+        "enumerations": null,
+        "data_flows": [
+          {"source": "ApplyPatchRequest", "transform": "ToolOrchestrator.run(ApplyPatchRuntime)", "sink": "runtime result.output -> ApplyPatchToolOutput"}
+        ],
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0016/entity/dynamic-tool-call",
+      "src": "SRC-0016",
+      "composition": "entity",
+      "terms": {
+        "object": "Dynamic tool call (client-side tool)",
+        "attributes": [
+          "call_id: String",
+          "turn_id: String (from turn_context.sub_id)",
+          "tool: String (tool_name)",
+          "arguments: serde_json::Value",
+          "started_at: Instant",
+          "tx_response: oneshot::Sender<DynamicToolResponse> (pending entry in active turn state)"
+        ],
+        "relationships": [
+          {"to": "SRC-0016/entity/dynamic-tool-response", "rel": "awaits", "card": "1:1"}
+        ],
+        "enumerations": null,
+        "data_flows": [
+          {"source": "ToolPayload::Function.arguments", "transform": "parse_arguments -> serde_json::Value", "sink": "DynamicToolCallRequest event"},
+          {"source": "session.active_turn.turn_state", "transform": "insert_pending_dynamic_tool(call_id, tx_response)", "sink": "pending dynamic tool registry"},
+          {"source": "EventMsg::DynamicToolCallRequest", "transform": "session.send_event", "sink": "client"},
+          {"source": "rx_response (oneshot)", "transform": "await client response (or None=cancelled)", "sink": "DynamicToolResponse OR DynamicToolCallResponseEvent with error"}
+        ],
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0016/entity/dynamic-tool-response",
+      "src": "SRC-0016",
+      "composition": "entity",
+      "terms": {
+        "object": "DynamicToolResponse",
+        "attributes": [
+          "content_items: Vec<FunctionCallOutputContentItem>",
+          "success: bool",
+          "error: Option<String> (in DynamicToolCallResponseEvent when cancelled)",
+          "duration: Duration (from started_at.elapsed)"
+        ],
+        "relationships": [],
+        "enumerations": null,
+        "data_flows": [
+          {"source": "DynamicToolResponse.content_items", "transform": "map FunctionCallOutputContentItem::from + FunctionToolOutput::from_content", "sink": "FunctionToolOutput"}
+        ],
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0016/entity/js-repl-args",
+      "src": "SRC-0016",
+      "composition": "entity",
+      "terms": {
+        "object": "JsReplArgs",
+        "attributes": [
+          "code: String (raw JavaScript source)",
+          "timeout_ms: Option<u64>"
+        ],
+        "relationships": [
+          {"to": "SRC-0016/entity/js-repl-invocation", "rel": "used_by", "card": "1:1"}
+        ],
+        "enumerations": null,
+        "data_flows": [
+          {"source": "ToolPayload::Function.arguments", "transform": "parse_arguments (JSON)", "sink": "JsReplArgs"},
+          {"source": "ToolPayload::Custom.input", "transform": "parse_freeform_args (first line pragma `// codex-js-repl: timeout_ms=N` + JS body)", "sink": "JsReplArgs"},
+          {"source": "Custom.input (trimmed)", "transform": "reject_json_or_quoted_source (rejects ``` markdown fences and JSON object/string)", "sink": "validation error OR accepted code"}
+        ],
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0016/entity/js-repl-invocation",
+      "src": "SRC-0016",
+      "composition": "entity",
+      "terms": {
+        "object": "JS REPL invocation",
+        "attributes": [
+          "feature: Feature::JsRepl (must be enabled)",
+          "manager: obtained via turn.js_repl.manager()",
+          "call_id: String",
+          "started_at: Instant",
+          "result.output: String",
+          "result.content_items: Vec<FunctionCallOutputContentItem>"
+        ],
+        "relationships": [
+          {"to": "SRC-0016/entity/exec-tool-call-output", "rel": "produces", "card": "1:1"}
+        ],
+        "enumerations": null,
+        "data_flows": [
+          {"source": "js_repl manager", "transform": "manager.execute(session, turn, tracker, args)", "sink": "result (output + content_items)"},
+          {"source": "output/error + duration", "transform": "build_js_repl_exec_output (exit_code=1 if error else 0, timed_out=false)", "sink": "ExecToolCallOutput"},
+          {"source": "ExecToolCallOutput", "transform": "ToolEmitter::shell + emit Begin/Success/Failure", "sink": "ToolEventCtx events"}
+        ],
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0016/entity/exec-tool-call-output",
+      "src": "SRC-0016",
+      "composition": "entity",
+      "terms": {
+        "object": "ExecToolCallOutput (shared shape used by js_repl)",
+        "attributes": [
+          "exit_code: i32 (0 on success, 1 on error per build_js_repl_exec_output)",
+          "stdout: StreamOutput",
+          "stderr: StreamOutput",
+          "aggregated_output: StreamOutput (stdout + \\n + stderr when both present)",
+          "duration: Duration",
+          "timed_out: bool"
+        ],
+        "relationships": [],
+        "enumerations": null,
+        "data_flows": [
+          {"source": "stdout, stderr", "transform": "join_outputs (empty-safe concatenation with \\n separator)", "sink": "aggregated_output"}
+        ],
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0016/entity/list-dir-args",
+      "src": "SRC-0016",
+      "composition": "entity",
+      "terms": {
+        "object": "ListDirArgs",
+        "attributes": [
+          "dir_path: String (must be absolute path)",
+          "offset: usize (1-indexed, default 1)",
+          "limit: usize (default 25)",
+          "depth: usize (default 2)"
+        ],
+        "relationships": [
+          {"to": "SRC-0016/entity/dir-entry", "rel": "produces", "card": "1:N"}
+        ],
+        "enumerations": null,
+        "data_flows": [
+          {"source": "filesystem via tokio::fs::read_dir (BFS queue with remaining_depth)", "transform": "collect_entries -> DirEntry { name, display_name, depth, kind }; sort by name; paginate by offset/limit", "sink": "formatted text lines with indentation (2 spaces per depth) + suffix (/ @ ? empty)"}
+        ],
+        "config": {
+          "default_offset": {"value": 1, "source": "hardcoded default_offset()", "default": 1},
+          "default_limit": {"value": 25, "source": "hardcoded default_limit()", "default": 25},
+          "default_depth": {"value": 2, "source": "hardcoded default_depth()", "default": 2},
+          "MAX_ENTRY_LENGTH": {"value": 500, "source": "hardcoded const", "default": 500},
+          "INDENTATION_SPACES": {"value": 2, "source": "hardcoded const", "default": 2}
+        }
+      }
+    },
+    {
+      "id": "SRC-0016/entity/dir-entry",
+      "src": "SRC-0016",
+      "composition": "entity",
+      "terms": {
+        "object": "DirEntry",
+        "attributes": [
+          "name: String (sort key, normalized relative path, max 500 bytes at char boundary)",
+          "display_name: String (final path component, normalized, max 500 bytes)",
+          "depth: usize (prefix components count)",
+          "kind: DirEntryKind"
+        ],
+        "relationships": [],
+        "enumerations": {
+          "DirEntryKind": ["Directory", "File", "Symlink", "Other"],
+          "DirEntryKind.suffix (in format_entry_line)": ["Directory=/", "Symlink=@", "Other=?", "File=(no suffix)"]
+        },
+        "data_flows": [
+          {"source": "std::fs::FileType", "transform": "From<&FileType>: is_symlink -> Symlink, is_dir -> Directory, is_file -> File, else Other", "sink": "DirEntryKind"}
+        ],
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0016/entity/mcp-tool-invocation",
+      "src": "SRC-0016",
+      "composition": "entity",
+      "terms": {
+        "object": "MCP tool invocation (McpHandler)",
+        "attributes": [
+          "server: String",
+          "tool: String",
+          "raw_arguments: String",
+          "call_id: String",
+          "started: Instant"
+        ],
+        "relationships": [
+          {"to": "SRC-0016/entity/mcp-tool-output", "rel": "produces", "card": "1:1"}
+        ],
+        "enumerations": null,
+        "data_flows": [
+          {"source": "ToolPayload::Mcp (server, tool, raw_arguments)", "transform": "handle_mcp_tool_call(session, turn, call_id, server, tool, raw_arguments)", "sink": "result"},
+          {"source": "result + wall_time + turn.model_info", "transform": "wrap in McpToolOutput (original_image_detail_supported = can_request_original_image_detail(model_info))", "sink": "McpToolOutput"}
+        ],
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0016/entity/mcp-tool-output",
+      "src": "SRC-0016",
+      "composition": "entity",
+      "terms": {
+        "object": "McpToolOutput",
+        "attributes": [
+          "result",
+          "wall_time: Duration",
+          "original_image_detail_supported: bool"
+        ],
+        "relationships": [],
+        "enumerations": null,
+        "data_flows": null,
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0016/entity/mcp-resource-args",
+      "src": "SRC-0016",
+      "composition": "entity",
+      "terms": {
+        "object": "MCP resource arguments",
+        "attributes": [
+          "ListResourcesArgs: { server: Option<String>, cursor: Option<String> }",
+          "ListResourceTemplatesArgs: { server: Option<String>, cursor: Option<String> }",
+          "ReadResourceArgs: { server: String (required, non-empty), uri: String (required, non-empty) }"
+        ],
+        "relationships": [
+          {"to": "SRC-0016/entity/mcp-resource-payload", "rel": "produces", "card": "1:1"}
+        ],
+        "enumerations": {
+          "tool_name dispatch (McpResourceHandler)": ["list_mcp_resources", "list_mcp_resource_templates", "read_mcp_resource"]
+        },
+        "data_flows": [
+          {"source": "arguments (Option<Value>)", "transform": "parse_args_with_default (Default when None) | parse_args (error when None)", "sink": "typed args"},
+          {"source": "raw String input", "transform": "normalize_optional_string (trim; empty -> None) | normalize_required_string (error when empty)", "sink": "validated String | Option<String>"}
+        ],
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0016/entity/mcp-resource-payload",
+      "src": "SRC-0016",
+      "composition": "entity",
+      "terms": {
+        "object": "MCP resource response payloads",
+        "attributes": [
+          "ListResourcesPayload: { server: Option<String>, resources: Vec<ResourceWithServer>, next_cursor: Option<String> }",
+          "ListResourceTemplatesPayload: { server: Option<String>, resource_templates: Vec<ResourceTemplateWithServer>, next_cursor: Option<String> }",
+          "ReadResourcePayload: { server, uri, ...ReadResourceResult (flattened) }",
+          "ResourceWithServer: { server, ...Resource }",
+          "ResourceTemplateWithServer: { server, ...ResourceTemplate }"
+        ],
+        "relationships": [],
+        "enumerations": null,
+        "data_flows": [
+          {"source": "single server: session.list_resources(server, PaginatedRequestParams{cursor})", "transform": "from_single_server (attach server to each resource + propagate next_cursor)", "sink": "ListResourcesPayload"},
+          {"source": "all servers: mcp_connection_manager.list_all_resources (HashMap<server, resources>)", "transform": "from_all_servers (sort entries by server, flatten, next_cursor=None)", "sink": "ListResourcesPayload"},
+          {"source": "session.list_resource_templates(server, params) or list_all_resource_templates", "transform": "analogous to resources", "sink": "ListResourceTemplatesPayload"},
+          {"source": "session.read_resource(server, ReadResourceRequestParams{uri})", "transform": "wrap in ReadResourcePayload", "sink": "ReadResourcePayload"},
+          {"source": "payload", "transform": "serialize_function_output (serde_json::to_string) -> FunctionToolOutput::from_text(content, success=Some(true))", "sink": "FunctionToolOutput"},
+          {"source": "FunctionToolOutput.body", "transform": "function_call_output_content_items_to_text + call_tool_result_from_content", "sink": "CallToolResult for emit_tool_call_end"}
+        ],
+        "config": {
+          "default_server_for_event": {"value": "codex", "source": "hardcoded fallback in handle_list_resources/templates when server is None", "default": "codex"}
+        }
+      }
+    },
+    {
+      "id": "SRC-0016/entity/plan-update",
+      "src": "SRC-0016",
+      "composition": "entity",
+      "terms": {
+        "object": "PlanHandler / update_plan invocation",
+        "attributes": [
+          "arguments: String (UpdatePlanArgs JSON)",
+          "PLAN_UPDATED_MESSAGE: \"Plan updated\"",
+          "collaboration_mode.mode check: must not be ModeKind::Plan"
+        ],
+        "relationships": [],
+        "enumerations": {
+          "ModeKind (referenced)": ["Plan", "<other modes>"]
+        },
+        "data_flows": [
+          {"source": "ToolPayload::Function.arguments", "transform": "parse_update_plan_arguments (serde_json::from_str<UpdatePlanArgs>)", "sink": "UpdatePlanArgs"},
+          {"source": "UpdatePlanArgs", "transform": "session.send_event(EventMsg::PlanUpdate)", "sink": "client event"},
+          {"source": "PlanToolOutput", "transform": "to_response_item = FunctionCallOutputPayload::from_text(\"Plan updated\"), success=true", "sink": "ResponseInputItem::FunctionCallOutput"}
+        ],
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0016/entity/request-permissions-invocation",
+      "src": "SRC-0016",
+      "composition": "entity",
+      "terms": {
+        "object": "request_permissions invocation",
+        "attributes": [
+          "args: RequestPermissionsArgs (parsed with base_path = turn.cwd)",
+          "args.permissions: RequestPermissionProfile (normalized)",
+          "call_id"
+        ],
+        "relationships": [
+          {"to": "SRC-0016/entity/additional-permissions", "rel": "normalizes", "card": "1:1"}
+        ],
+        "enumerations": null,
+        "data_flows": [
+          {"source": "arguments + turn.cwd", "transform": "parse_arguments_with_base_path", "sink": "RequestPermissionsArgs"},
+          {"source": "args.permissions (into PermissionProfile)", "transform": "normalize_additional_permissions -> RequestPermissionProfile::from", "sink": "args.permissions"},
+          {"source": "args", "transform": "session.request_permissions(turn, call_id, args) (await; None=cancelled)", "sink": "response serialized as JSON text"}
+        ],
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0016/entity/request-user-input-invocation",
+      "src": "SRC-0016",
+      "composition": "entity",
+      "terms": {
+        "object": "request_user_input invocation",
+        "attributes": [
+          "args: RequestUserInputArgs (normalized via normalize_request_user_input_args)",
+          "call_id",
+          "default_mode_request_user_input: bool (handler config)",
+          "root-thread-only constraint: SessionSource must not be SubAgent"
+        ],
+        "relationships": [],
+        "enumerations": {
+          "SessionSource variants (referenced)": ["SubAgent(_)", "<root>"]
+        },
+        "data_flows": [
+          {"source": "turn.session_source + collaboration_mode.mode + default_mode_request_user_input", "transform": "request_user_input_unavailable_message", "sink": "Some(message)=reject | None=proceed"},
+          {"source": "arguments", "transform": "parse_arguments + normalize_request_user_input_args", "sink": "RequestUserInputArgs"},
+          {"source": "args", "transform": "session.request_user_input(turn, call_id, args) (await; None=cancelled)", "sink": "response serialized as JSON text"}
+        ],
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0016/entity/shell-invocation",
+      "src": "SRC-0016",
+      "composition": "entity",
+      "terms": {
+        "object": "Shell / ShellCommand invocation",
+        "attributes": [
+          "command: Vec<String>",
+          "cwd: AbsolutePathBuf (resolved via turn.resolve_path(params.workdir))",
+          "expiration / timeout_ms",
+          "capture_policy: ExecCapturePolicy::ShellTool",
+          "env: via create_env(turn.shell_environment_policy, thread_id)",
+          "network: turn.network",
+          "sandbox_permissions: SandboxPermissions (default if unset)",
+          "windows_sandbox_level: turn.windows_sandbox_level",
+          "windows_sandbox_private_desktop: turn.config.permissions.windows_sandbox_private_desktop",
+          "justification: Option<String>",
+          "arg0: None",
+          "prefix_rule: Option<Vec<String>>",
+          "additional_permissions: Option<PermissionProfile>",
+          "login: Option<bool> (ShellCommandHandler only)",
+          "allow_login_shell: bool (from turn.tools_config.allow_login_shell)"
+        ],
+        "relationships": [
+          {"to": "SRC-0016/entity/shell-request", "rel": "converts_to", "card": "1:1"},
+          {"to": "SRC-0016/entity/effective-additional-permissions", "rel": "uses", "card": "1:1"}
+        ],
+        "enumerations": null,
+        "data_flows": [
+          {"source": "ShellToolCallParams | ShellCommandToolCallParams", "transform": "to_exec_params (+ resolve_use_login_shell for ShellCommandHandler)", "sink": "ExecParams"},
+          {"source": "ExecParams + session.dependency_env", "transform": "extend env; collect explicit_env_overrides (union of turn.set and keys from dependency_env)", "sink": "env + explicit_env_overrides"},
+          {"source": "exec_params.command", "transform": "intercept_apply_patch (if apply_patch present, delegate to apply_patch pipeline and return early)", "sink": "Option<FunctionToolOutput>"},
+          {"source": "command + cwd + sandbox_policy + sandbox_permissions + prefix_rule + approval_policy + file_system_sandbox_policy", "transform": "exec_policy.create_exec_approval_requirement_for_command", "sink": "exec_approval_requirement"},
+          {"source": "ShellRequest", "transform": "ToolOrchestrator.run(ShellRuntime)", "sink": "result.output"},
+          {"source": "emitter begin/finish + output", "transform": "format_exec_output_str(output, turn.truncation_policy)", "sink": "post_tool_use_response (JsonValue::String)"}
+        ],
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0016/entity/shell-request",
+      "src": "SRC-0016",
+      "composition": "entity",
+      "terms": {
+        "object": "ShellRequest",
+        "attributes": [
+          "command: Vec<String>",
+          "cwd: AbsolutePathBuf",
+          "timeout_ms",
+          "env",
+          "explicit_env_overrides",
+          "network",
+          "sandbox_permissions: effective",
+          "additional_permissions: normalized",
+          "additional_permissions_preapproved: bool (unix only)",
+          "justification",
+          "exec_approval_requirement"
+        ],
+        "relationships": [],
+        "enumerations": null,
+        "data_flows": null,
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0016/entity/effective-additional-permissions",
+      "src": "SRC-0016",
+      "composition": "entity",
+      "terms": {
+        "object": "EffectiveAdditionalPermissions",
+        "attributes": [
+          "sandbox_permissions: SandboxPermissions (possibly promoted to WithAdditionalPermissions)",
+          "additional_permissions: Option<PermissionProfile> (merged session + turn + inline)",
+          "permissions_preapproved: bool (true iff intersect(effective, granted)==effective)"
+        ],
+        "relationships": [
+          {"to": "SRC-0016/entity/additional-permissions", "rel": "contains", "card": "1:1"}
+        ],
+        "enumerations": {
+          "SandboxPermissions (referenced)": ["UseDefault", "WithAdditionalPermissions", "RequireEscalated"]
+        },
+        "data_flows": [
+          {"source": "session.granted_session_permissions + granted_turn_permissions", "transform": "merge_permission_profiles", "sink": "granted_permissions"},
+          {"source": "additional_permissions + granted_permissions", "transform": "merge_permission_profiles", "sink": "effective_permissions"},
+          {"source": "effective_permissions, granted_permissions", "transform": "intersect_permission_profiles(effective, granted) == effective", "sink": "permissions_preapproved"},
+          {"source": "sandbox_permissions + effective_permissions", "transform": "if effective_permissions.is_some() && !uses_additional_permissions -> promote to WithAdditionalPermissions", "sink": "sandbox_permissions"},
+          {"source": "sandbox_permissions=RequireEscalated", "transform": "early-return bypasses session grants merge; preapproved=false", "sink": "EffectiveAdditionalPermissions"}
+        ],
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0016/entity/additional-permissions",
+      "src": "SRC-0016",
+      "composition": "entity",
+      "terms": {
+        "object": "PermissionProfile (additional permissions)",
+        "attributes": [
+          "network: Option<NetworkPermissions { enabled: Option<bool> }>",
+          "file_system: Option<FileSystemPermissions { read: Option<Vec<AbsolutePathBuf>>, write: Option<Vec<AbsolutePathBuf>> }>"
+        ],
+        "relationships": [],
+        "enumerations": null,
+        "data_flows": [
+          {"source": "additional_permissions (input)", "transform": "normalize_additional_permissions (path normalization + emptiness check)", "sink": "normalized PermissionProfile"},
+          {"source": "apply_patch: file_paths", "transform": "write_permissions_for_paths: map to parent dir, filter by can_write_path_with_cwd (keep only non-writable), dedupe via BTreeSet -> PermissionProfile{file_system: FileSystemPermissions{read: Some(vec![]), write: Some(paths)}} -> normalize_additional_permissions", "sink": "write-only PermissionProfile"},
+          {"source": "implicit_granted_permissions: uses sticky session grant", "transform": "if !uses_additional_permissions && !RequireEscalated && inline None -> use effective.additional_permissions; else None", "sink": "Option<PermissionProfile>"}
+        ],
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0016/entity/test-sync-barrier",
+      "src": "SRC-0016",
+      "composition": "entity",
+      "terms": {
+        "object": "Test sync barrier",
+        "attributes": [
+          "id: String (barrier identifier)",
+          "participants: usize (must be > 0)",
+          "timeout_ms: u64 (default 1_000, must be > 0)",
+          "barrier: Arc<tokio::sync::Barrier>",
+          "BarrierState: { barrier, participants }",
+          "global BARRIERS: OnceLock<Mutex<HashMap<String, BarrierState>>>"
+        ],
+        "relationships": [],
+        "enumerations": null,
+        "data_flows": [
+          {"source": "TestSyncArgs { sleep_before_ms, sleep_after_ms, barrier }", "transform": "parse_arguments; sleep_before_ms (if > 0) -> sleep; wait_on_barrier; sleep_after_ms (if > 0) -> sleep", "sink": "FunctionToolOutput \"ok\" success=true"},
+          {"source": "barrier_map + id", "transform": "Entry::Occupied: reuse barrier if participants match (else error \"already registered with N participants\"); Entry::Vacant: create new Barrier(participants) and insert", "sink": "Arc<Barrier>"},
+          {"source": "barrier.wait with timeout", "transform": "tokio::time::timeout(timeout_ms); on is_leader -> remove entry from barrier_map", "sink": "() | error \"timed out\""}
+        ],
+        "config": {
+          "DEFAULT_TIMEOUT_MS": {"value": 1000, "source": "hardcoded const", "default": 1000}
+        }
+      }
+    },
+    {
+      "id": "SRC-0016/entity/tool-search-index",
+      "src": "SRC-0016",
+      "composition": "entity",
+      "terms": {
+        "object": "Tool search index (BM25)",
+        "attributes": [
+          "entries: Vec<(String tool_key, ToolInfo)> sorted by tool_key",
+          "search_engine: BM25 SearchEngine<usize> (Language::English)",
+          "documents: Document<usize> built from build_search_text(name, info) at index",
+          "query: trimmed string (non-empty required)",
+          "limit: Option<usize> (default TOOL_SEARCH_DEFAULT_LIMIT, > 0)",
+          "COMPUTER_USE_MCP_SERVER_NAME: \"computer-use\"",
+          "COMPUTER_USE_TOOL_SEARCH_LIMIT: 20"
+        ],
+        "relationships": [
+          {"to": "SRC-0016/entity/tool-info-search-text", "rel": "indexes", "card": "1:N"}
+        ],
+        "enumerations": null,
+        "data_flows": [
+          {"source": "query + limit", "transform": "search_engine.search(query, limit)", "sink": "initial results (Vec<&(String, ToolInfo)>)"},
+          {"source": "results (when use_default_limit=true)", "transform": "if any result has server_name==computer-use -> re-search with COMPUTER_USE_TOOL_SEARCH_LIMIT (20); then limit_results_per_server", "sink": "capped results"},
+          {"source": "per-server counts", "transform": "limit_results_per_server: keep up to default_limit_for_server(server) (computer-use=20, else TOOL_SEARCH_DEFAULT_LIMIT)", "sink": "Vec<&(String, ToolInfo)>"},
+          {"source": "results", "transform": "collect_tool_search_output_tools(ToolSearchResultSource { server_name, tool_namespace, tool_name, tool, connector_name, connector_description })", "sink": "ToolSearchOutput.tools"}
+        ],
+        "config": {
+          "COMPUTER_USE_MCP_SERVER_NAME": {"value": "computer-use", "source": "hardcoded const", "default": "computer-use"},
+          "COMPUTER_USE_TOOL_SEARCH_LIMIT": {"value": 20, "source": "hardcoded const", "default": 20},
+          "TOOL_SEARCH_DEFAULT_LIMIT": {"value": null, "source": "imported const codex_tools::TOOL_SEARCH_DEFAULT_LIMIT", "default": null}
+        }
+      }
+    },
+    {
+      "id": "SRC-0016/entity/tool-info-search-text",
+      "src": "SRC-0016",
+      "composition": "entity",
+      "terms": {
+        "object": "Tool search-text document (per ToolInfo)",
+        "attributes": [
+          "parts: [name, callable_name, tool.name, server_name, tool.title?, tool.description?, connector_name?, connector_description?, plugin_display_names[], input_schema.properties keys[]]",
+          "joined by space"
+        ],
+        "relationships": [],
+        "enumerations": null,
+        "data_flows": [
+          {"source": "ToolInfo (+ rmcp Tool)", "transform": "build_search_text (skip empty/whitespace-only strings; include schema property names)", "sink": "BM25 document text"}
+        ],
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0016/entity/tool-suggest-invocation",
+      "src": "SRC-0016",
+      "composition": "entity",
+      "terms": {
+        "object": "Tool suggest invocation",
+        "attributes": [
+          "suggest_reason: String (trimmed, must be non-empty)",
+          "action_type: DiscoverableToolAction (must be Install)",
+          "tool_type: DiscoverableToolType (Connector | Plugin)",
+          "tool_id: String (must match a discoverable tool exposed to this client)",
+          "client name restriction: tool_type=Plugin && app_server_client_name=Some(\"codex-tui\") -> not available",
+          "request_id: RequestId::String(\"tool_suggestion_{call_id}\")"
+        ],
+        "relationships": [
+          {"to": "SRC-0016/entity/tool-suggest-result", "rel": "produces", "card": "1:1"}
+        ],
+        "enumerations": {
+          "DiscoverableToolAction (supported)": ["Install"],
+          "DiscoverableToolType": ["Connector", "Plugin"],
+          "ElicitationAction (relevant)": ["Accept", "<other>"]
+        },
+        "data_flows": [
+          {"source": "session.services.mcp_connection_manager + auth", "transform": "accessible_connectors_from_mcp_tools -> with_app_enabled_state -> list_tool_suggest_discoverable_tools_with_auth -> filter_tool_suggest_discoverable_tools_for_client", "sink": "discoverable_tools"},
+          {"source": "discoverable_tools", "transform": "find by tool_type == args.tool_type && id() == args.tool_id (error if not found)", "sink": "DiscoverableTool"},
+          {"source": "CODEX_APPS_MCP_SERVER_NAME + conversation_id + sub_id + args + suggest_reason + tool", "transform": "build_tool_suggestion_elicitation_request + session.request_mcp_server_elicitation", "sink": "response"},
+          {"source": "response.action == Accept", "transform": "user_confirmed = Some.Accept", "sink": "user_confirmed: bool"},
+          {"source": "user_confirmed", "transform": "verify_tool_suggestion_completed (Connector: refresh_missing_suggested_connectors + verified_connector_suggestion_completed; Plugin: reload_user_config_layer + verified_plugin_suggestion_completed using PluginsManager)", "sink": "completed: bool"},
+          {"source": "completed && Connector", "transform": "session.merge_connector_selection(HashSet{connector.id})", "sink": "session connector selection updated"}
+        ],
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0016/entity/tool-suggest-result",
+      "src": "SRC-0016",
+      "composition": "entity",
+      "terms": {
+        "object": "ToolSuggestResult",
+        "attributes": [
+          "completed: bool",
+          "user_confirmed: bool",
+          "tool_type: DiscoverableToolType",
+          "action_type: DiscoverableToolAction",
+          "tool_id: String",
+          "tool_name: String",
+          "suggest_reason: String"
+        ],
+        "relationships": [],
+        "enumerations": null,
+        "data_flows": [
+          {"source": "ToolSuggestResult", "transform": "serde_json::to_string -> FunctionToolOutput::from_text(content, success=Some(true))", "sink": "FunctionToolOutput"}
+        ],
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0016/entity/unavailable-tool",
+      "src": "SRC-0016",
+      "composition": "entity",
+      "terms": {
+        "object": "Unavailable tool stub",
+        "attributes": [
+          "tool_name: String (display)",
+          "message template: \"Tool `{tool_name}` is not currently available. It appeared in earlier tool calls in this conversation, but its implementation is not available in the current request. {next_step}\"",
+          "next_step (default for handler): \"Retry after the tool becomes available or ask the user to re-enable it.\"",
+          "success: Some(false)"
+        ],
+        "relationships": [],
+        "enumerations": null,
+        "data_flows": [
+          {"source": "tool_name + next_step", "transform": "unavailable_tool_message(format!)", "sink": "FunctionToolOutput::from_text(..., Some(false))"}
+        ],
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0016/entity/unified-exec-args",
+      "src": "SRC-0016",
+      "composition": "entity",
+      "terms": {
+        "object": "ExecCommandArgs / WriteStdinArgs (UnifiedExec)",
+        "attributes": [
+          "ExecCommandArgs.cmd: String",
+          "ExecCommandArgs.workdir: Option<String>",
+          "ExecCommandArgs.shell: Option<String>",
+          "ExecCommandArgs.login: Option<bool>",
+          "ExecCommandArgs.tty: bool (default false)",
+          "ExecCommandArgs.yield_time_ms: u64 (default 10_000)",
+          "ExecCommandArgs.max_output_tokens: Option<usize>",
+          "ExecCommandArgs.sandbox_permissions: SandboxPermissions",
+          "ExecCommandArgs.additional_permissions: Option<PermissionProfile>",
+          "ExecCommandArgs.justification: Option<String>",
+          "ExecCommandArgs.prefix_rule: Option<Vec<String>>",
+          "WriteStdinArgs.session_id: i32 (process_id)",
+          "WriteStdinArgs.chars: String",
+          "WriteStdinArgs.yield_time_ms: u64 (default 250)",
+          "WriteStdinArgs.max_output_tokens: Option<usize>"
+        ],
+        "relationships": [
+          {"to": "SRC-0016/entity/unified-exec-command", "rel": "produces", "card": "1:1"}
+        ],
+        "enumerations": {
+          "UnifiedExec tool_name dispatch": ["exec_command", "write_stdin"],
+          "UnifiedExecShellMode": ["Direct", "ZshFork"]
+        },
+        "data_flows": null,
+        "config": {
+          "default_exec_yield_time_ms": {"value": 10000, "source": "hardcoded default_exec_yield_time_ms()", "default": 10000},
+          "default_write_stdin_yield_time_ms": {"value": 250, "source": "hardcoded default_write_stdin_yield_time_ms()", "default": 250},
+          "default_tty": {"value": false, "source": "hardcoded default_tty()", "default": false}
+        }
+      }
+    },
+    {
+      "id": "SRC-0016/entity/unified-exec-command",
+      "src": "SRC-0016",
+      "composition": "entity",
+      "terms": {
+        "object": "UnifiedExec command resolution (get_command)",
+        "attributes": [
+          "use_login_shell: bool (rejected if login=Some(true) && !allow_login_shell; else login.unwrap_or(allow_login_shell))",
+          "UnifiedExecShellMode::Direct: model_shell from args.shell (via get_shell_by_model_provided_path, with empty shell_snapshot) OR session_shell; shell.derive_exec_args(cmd, use_login_shell)",
+          "UnifiedExecShellMode::ZshFork: vec![zsh_fork_config.shell_zsh_path, \"-lc\"|\"-c\", args.cmd]",
+          "TOOL_CALL_UNIFIED_EXEC_METRIC (OTEL counter with tty=true|false tag)"
+        ],
+        "relationships": [
+          {"to": "SRC-0016/entity/exec-command-request", "rel": "converts_to", "card": "1:1"}
+        ],
+        "enumerations": {
+          "ZshFork flag": ["-lc (login)", "-c (no login)"]
+        },
+        "data_flows": [
+          {"source": "ExecCommandArgs + shell_mode + allow_login_shell", "transform": "get_command (Direct or ZshFork path; errors if login disabled)", "sink": "Vec<String> command"},
+          {"source": "command + cwd + fs", "transform": "intercept_apply_patch (if apply_patch, release_process_id and return ExecCommandToolOutput with raw_output=text + zero wall_time)", "sink": "short-circuit result"},
+          {"source": "ExecCommandRequest", "transform": "manager.exec_command(request, context)", "sink": "ExecCommandToolOutput"}
+        ],
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0016/entity/exec-command-request",
+      "src": "SRC-0016",
+      "composition": "entity",
+      "terms": {
+        "object": "ExecCommandRequest",
+        "attributes": [
+          "command: Vec<String>",
+          "process_id",
+          "yield_time_ms: u64",
+          "max_output_tokens: Option<usize>",
+          "workdir: Option<AbsolutePathBuf>",
+          "network",
+          "tty: bool",
+          "sandbox_permissions: effective",
+          "additional_permissions: normalized",
+          "additional_permissions_preapproved: bool",
+          "justification: Option<String>",
+          "prefix_rule: Option<Vec<String>>"
+        ],
+        "relationships": [],
+        "enumerations": null,
+        "data_flows": [
+          {"source": "ExecCommandRequest", "transform": "UnifiedExecProcessManager.exec_command (allocates process_id beforehand; releases on failure paths)", "sink": "ExecCommandToolOutput"},
+          {"source": "WriteStdinRequest", "transform": "manager.write_stdin + send_event(TerminalInteraction { call_id, process_id=session_id.to_string(), stdin })", "sink": "ExecCommandToolOutput"}
+        ],
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0016/entity/view-image-invocation",
+      "src": "SRC-0016",
+      "composition": "entity",
+      "terms": {
+        "object": "view_image invocation",
+        "attributes": [
+          "args.path: String (resolved via turn.resolve_path)",
+          "args.detail: Option<String> (only 'original' or absent)",
+          "abs_path: AbsolutePathBuf",
+          "file_bytes: Vec<u8>",
+          "image_mode: PromptImageMode (Original if detail=Original && can_request_original; else ResizeToFit)",
+          "image_detail: Option<ImageDetail> (Some(Original) iff use_original_detail)",
+          "image_url: String (from image.into_data_url)",
+          "VIEW_IMAGE_UNSUPPORTED_MESSAGE: \"view_image is not allowed because you do not support image inputs\""
+        ],
+        "relationships": [
+          {"to": "SRC-0016/entity/view-image-output", "rel": "produces", "card": "1:1"}
+        ],
+        "enumerations": {
+          "ViewImageDetail": ["Original"],
+          "PromptImageMode (referenced)": ["Original", "ResizeToFit"],
+          "ImageDetail (referenced)": ["Original"]
+        },
+        "data_flows": [
+          {"source": "turn.model_info.input_modalities", "transform": "check contains InputModality::Image (else reject with VIEW_IMAGE_UNSUPPORTED_MESSAGE)", "sink": "gate"},
+          {"source": "abs_path + fs (with sandbox if environment.is_remote)", "transform": "get_metadata (must be file) + read_file", "sink": "file_bytes"},
+          {"source": "abs_path + file_bytes + image_mode", "transform": "load_for_prompt_bytes -> image.into_data_url", "sink": "image_url"},
+          {"source": "call_id + event_path", "transform": "session.send_event(EventMsg::ViewImageToolCall(ViewImageToolCallEvent))", "sink": "client event"}
+        ],
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0016/entity/view-image-output",
+      "src": "SRC-0016",
+      "composition": "entity",
+      "terms": {
+        "object": "ViewImageOutput",
+        "attributes": [
+          "image_url: String",
+          "image_detail: Option<ImageDetail>"
+        ],
+        "relationships": [],
+        "enumerations": null,
+        "data_flows": [
+          {"source": "image_url + image_detail", "transform": "to_response_item -> FunctionCallOutputBody::ContentItems([InputImage{image_url, detail}]) success=true", "sink": "ResponseInputItem::FunctionCallOutput"},
+          {"source": "image_url + image_detail", "transform": "code_mode_result -> {image_url, detail}", "sink": "serde_json::Value"}
+        ],
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0016/entity/handler-common-parsing",
+      "src": "SRC-0016",
+      "composition": "entity",
+      "terms": {
+        "object": "Handler-common argument parsing utilities",
+        "attributes": [
+          "parse_arguments<T>: serde_json::from_str; error mapped to RespondToModel(\"failed to parse function arguments: {err}\")",
+          "parse_arguments_with_base_path<T>: sets AbsolutePathBufGuard(base_path) during parsing (for Deserialize path-resolution)",
+          "resolve_workdir_base_path: reads arguments.workdir (non-empty) -> default_cwd.join(workdir) else default_cwd.clone()"
+        ],
+        "relationships": [
+          {"to": "SRC-0016/entity/tool-payload", "rel": "parses", "card": "1:N"}
+        ],
+        "enumerations": null,
+        "data_flows": null,
+        "config": null
+      }
+    }
+  ]
+}

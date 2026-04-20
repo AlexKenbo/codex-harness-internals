@@ -1,0 +1,560 @@
+{
+  "src": "SRC-0017",
+  "schema_version": "2.0",
+  "lens": "structural",
+  "compositions": [
+    {
+      "id": "SRC-0017/entity/agent-job",
+      "src": "SRC-0017",
+      "composition": "entity",
+      "terms": {
+        "object": "AgentJob — CSV-driven batch job that spawns one sub-agent per input row to process it against a templated instruction",
+        "attributes": [
+          "job_id: String (UUID)",
+          "name: String (format: agent-job-<first 8 chars of job_id>)",
+          "instruction: String (template with {column} placeholders)",
+          "auto_export: bool (true — always export CSV on completion)",
+          "max_runtime_seconds: Option<u64>",
+          "output_schema_json: Option<Value> (JSON Schema for expected result)",
+          "input_headers: Vec<String>",
+          "input_csv_path: String",
+          "output_csv_path: String",
+          "status: enum (as reported via job.status.as_str())",
+          "last_error: Option<String>"
+        ],
+        "relationships": [
+          {"to": "SRC-0017/entity/agent-job-item", "rel": "has_items", "card": "1:N", "direction": "AgentJob → AgentJobItem"},
+          {"to": "SRC-0017/entity/agent-job-progress", "rel": "produces_progress", "card": "1:1", "direction": "AgentJob → AgentJobProgress"},
+          {"to": "SRC-0017/entity/spawned-agent", "rel": "spawns_worker_per_item", "card": "1:N", "direction": "AgentJob → spawned-agent (via items)"}
+        ],
+        "enumerations": null,
+        "data_flows": [
+          {"source": "csv_path (input file)", "transform": "parse_csv → headers + rows; each row → AgentJobItem with item_id (source_id or row-N, suffix for duplicates), row_index, row_json, source_id", "sink": "codex_state.create_agent_job(items)"},
+          {"source": "AgentJobItem.result_json (reported by worker via report_agent_job_result)", "transform": "render_job_csv(headers, items) — produces CSV with input columns + job_id, item_id, row_index, source_id, status, attempt_count, last_error, result_json, reported_at, completed_at", "sink": "output_csv_path (filesystem write)"},
+          {"source": "AgentJobProgress (polled during run loop)", "transform": "JobProgressEmitter.maybe_emit — compute eta_seconds = remaining/rate, serialize AgentJobProgressUpdate", "sink": "session.notify_background_event(\"agent_job_progress:<payload>\")"}
+        ],
+        "config": {
+          "DEFAULT_AGENT_JOB_CONCURRENCY": {"value": 16, "source": "hardcoded const in agent_jobs.rs:39", "default": 16},
+          "MAX_AGENT_JOB_CONCURRENCY": {"value": 64, "source": "hardcoded const in agent_jobs.rs:40", "default": 64},
+          "STATUS_POLL_INTERVAL": {"value": "250ms", "source": "hardcoded const in agent_jobs.rs:41", "default": "250ms"},
+          "PROGRESS_EMIT_INTERVAL": {"value": "1s", "source": "hardcoded const in agent_jobs.rs:42", "default": "1s"},
+          "DEFAULT_AGENT_JOB_ITEM_TIMEOUT": {"value": "30 minutes (60*30 seconds)", "source": "hardcoded const in agent_jobs.rs:43", "default": "1800s"},
+          "max_runtime_seconds": {"value": "from args or turn.config.agent_job_max_runtime_seconds", "source": "tool args + Config", "default": "None (falls back to DEFAULT_AGENT_JOB_ITEM_TIMEOUT)"},
+          "max_concurrency": {"value": "from args.max_concurrency or args.max_workers", "source": "tool args", "default": "DEFAULT_AGENT_JOB_CONCURRENCY (16)"},
+          "agent_max_threads": {"value": "from turn.config.agent_max_threads", "source": "Config", "default": "None"},
+          "id_column": {"value": "from args.id_column", "source": "tool args", "default": "None (fallback item_id = row-<index+1>)"}
+        }
+      }
+    },
+    {
+      "id": "SRC-0017/entity/agent-job-item",
+      "src": "SRC-0017",
+      "composition": "entity",
+      "terms": {
+        "object": "AgentJobItem — one CSV row processed by one spawned worker sub-agent; carries input row, assigned thread, reported result, and per-item state",
+        "attributes": [
+          "item_id: String (source_id or row-<row_index+1>; duplicates receive suffix -2, -3, ...)",
+          "row_index: i64 (0-based; user-facing row number = idx + 2 including header)",
+          "source_id: Option<String> (value from id_column, trimmed non-empty)",
+          "row_json: Value (JSON object: header → cell value as String)",
+          "status: AgentJobItemStatus enum",
+          "assigned_thread_id: Option<String>",
+          "attempt_count: integer",
+          "last_error: Option<String>",
+          "result_json: Option<Value> (reported via report_agent_job_result)",
+          "reported_at: Option<datetime>",
+          "completed_at: Option<datetime>",
+          "updated_at: datetime"
+        ],
+        "relationships": [
+          {"to": "SRC-0017/entity/agent-job", "rel": "belongs_to", "card": "N:1", "direction": "AgentJobItem → AgentJob"},
+          {"to": "SRC-0017/entity/spawned-agent", "rel": "assigned_to_thread", "card": "1:1", "direction": "AgentJobItem.assigned_thread_id → spawned-agent.thread_id"}
+        ],
+        "enumerations": {
+          "AgentJobItemStatus": ["Pending", "Running", "Failed", "Completed"]
+        },
+        "data_flows": [
+          {"source": "spawned worker agent calls report_agent_job_result(job_id, item_id, result, stop?)", "transform": "db.report_agent_job_item_result(job_id, item_id, reporting_thread_id, result)", "sink": "AgentJobItem.result_json + reported_at"}
+        ],
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0017/entity/agent-job-progress",
+      "src": "SRC-0017",
+      "composition": "entity",
+      "terms": {
+        "object": "AgentJobProgress — aggregated state snapshot of a running job, emitted to the parent session as background events",
+        "attributes": [
+          "job_id: String",
+          "total_items: usize",
+          "pending_items: usize",
+          "running_items: usize",
+          "completed_items: usize",
+          "failed_items: usize",
+          "eta_seconds: Option<u64> (computed: remaining / rate, rate = processed/elapsed_seconds)"
+        ],
+        "relationships": [
+          {"to": "SRC-0017/entity/agent-job", "rel": "describes_job", "card": "N:1", "direction": "AgentJobProgress → AgentJob"}
+        ],
+        "enumerations": null,
+        "data_flows": [
+          {"source": "codex_state.get_agent_job_progress(job_id)", "transform": "JobProgressEmitter.maybe_emit — gate by (force || processed changed || failed_items changed || last_emit_at elapsed >= PROGRESS_EMIT_INTERVAL)", "sink": "session.notify_background_event(turn, \"agent_job_progress:<json>\")"}
+        ],
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0017/entity/job-runner-options",
+      "src": "SRC-0017",
+      "composition": "entity",
+      "terms": {
+        "object": "JobRunnerOptions — runtime parameters for the per-job loop; derived from session base instructions, turn context, and the requested concurrency",
+        "attributes": [
+          "max_concurrency: usize (normalized: max(1, min(requested, MAX_AGENT_JOB_CONCURRENCY, agent_max_threads)))",
+          "spawn_config: Config (base snapshot for spawning each worker; produced by build_agent_spawn_config)"
+        ],
+        "relationships": [
+          {"to": "SRC-0017/entity/agent-job", "rel": "configures_run", "card": "1:1", "direction": "JobRunnerOptions → AgentJob run loop"}
+        ],
+        "enumerations": null,
+        "data_flows": [
+          {"source": "args.max_concurrency / args.max_workers + turn.config.agent_max_threads + session.get_base_instructions() + turn (Config)", "transform": "build_runner_options → normalize_concurrency + build_agent_spawn_config + depth-limit check", "sink": "JobRunnerOptions"}
+        ],
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0017/entity/active-job-item",
+      "src": "SRC-0017",
+      "composition": "entity",
+      "terms": {
+        "object": "ActiveJobItem — in-memory tracking entry for an item whose worker thread is currently alive; keyed by ThreadId inside the run loop",
+        "attributes": [
+          "item_id: String",
+          "started_at: Instant (from now or reconstructed from item.updated_at age on recovery)",
+          "status_rx: Option<Receiver<AgentStatus>> (watch subscription to worker agent status)"
+        ],
+        "relationships": [
+          {"to": "SRC-0017/entity/agent-job-item", "rel": "tracks_item", "card": "1:1", "direction": "ActiveJobItem ↔ AgentJobItem (by item_id)"},
+          {"to": "SRC-0017/entity/spawned-agent", "rel": "tracks_thread", "card": "1:1", "direction": "ActiveJobItem ↔ spawned-agent (by ThreadId)"}
+        ],
+        "enumerations": null,
+        "data_flows": [
+          {"source": "spawn_agent result (thread_id) + session.services.agent_control.subscribe_status(thread_id)", "transform": "insert into active_items HashMap<ThreadId, ActiveJobItem>", "sink": "run_agent_job_loop.active_items"}
+        ],
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0017/entity/spawned-agent",
+      "src": "SRC-0017",
+      "composition": "entity",
+      "terms": {
+        "object": "Spawned sub-agent — a child thread created via agent_control.spawn_agent / spawn_agent_with_metadata; identified by ThreadId, tagged with agent_path, agent_nickname, agent_role",
+        "attributes": [
+          "thread_id: ThreadId",
+          "agent_path: Option<AgentPath> (canonical hierarchical task name, e.g., parent_path/task_name)",
+          "agent_nickname: Option<String>",
+          "agent_role: Option<String>",
+          "status: AgentStatus enum",
+          "model: String (effective — from agent config snapshot or args)",
+          "reasoning_effort: ReasoningEffort (effective)",
+          "session_source: SessionSource::SubAgent(SubAgentSource::ThreadSpawn { parent_thread_id, depth, agent_path, agent_nickname, agent_role })",
+          "depth: i32 (child_depth = next_thread_spawn_depth(parent.session_source))"
+        ],
+        "relationships": [
+          {"to": "SRC-0017/entity/spawned-agent", "rel": "parent_of", "card": "1:N", "direction": "parent thread → child thread (self-ref via parent_thread_id + depth)"},
+          {"to": "SRC-0017/entity/agent-job-item", "rel": "processes_item", "card": "1:1", "direction": "spawned-agent (worker) → AgentJobItem (for CSV jobs only)"}
+        ],
+        "enumerations": {
+          "AgentStatus": ["(referenced — contains at least NotFound + non-final + final states; is_final() classifies terminals)"]
+        },
+        "data_flows": [
+          {"source": "spawn tool args (message/items, agent_type, model, reasoning_effort, fork_context/fork_turns) + turn config", "transform": "build_agent_spawn_config → apply_requested_spawn_agent_model_overrides → apply_role_to_config → apply_spawn_agent_runtime_overrides → apply_spawn_agent_overrides → spawn_agent_with_metadata", "sink": "new ThreadId registered in agent_control"},
+          {"source": "parent session_source + child_depth + agent_role + task_name", "transform": "thread_spawn_source → SessionSource::SubAgent(SubAgentSource::ThreadSpawn { ... })", "sink": "spawned agent's session_source"}
+        ],
+        "config": {
+          "agent_max_depth": {"value": "from turn.config.agent_max_depth", "source": "Config", "default": "not specified in SRC"},
+          "DEFAULT_ROLE_NAME": {"value": "from crate::agent::role::DEFAULT_ROLE_NAME", "source": "imported constant", "default": "used as role_tag when role_name is None"}
+        }
+      }
+    },
+    {
+      "id": "SRC-0017/entity/spawn-agent-args",
+      "src": "SRC-0017",
+      "composition": "entity",
+      "terms": {
+        "object": "SpawnAgentArgs — request payload for spawning one sub-agent; two variants (v1 and v2) differ in required fields and fork semantics",
+        "attributes": [
+          "v1.message: Option<String>",
+          "v1.items: Option<Vec<UserInput>> (exactly one of message/items must be provided)",
+          "v1.agent_type: Option<String> (trimmed; empty treated as None; resolves to role)",
+          "v1.model: Option<String>",
+          "v1.reasoning_effort: Option<ReasoningEffort>",
+          "v1.fork_context: bool (default false; when true → FullHistory fork)",
+          "v2.message: String (required, non-empty)",
+          "v2.task_name: String (required, becomes agent_path segment)",
+          "v2.agent_type: Option<String>",
+          "v2.model: Option<String>",
+          "v2.reasoning_effort: Option<ReasoningEffort>",
+          "v2.fork_turns: Option<String> ('none' | 'all' | positive integer-string; 0 invalid)",
+          "v2.fork_context: Option<bool> (rejected in v2 — 'use fork_turns instead')"
+        ],
+        "relationships": [
+          {"to": "SRC-0017/entity/spawned-agent", "rel": "produces", "card": "1:1", "direction": "SpawnAgentArgs → spawned-agent"},
+          {"to": "SRC-0017/entity/spawn-agent-fork-mode", "rel": "selects_fork_mode", "card": "1:1", "direction": "SpawnAgentArgs.fork_turns/fork_context → SpawnAgentForkMode"}
+        ],
+        "enumerations": {
+          "v2.fork_turns_values": ["'none' → None", "'all' → FullHistory", "positive integer string → LastNTurns(n)", "empty/missing → None"]
+        },
+        "data_flows": null,
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0017/entity/spawn-agent-fork-mode",
+      "src": "SRC-0017",
+      "composition": "entity",
+      "terms": {
+        "object": "SpawnAgentForkMode — mode used when spawning with conversation history fork (imported from crate::agent::control)",
+        "attributes": null,
+        "relationships": [
+          {"to": "SRC-0017/entity/spawned-agent", "rel": "applied_when_spawning", "card": "1:1", "direction": "SpawnAgentForkMode → spawned-agent spawn options"}
+        ],
+        "enumerations": {
+          "SpawnAgentForkMode (as used in SRC)": ["FullHistory (v1 fork_context=true, v2 fork_turns='all')", "LastNTurns(usize) (v2 only — fork_turns = positive integer)"]
+        },
+        "data_flows": null,
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0017/entity/close-agent-args",
+      "src": "SRC-0017",
+      "composition": "entity",
+      "terms": {
+        "object": "CloseAgentArgs / CloseAgentResult — input and result for the close_agent tool; closes a live sub-agent and returns its status just before close",
+        "attributes": [
+          "CloseAgentArgs.target: String (v1: ThreadId string; v2: path or thread_id, resolved via resolve_agent_target; v2 rejects root agent)",
+          "CloseAgentResult.previous_status: AgentStatus"
+        ],
+        "relationships": [
+          {"to": "SRC-0017/entity/spawned-agent", "rel": "operates_on", "card": "1:1", "direction": "CloseAgentArgs.target → spawned-agent"}
+        ],
+        "enumerations": null,
+        "data_flows": [
+          {"source": "tool args (target)", "transform": "parse_agent_id_target (v1) / resolve_agent_target (v2) → subscribe_status.borrow_and_update() → agent_control.close_agent(agent_id)", "sink": "agent_control (agent closed) + CollabCloseEndEvent"}
+        ],
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0017/entity/resume-agent-args",
+      "src": "SRC-0017",
+      "composition": "entity",
+      "terms": {
+        "object": "ResumeAgentArgs / ResumeAgentResult — v1-only; resumes a previously closed agent (or returns the current status of a live one) by ThreadId",
+        "attributes": [
+          "ResumeAgentArgs.id: String (ThreadId string)",
+          "ResumeAgentResult.status: AgentStatus"
+        ],
+        "relationships": [
+          {"to": "SRC-0017/entity/spawned-agent", "rel": "reactivates", "card": "1:1", "direction": "ResumeAgentArgs → spawned-agent"}
+        ],
+        "enumerations": null,
+        "data_flows": [
+          {"source": "args.id (ThreadId) + turn.session_source", "transform": "ThreadId::from_string → next_thread_spawn_depth → if status == NotFound → try_resume_closed_agent (build_agent_resume_config, resume_agent_from_rollout with thread_spawn_source(agent_role=None, task_name=None))", "sink": "agent_control state updated + session_telemetry counter 'codex.multi_agent.resume' +1"}
+        ],
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0017/entity/send-input-args",
+      "src": "SRC-0017",
+      "composition": "entity",
+      "terms": {
+        "object": "SendInputArgs / SendInputResult — v1-only; delivers a message/items to a live sub-agent, with optional interrupt of its current turn",
+        "attributes": [
+          "SendInputArgs.target: String (ThreadId)",
+          "SendInputArgs.message: Option<String>",
+          "SendInputArgs.items: Option<Vec<UserInput>>",
+          "SendInputArgs.interrupt: bool (default false; when true → interrupt_agent before sending)",
+          "SendInputResult.submission_id: String"
+        ],
+        "relationships": [
+          {"to": "SRC-0017/entity/spawned-agent", "rel": "sends_input_to", "card": "1:1", "direction": "SendInputArgs.target → spawned-agent"}
+        ],
+        "enumerations": null,
+        "data_flows": [
+          {"source": "args (target, message/items, interrupt)", "transform": "parse_agent_id_target → parse_collab_input → if interrupt: agent_control.interrupt_agent → agent_control.send_input(thread_id, input_items)", "sink": "submission_id + CollabAgentInteractionEndEvent"}
+        ],
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0017/entity/wait-args",
+      "src": "SRC-0017",
+      "composition": "entity",
+      "terms": {
+        "object": "WaitArgs / WaitAgentResult — wait for agent(s) to reach a final status (v1: per-thread statuses; v2: mailbox-change signal)",
+        "attributes": [
+          "v1.WaitArgs.targets: Vec<String> (ThreadId list; must be non-empty)",
+          "v1.WaitArgs.timeout_ms: Option<i64>",
+          "v1.WaitAgentResult.status: HashMap<String, AgentStatus> (key = agent_path or ThreadId.to_string())",
+          "v1.WaitAgentResult.timed_out: bool",
+          "v2.WaitArgs.timeout_ms: Option<i64>",
+          "v2.WaitAgentResult.message: String ('Wait timed out.' | 'Wait completed.')",
+          "v2.WaitAgentResult.timed_out: bool"
+        ],
+        "relationships": [
+          {"to": "SRC-0017/entity/spawned-agent", "rel": "waits_on", "card": "1:N", "direction": "WaitArgs.targets → spawned-agent (v1 only; v2 waits on session mailbox)"}
+        ],
+        "enumerations": null,
+        "data_flows": [
+          {"source": "v1: subscribe_status per target → watch Receiver<AgentStatus>", "transform": "wait_for_final_status (status.borrow → if is_final return; loop: status_rx.changed → re-check); collected via FuturesUnordered with timeout_at(deadline)", "sink": "v1.WaitAgentResult (status map + timed_out)"},
+          {"source": "v2: session.subscribe_mailbox_seq() → watch Receiver<u64>", "transform": "wait_for_mailbox_change (timeout_at(deadline, mailbox_seq_rx.changed))", "sink": "v2.WaitAgentResult (from_timed_out: message + timed_out)"}
+        ],
+        "config": {
+          "MIN_WAIT_TIMEOUT_MS": {"value": 10000, "source": "hardcoded const in multi_agents_common.rs:29", "default": 10000},
+          "DEFAULT_WAIT_TIMEOUT_MS": {"value": 30000, "source": "hardcoded const in multi_agents_common.rs:30", "default": 30000},
+          "MAX_WAIT_TIMEOUT_MS": {"value": 3600000, "source": "hardcoded const in multi_agents_common.rs:31 (3600*1000 = 1 hour)", "default": 3600000}
+        }
+      }
+    },
+    {
+      "id": "SRC-0017/entity/list-agents-args",
+      "src": "SRC-0017",
+      "composition": "entity",
+      "terms": {
+        "object": "ListAgentsArgs / ListAgentsResult — v2-only; enumerates sub-agents of the current session, optionally filtered by an agent_path prefix",
+        "attributes": [
+          "ListAgentsArgs.path_prefix: Option<String>",
+          "ListAgentsResult.agents: Vec<ListedAgent>"
+        ],
+        "relationships": [
+          {"to": "SRC-0017/entity/spawned-agent", "rel": "enumerates", "card": "1:N", "direction": "ListAgentsResult.agents → spawned-agent"}
+        ],
+        "enumerations": null,
+        "data_flows": [
+          {"source": "agent_control.register_session_root(session.conversation_id, turn.session_source) then agent_control.list_agents(session_source, path_prefix?)", "transform": "filtering by path_prefix if provided", "sink": "ListAgentsResult.agents"}
+        ],
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0017/entity/message-args",
+      "src": "SRC-0017",
+      "composition": "entity",
+      "terms": {
+        "object": "SendMessageArgs / FollowupTaskArgs — v2 text-only communication to a sub-agent; shared submission path differs only by MessageDeliveryMode (QueueOnly vs TriggerTurn)",
+        "attributes": [
+          "SendMessageArgs.target: String (resolved via resolve_agent_target)",
+          "SendMessageArgs.message: String (non-empty)",
+          "FollowupTaskArgs.target: String",
+          "FollowupTaskArgs.message: String (non-empty)",
+          "FollowupTaskArgs.interrupt: bool (default false)"
+        ],
+        "relationships": [
+          {"to": "SRC-0017/entity/spawned-agent", "rel": "messages", "card": "1:1", "direction": "message args.target → spawned-agent"},
+          {"to": "SRC-0017/entity/inter-agent-communication", "rel": "produces", "card": "1:1", "direction": "handle_message_submission → InterAgentCommunication"}
+        ],
+        "enumerations": {
+          "MessageDeliveryMode": ["QueueOnly (send_message — trigger_turn=false)", "TriggerTurn (followup_task — trigger_turn=true)"]
+        },
+        "data_flows": [
+          {"source": "args (target, message, interrupt?)", "transform": "handle_message_string_tool → message_content validate non-empty → handle_message_submission → resolve_agent_target → build InterAgentCommunication(sender_path, receiver_path, [], prompt, trigger_turn=true) → mode.apply(communication) (overrides trigger_turn per mode) → agent_control.send_inter_agent_communication(receiver_thread_id, communication)", "sink": "sub-agent mailbox + CollabAgentInteractionEndEvent"}
+        ],
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0017/entity/inter-agent-communication",
+      "src": "SRC-0017",
+      "composition": "entity",
+      "terms": {
+        "object": "InterAgentCommunication — message envelope between agents carrying sender agent_path, recipient agent_path, optional attachments, prompt text, and trigger_turn flag",
+        "attributes": [
+          "sender_agent_path: AgentPath (turn.session_source.get_agent_path() or AgentPath::root())",
+          "recipient_agent_path: AgentPath",
+          "attachments: Vec<...> (empty vec in current code)",
+          "prompt: String",
+          "trigger_turn: bool (true = wake/TriggerTurn; false = QueueOnly — overridden by MessageDeliveryMode.apply)"
+        ],
+        "relationships": [
+          {"to": "SRC-0017/entity/spawned-agent", "rel": "delivered_to", "card": "1:1", "direction": "InterAgentCommunication.recipient → spawned-agent"},
+          {"to": "SRC-0017/entity/message-args", "rel": "created_from", "card": "1:1", "direction": "message args → InterAgentCommunication"}
+        ],
+        "enumerations": null,
+        "data_flows": [
+          {"source": "sender turn session_source agent_path + receiver_agent.agent_path + prompt", "transform": "InterAgentCommunication::new + mode.apply (force trigger_turn)", "sink": "agent_control.send_inter_agent_communication / Op::InterAgentCommunication on initial spawn"}
+        ],
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0017/entity/collab-event",
+      "src": "SRC-0017",
+      "composition": "entity",
+      "terms": {
+        "object": "Collab lifecycle events — emitted pairwise (Begin/End) around each tool invocation so the session bus reflects spawn, interaction, wait, close, resume lifecycles",
+        "attributes": [
+          "CollabAgentSpawnBeginEvent: { call_id, sender_thread_id, prompt, model, reasoning_effort }",
+          "CollabAgentSpawnEndEvent: { call_id, sender_thread_id, new_thread_id, new_agent_nickname, new_agent_role, prompt, model, reasoning_effort, status }",
+          "CollabAgentInteractionBeginEvent: { call_id, sender_thread_id, receiver_thread_id, prompt }",
+          "CollabAgentInteractionEndEvent: { call_id, sender_thread_id, receiver_thread_id, receiver_agent_nickname, receiver_agent_role, prompt, status }",
+          "CollabCloseBeginEvent: { call_id, sender_thread_id, receiver_thread_id }",
+          "CollabCloseEndEvent: { call_id, sender_thread_id, receiver_thread_id, receiver_agent_nickname, receiver_agent_role, status }",
+          "CollabResumeBeginEvent: { call_id, sender_thread_id, receiver_thread_id, receiver_agent_nickname, receiver_agent_role } (v1 only)",
+          "CollabResumeEndEvent: { call_id, sender_thread_id, receiver_thread_id, receiver_agent_nickname, receiver_agent_role, status } (v1 only)",
+          "CollabWaitingBeginEvent: { sender_thread_id, receiver_thread_ids, receiver_agents, call_id }",
+          "CollabWaitingEndEvent: { sender_thread_id, call_id, agent_statuses, statuses }"
+        ],
+        "relationships": [
+          {"to": "SRC-0017/entity/spawned-agent", "rel": "references_agent", "card": "1:N", "direction": "events → spawned-agent (receiver/new_thread_id)"}
+        ],
+        "enumerations": null,
+        "data_flows": [
+          {"source": "handler invocation (Begin) → tool action → handler result (End)", "transform": "construct event struct with call_id, thread ids, status, etc.", "sink": "session.send_event(&turn, event.into()) — session event stream"}
+        ],
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0017/entity/collab-agent-ref",
+      "src": "SRC-0017",
+      "composition": "entity",
+      "terms": {
+        "object": "CollabAgentRef / CollabAgentStatusEntry — lightweight descriptors of a sub-agent used in wait events and wait result aggregation",
+        "attributes": [
+          "CollabAgentRef: { thread_id: ThreadId, agent_nickname: Option<String>, agent_role: Option<String> }",
+          "CollabAgentStatusEntry: { thread_id: ThreadId, agent_nickname: Option<String>, agent_role: Option<String>, status: AgentStatus }"
+        ],
+        "relationships": [
+          {"to": "SRC-0017/entity/spawned-agent", "rel": "describes", "card": "1:1", "direction": "CollabAgentRef/Entry → spawned-agent"}
+        ],
+        "enumerations": null,
+        "data_flows": [
+          {"source": "receiver_thread_ids + agent_control.get_agent_metadata per id + per-thread status", "transform": "build_wait_agent_statuses — order receiver_agents first (only ids present in statuses map), then append extras from statuses not already seen, sorted by thread_id string", "sink": "Vec<CollabAgentStatusEntry> used in CollabWaitingEndEvent and WaitAgentResult"}
+        ],
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0017/entity/agent-job-failure-summary",
+      "src": "SRC-0017",
+      "composition": "entity",
+      "terms": {
+        "object": "AgentJobFailureSummary — per-failed-item diagnostic included in SpawnAgentsOnCsvResult when any items fail (up to 5 failures listed)",
+        "attributes": [
+          "item_id: String",
+          "source_id: Option<String>",
+          "last_error: String (non-empty; filtered)"
+        ],
+        "relationships": [
+          {"to": "SRC-0017/entity/agent-job-item", "rel": "summarizes_failure_of", "card": "1:1", "direction": "AgentJobFailureSummary → AgentJobItem (by item_id)"}
+        ],
+        "enumerations": null,
+        "data_flows": [
+          {"source": "db.list_agent_job_items(job_id, status=Failed, limit=5)", "transform": "filter_map — drop items with empty last_error; if none remain but progress.failed_items > 0, set job_error fallback", "sink": "SpawnAgentsOnCsvResult.failed_item_errors"}
+        ],
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0017/entity/spawn-agents-on-csv-result",
+      "src": "SRC-0017",
+      "composition": "entity",
+      "terms": {
+        "object": "SpawnAgentsOnCsvResult — final result payload returned to the caller of spawn_agents_on_csv",
+        "attributes": [
+          "job_id: String",
+          "status: String (from AgentJobStatus.as_str())",
+          "output_csv_path: String",
+          "total_items: usize",
+          "completed_items: usize",
+          "failed_items: usize",
+          "job_error: Option<String> (last_error on the job, non-empty; fallback message when failures exist but details absent)",
+          "failed_item_errors: Option<Vec<AgentJobFailureSummary>> (None when no failures or all failure summaries empty)"
+        ],
+        "relationships": [
+          {"to": "SRC-0017/entity/agent-job", "rel": "reports_for", "card": "1:1", "direction": "SpawnAgentsOnCsvResult → AgentJob"},
+          {"to": "SRC-0017/entity/agent-job-failure-summary", "rel": "contains", "card": "1:N", "direction": "SpawnAgentsOnCsvResult → failed summaries"}
+        ],
+        "enumerations": null,
+        "data_flows": [
+          {"source": "job + progress + failed item list", "transform": "serde_json::to_string(SpawnAgentsOnCsvResult)", "sink": "FunctionToolOutput::from_text(content, Some(true))"}
+        ],
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0017/entity/report-agent-job-result-args",
+      "src": "SRC-0017",
+      "composition": "entity",
+      "terms": {
+        "object": "ReportAgentJobResultArgs / ReportAgentJobResultToolResult — payload a worker calls exactly once to persist its per-item result and optionally cancel the entire job",
+        "attributes": [
+          "ReportAgentJobResultArgs.job_id: String",
+          "ReportAgentJobResultArgs.item_id: String",
+          "ReportAgentJobResultArgs.result: Value (must be JSON object)",
+          "ReportAgentJobResultArgs.stop: Option<bool> (default false; if accepted and true → cancel job with message 'cancelled by worker request')",
+          "ReportAgentJobResultToolResult.accepted: bool"
+        ],
+        "relationships": [
+          {"to": "SRC-0017/entity/agent-job-item", "rel": "reports_for", "card": "1:1", "direction": "ReportAgentJobResultArgs → AgentJobItem"},
+          {"to": "SRC-0017/entity/agent-job", "rel": "may_cancel", "card": "1:1", "direction": "ReportAgentJobResultArgs.stop → AgentJob cancellation"}
+        ],
+        "enumerations": null,
+        "data_flows": [
+          {"source": "worker agent (session.conversation_id) → tool args", "transform": "validate result.is_object → db.report_agent_job_item_result(job_id, item_id, reporting_thread_id, result) → if accepted && stop == true: db.mark_agent_job_cancelled(job_id, 'cancelled by worker request')", "sink": "AgentJobItem.result_json + optional job.cancelled flag"}
+        ],
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0017/entity/worker-prompt",
+      "src": "SRC-0017",
+      "composition": "entity",
+      "terms": {
+        "object": "Worker prompt — the text sent to each CSV-job worker sub-agent; embeds job_id, item_id, rendered instruction (from template + row), expected result schema, and the mandatory report_agent_job_result tool protocol",
+        "attributes": [
+          "contents: job_id + item_id + rendered instruction + row_json (pretty) + output_schema (pretty or '{}') + instructions to call report_agent_job_result exactly once with { job_id, item_id, result: JSON object } and optional stop=true"
+        ],
+        "relationships": [
+          {"to": "SRC-0017/entity/agent-job-item", "rel": "built_from", "card": "1:1", "direction": "AgentJob + AgentJobItem → worker prompt"},
+          {"to": "SRC-0017/entity/spawned-agent", "rel": "drives", "card": "1:1", "direction": "worker prompt → worker spawned-agent"}
+        ],
+        "enumerations": null,
+        "data_flows": [
+          {"source": "job.instruction (template with {column} placeholders) + item.row_json", "transform": "render_instruction_template — escape literal {{ and }} to sentinels, replace {column} with row[column] (string value or JSON stringification), restore escaped braces", "sink": "build_worker_prompt → UserInput::Text sent to spawn_agent"}
+        ],
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0017/entity/session-source",
+      "src": "SRC-0017",
+      "composition": "entity",
+      "terms": {
+        "object": "SessionSource / SubAgentSource — hierarchical identity/lineage descriptor attached to every spawned sub-agent; encodes parent, depth, agent_path, nickname, role",
+        "attributes": [
+          "SessionSource::SubAgent(SubAgentSource)",
+          "SubAgentSource::ThreadSpawn { parent_thread_id: ThreadId, depth: i32, agent_path: Option<AgentPath>, agent_nickname: Option<String>, agent_role: Option<String> }",
+          "SubAgentSource::Other(String) — used for CSV jobs with value 'agent_job:<job_id>'"
+        ],
+        "relationships": [
+          {"to": "SRC-0017/entity/spawned-agent", "rel": "identifies", "card": "1:1", "direction": "SessionSource → spawned-agent"},
+          {"to": "SRC-0017/entity/agent-job", "rel": "tags_job_workers", "card": "1:N", "direction": "SubAgentSource::Other('agent_job:<id>') → AgentJob workers"}
+        ],
+        "enumerations": {
+          "SubAgentSource (as used in SRC)": ["ThreadSpawn { parent_thread_id, depth, agent_path, agent_nickname, agent_role }", "Other(String) — e.g. 'agent_job:<job_id>'"]
+        },
+        "data_flows": [
+          {"source": "parent session.conversation_id + parent session_source + child_depth + agent_role + task_name (optional)", "transform": "thread_spawn_source — if task_name: agent_path = parent.get_agent_path().unwrap_or(root).join(task_name); else None", "sink": "SessionSource::SubAgent(...) attached to spawned agent"}
+        ],
+        "config": null
+      }
+    }
+  ]
+}

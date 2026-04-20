@@ -1,0 +1,263 @@
+{
+  "src": "SRC-0004",
+  "schema_version": "2.0",
+  "lens": "use_case",
+  "compositions": [
+    {
+      "id": "SRC-0004/uc.user/grant-permissions-request",
+      "src": "SRC-0004",
+      "composition": "use_case",
+      "level": "user",
+      "strategic_domain": "контроль доступа агента к окружению",
+      "terms": {
+        "actor": "Пользователь (Operator)",
+        "goal": "Принять решение о выдаче дополнительных прав агенту по инициируемому запросу tool call",
+        "steps": [
+          "1. Агент инициирует RequestPermissionsEvent с call_id, turn_id, опциональным reason и запрашиваемым набором RequestPermissionProfile (network и/или file_system)",
+          "2. Пользователь видит запрос с reason (если задан) и набором запрашиваемых permissions",
+          "3. Пользователь решает какой scope выдать: turn (только этот ход) или session (на всю сессию)",
+          "4. Пользователь возвращает RequestPermissionsResponse с подтверждённым набором permissions и выбранным scope",
+          "5. Система применяет PermissionProfile, конвертированный из RequestPermissionProfile через From"
+        ],
+        "extensions (Cockburn)": [
+          {"step": 1, "condition": "reason отсутствует", "action": "поле reason пропускается при сериализации (skip_serializing_if Option::is_none)"},
+          {"step": 1, "condition": "turn_id отсутствует в payload (старый клиент)", "action": "turn_id = пустая строка (#[serde(default)] для backwards compatibility)"},
+          {"step": 4, "condition": "scope отсутствует в ответе", "action": "scope = Turn (#[serde(default)] + PermissionGrantScope::default = Turn)"},
+          {"step": 1, "condition": "оба network и file_system равны None", "action": "RequestPermissionProfile.is_empty() = true"}
+        ],
+        "edge_cases": null,
+        "lifecycle": {
+          "entity": "SRC-0004/entity/permission-grant-scope",
+          "states": ["turn", "session"],
+          "transition": {
+            "from": "default (turn)",
+            "to": "session или turn по выбору пользователя",
+            "guard": "пользователь принял запрос",
+            "side_effect": "PermissionProfile применяется на ход или сессию в зависимости от scope"
+          }
+        },
+        "ux": [
+          "пользователь видит reason запроса (если предоставлен)",
+          "пользователь видит детальный набор требуемых permissions (network, file_system)"
+        ],
+        "result": "Возвращён RequestPermissionsResponse с permissions и scope; ответ конвертируется в PermissionProfile применимый системой"
+      }
+    },
+    {
+      "id": "SRC-0004/uc.user/answer-user-input-request",
+      "src": "SRC-0004",
+      "composition": "use_case",
+      "level": "user",
+      "strategic_domain": "интерактивный сбор недостающих параметров от пользователя",
+      "terms": {
+        "actor": "Пользователь",
+        "goal": "Ответить на структурированные вопросы агента для предоставления недостающих параметров",
+        "steps": [
+          "1. Агент инициирует RequestUserInputEvent с call_id, turn_id и набором RequestUserInputQuestion",
+          "2. Пользователь видит для каждого вопроса: header, question, опциональный список options (label + description), флаги isOther и isSecret",
+          "3. Пользователь для каждого вопроса (по id) выбирает один из options или вводит свободный текст (если isOther) или скрытое значение (если isSecret)",
+          "4. Пользователь возвращает RequestUserInputResponse с answers: HashMap<question_id, RequestUserInputAnswer{answers: Vec<String>}>"
+        ],
+        "extensions (Cockburn)": [
+          {"step": 1, "condition": "turn_id отсутствует в payload", "action": "turn_id = пустая строка (#[serde(default)] для backwards compatibility)"},
+          {"step": 2, "condition": "options отсутствуют у вопроса", "action": "поле options пропускается при сериализации (skip_serializing_if Option::is_none); ответ — свободный ввод"},
+          {"step": 3, "condition": "isOther = true", "action": "пользователь может ввести значение, не входящее в options"},
+          {"step": 3, "condition": "isSecret = true", "action": "значение скрыто в UI"},
+          {"step": 3, "condition": "isOther/isSecret отсутствуют в payload", "action": "по умолчанию false (#[serde(default)])"}
+        ],
+        "edge_cases": null,
+        "lifecycle": null,
+        "ux": [
+          "пользователь видит header вопроса",
+          "пользователь видит текст question",
+          "при наличии options — выбор из label + description",
+          "при isSecret — поле ввода скрытого значения"
+        ],
+        "result": "Возвращён RequestUserInputResponse где answers индексирован по question.id, каждое значение содержит Vec<String> ответов"
+      }
+    },
+    {
+      "id": "SRC-0004/uc.sub/decode-shell-stream-bytes",
+      "src": "SRC-0004",
+      "composition": "use_case",
+      "level": "sub",
+      "strategic_domain": null,
+      "terms": {
+        "actor": "Модуль декодирования shell-вывода (bytes_to_string_smart)",
+        "goal": "Преобразовать произвольные байты команды в UTF-8 строку с автоопределением legacy-кодировок",
+        "steps": [
+          "1. Модуль декодирования получает байты потока (stdout/stderr)",
+          "2. Модуль проверяет: если bytes пустые — вернуть пустую строку",
+          "3. Модуль пытается интерпретировать байты как UTF-8 (fast-path через std::str::from_utf8)",
+          "4. Если не UTF-8 — модуль вызывает detect_encoding (chardetng EncodingDetector с feed + guess_assess)",
+          "5. Если detector вернул IBM866 и looks_like_windows_1252_punctuation истинно — модуль подменяет кодировку на WINDOWS_1252",
+          "6. Модуль вызывает decode_bytes(bytes, encoding) и возвращает строку"
+        ],
+        "extensions (Cockburn)": [
+          {"step": 3, "condition": "bytes — валидный UTF-8", "action": "вернуть utf8_str.to_owned() сразу (fast-path)"},
+          {"step": 5, "condition": "detector вернул IBM866 + входной поток выглядит как Windows-1252 smart-punctuation вокруг ASCII (только байты из WINDOWS_1252_PUNCT_BYTES в диапазоне 0x80-0x9F + ASCII alphabetic)", "action": "переключить encoding на WINDOWS_1252, чтобы рендерить “…” как кавычки/тире, а не Cyrillic-мусор"},
+          {"step": 5, "condition": "встречен любой байт >= 0xA0 в looks_like_windows_1252_punctuation", "action": "вернуть false — оставить IBM866 как есть"},
+          {"step": 5, "condition": "встречен байт 0x80-0x9F не из WINDOWS_1252_PUNCT_BYTES", "action": "вернуть false — оставить IBM866 как есть"},
+          {"step": 6, "condition": "encoding.decode вернул had_errors = true", "action": "fallback на String::from_utf8_lossy(bytes).into_owned() (Unicode replacement character)"}
+        ],
+        "edge_cases": [
+          {"condition": "bytes только smart-punctuation без ASCII букв", "action": "looks_like_windows_1252_punctuation = false (требуется и saw_extended_punctuation, и saw_ascii_word) → IBM866 не подменяется"}
+        ],
+        "lifecycle": null,
+        "ux": null,
+        "result": "Возвращена String, в которой legacy-кодировки (CP1251, CP866) и Windows-1252 smart punctuation корректно декодированы; в худшем случае — lossy UTF-8 с заменителями"
+      }
+    },
+    {
+      "id": "SRC-0004/uc.sub/deserialize-dynamic-tool-spec-with-legacy-fallback",
+      "src": "SRC-0004",
+      "composition": "use_case",
+      "level": "sub",
+      "strategic_domain": null,
+      "terms": {
+        "actor": "Десериализатор DynamicToolSpec",
+        "goal": "Десериализовать DynamicToolSpec из wire JSON с обратной совместимостью к устаревшему полю exposeToContext",
+        "steps": [
+          "1. Десериализатор десериализует промежуточную структуру DynamicToolSpecDe (name, description, input_schema, deferLoading: Option<bool>, exposeToContext: Option<bool>) из camelCase JSON",
+          "2. Десериализатор вычисляет defer_loading: если deferLoading присутствует — взять его значение",
+          "3. Иначе если exposeToContext присутствует — defer_loading = !expose_to_context (инверсия legacy-поля)",
+          "4. Иначе defer_loading = false",
+          "5. Десериализатор возвращает DynamicToolSpec с вычисленным defer_loading"
+        ],
+        "extensions (Cockburn)": [
+          {"step": 2, "condition": "deferLoading отсутствует, exposeToContext отсутствует", "action": "defer_loading = false (двойной fallback)"},
+          {"step": 2, "condition": "deferLoading=true в payload", "action": "defer_loading = true (приоритет нового поля)"},
+          {"step": 3, "condition": "exposeToContext=false в payload (без deferLoading)", "action": "defer_loading = !false = true (legacy инверсия)"}
+        ],
+        "edge_cases": null,
+        "lifecycle": null,
+        "ux": null,
+        "result": "DynamicToolSpec со скалярным defer_loading: bool, корректно интерпретирующий и новое (deferLoading), и устаревшее (exposeToContext) поля без потери совместимости"
+      }
+    },
+    {
+      "id": "SRC-0004/uc.sub/adapt-mcp-wire-value-to-protocol-type",
+      "src": "SRC-0004",
+      "composition": "use_case",
+      "level": "sub",
+      "strategic_domain": null,
+      "terms": {
+        "actor": "MCP-адаптер (Tool::from_mcp_value, Resource::from_mcp_value, ResourceTemplate::from_mcp_value)",
+        "goal": "Преобразовать wire-shaped MCP JSON (от rmcp) в TS/JsonSchema-совместимые типы протокола Codex без зависимости от mcp-types",
+        "steps": [
+          "1. Адаптер принимает serde_json::Value от MCP-сервера",
+          "2. Адаптер десериализует в промежуточную *Serde структуру (ToolSerde / ResourceSerde / ResourceTemplateSerde) с camelCase + alias snake_case (inputSchema/input_schema, mimeType/mime_type, uriTemplate/uri_template)",
+          "3. Адаптер для Resource.size использует deserialize_lossy_opt_i64: пытается number.as_i64; иначе number.as_u64 затем i64::try_from; иначе None",
+          "4. Адаптер вызывает From<*Serde> for <Type> — побитовое перенаправление полей",
+          "5. Адаптер возвращает Result<Type, serde_json::Error>"
+        ],
+        "extensions (Cockburn)": [
+          {"step": 2, "condition": "wire ключ inputSchema отсутствует", "action": "alias input_schema принимается; default — пустой serde_json::Value"},
+          {"step": 2, "condition": "wire ключ mimeType отсутствует", "action": "alias mime_type принимается"},
+          {"step": 2, "condition": "wire ключ _meta присутствует", "action": "сохраняется в поле meta (rename)"},
+          {"step": 3, "condition": "size валиден как i64", "action": "Some(i64)"},
+          {"step": 3, "condition": "size — u64 в диапазоне i64", "action": "Some(i64) через try_from"},
+          {"step": 3, "condition": "size — u64 вне диапазона i64 (например 18446744073709551615)", "action": "None (значение проигнорировано без ошибки парсинга)"},
+          {"step": 3, "condition": "size — отрицательное число (-1)", "action": "Some(-1) — отрицательные сохраняются"}
+        ],
+        "edge_cases": null,
+        "lifecycle": null,
+        "ux": null,
+        "result": "Tool / Resource / ResourceTemplate готовы к встраиванию в протокол Codex и сериализации с TS/JsonSchema"
+      }
+    },
+    {
+      "id": "SRC-0004/uc.sub/serialize-local-image-to-data-url",
+      "src": "SRC-0004",
+      "composition": "use_case",
+      "level": "sub",
+      "strategic_domain": null,
+      "terms": {
+        "actor": "Сериализатор UserInput",
+        "goal": "Преобразовать локальный путь изображения в Image-вариант с base64 data URL во время сериализации запроса",
+        "steps": [
+          "1. Сериализатор обнаруживает UserInput::LocalImage{path}",
+          "2. Сериализатор конвертирует локальный путь в base64 data URL",
+          "3. Сериализатор заменяет вариант на UserInput::Image{image_url: <data URL>} в исходящем запросе"
+        ],
+        "extensions (Cockburn)": null,
+        "edge_cases": null,
+        "lifecycle": {
+          "entity": "SRC-0004/entity/user-input",
+          "states": ["LocalImage", "Image"],
+          "transition": {
+            "from": "LocalImage{path}",
+            "to": "Image{image_url}",
+            "guard": "момент сериализации запроса",
+            "side_effect": "содержимое файла кодируется в base64 и встраивается в data URL"
+          }
+        },
+        "ux": null,
+        "result": "Исходящий запрос содержит UserInput::Image с pre-encoded data URI вместо локального пути"
+      }
+    },
+    {
+      "id": "SRC-0004/uc.sub/track-text-element-spans",
+      "src": "SRC-0004",
+      "composition": "use_case",
+      "level": "sub",
+      "strategic_domain": null,
+      "terms": {
+        "actor": "UI-слой (производитель TextElement)",
+        "goal": "Сохранить позиции UI-определённых спанов внутри текста сообщения, чтобы рендерить или сохранять rich-маркеры (например, image placeholders) при истории и resume без мутации литерального текста",
+        "steps": [
+          "1. UI создаёт TextElement::new(byte_range, placeholder) для каждого специального спана внутри UserInput::Text.text",
+          "2. UI добавляет элементы в text_elements: Vec<TextElement> у UserInput::Text",
+          "3. При изменении текста (resume/history) клиент вызывает map_range(F) — возвращает копию TextElement с remapped byte_range, placeholder сохраняется как есть",
+          "4. При рендеринге клиент вызывает placeholder(text): возвращает явный placeholder, иначе фрагмент text.get(byte_range.start..byte_range.end)"
+        ],
+        "extensions (Cockburn)": [
+          {"step": 4, "condition": "placeholder = None и byte_range вне границ text", "action": "text.get вернёт None — placeholder отсутствует"},
+          {"step": 3, "condition": "placeholder необходимо обновить отдельно", "action": "set_placeholder(Option<String>) перезаписывает поле"}
+        ],
+        "edge_cases": [
+          {"condition": "placeholder используется внутри From<TextElement> на эквивалентных протокольных типах где исходный text недоступен", "action": "_placeholder_for_conversion_only возвращает Option<&str> без fallback к text — использовать только в From-импл"}
+        ],
+        "lifecycle": null,
+        "ux": [
+          "placeholder отображается в UI вместо сырого спана текста (например, метка для embedded image)"
+        ],
+        "result": "Позиции спанов и их человеческие placeholders сохранены параллельно тексту; при изменениях текста спаны remap-ятся без потери placeholders, при рендере используется человеческий placeholder или fallback на фрагмент текста"
+      }
+    },
+    {
+      "id": "SRC-0004/uc.sub/update-todo-plan",
+      "src": "SRC-0004",
+      "composition": "use_case",
+      "level": "sub",
+      "strategic_domain": null,
+      "terms": {
+        "actor": "TODO/checklist tool (update_plan, codex-vscode/todo-mcp)",
+        "goal": "Обновить чек-лист (plan) набором PlanItemArg(step, status), сопроводив опциональным explanation",
+        "steps": [
+          "1. Tool принимает UpdatePlanArgs с опциональным explanation и обязательным plan: Vec<PlanItemArg>",
+          "2. Tool валидирует: deny_unknown_fields на UpdatePlanArgs и PlanItemArg — любые лишние поля отклоняются",
+          "3. Для каждого PlanItemArg фиксируется текст step и status из enumeration {pending, in_progress, completed}",
+          "4. Tool применяет обновлённый plan к состоянию чек-листа"
+        ],
+        "extensions (Cockburn)": [
+          {"step": 1, "condition": "explanation отсутствует", "action": "поле имеет default = None (#[serde(default)] на Option<String>)"},
+          {"step": 2, "condition": "присутствует поле, не описанное в PlanItemArg/UpdatePlanArgs", "action": "ошибка десериализации — deny_unknown_fields"}
+        ],
+        "edge_cases": null,
+        "lifecycle": {
+          "entity": "SRC-0004/entity/plan-item-arg",
+          "states": ["pending", "in_progress", "completed"],
+          "transition": {
+            "from": "pending или in_progress",
+            "to": "in_progress или completed",
+            "guard": "вызов update_plan с новым status",
+            "side_effect": "состояние шага плана обновлено"
+          }
+        },
+        "ux": null,
+        "result": "Чек-лист отражает актуальные статусы шагов; неизвестные поля приводят к ошибке (строгая схема)"
+      }
+    }
+  ]
+}

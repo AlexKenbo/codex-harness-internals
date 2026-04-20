@@ -1,0 +1,1442 @@
+{
+  "src": "SRC-0013",
+  "schema_version": "2.0",
+  "lens": "rule",
+  "compositions": [
+    {
+      "id": "SRC-0013/rule/tool-search-default-limit",
+      "src": "SRC-0013",
+      "composition": "rule",
+      "terms": {
+        "condition": "default limit для tool_search = 8, если параметр `limit` не передан",
+        "numbers": [{"value": 8, "kind": "default_limit"}],
+        "formula": null,
+        "gwt": {"given": "вызов tool_search без параметра limit", "when": "формируется description инструмента", "then": "в description встраивается 'Maximum number of tools to return (defaults to 8).'"}
+      }
+    },
+    {
+      "id": "SRC-0013/rule/spawn-agents-csv-max-concurrency-default",
+      "src": "SRC-0013",
+      "composition": "rule",
+      "terms": {
+        "condition": "max_concurrency для spawn_agents_on_csv = 16 по умолчанию, capped by config",
+        "numbers": [{"value": 16, "kind": "default_max_concurrency"}],
+        "formula": null,
+        "gwt": {"given": "вызов spawn_agents_on_csv без max_concurrency", "when": "CSV обрабатывается", "then": "запускается до 16 параллельных worker sub-agents (ограничение дополнительно сверху режется конфигом)"}
+      }
+    },
+    {
+      "id": "SRC-0013/rule/spawn-agents-csv-max-runtime-default",
+      "src": "SRC-0013",
+      "composition": "rule",
+      "terms": {
+        "condition": "max_runtime_seconds для worker в spawn_agents_on_csv = 1800 по умолчанию; при превышении worker fail-ится",
+        "numbers": [{"value": 1800, "kind": "default_timeout_seconds"}],
+        "formula": null,
+        "gwt": {"given": "worker выполняет задачу без заданного max_runtime_seconds", "when": "прошло 1800 секунд", "then": "worker помечается как failed"}
+      }
+    },
+    {
+      "id": "SRC-0013/rule/spawn-agents-csv-sequential",
+      "src": "SRC-0013",
+      "composition": "rule",
+      "terms": {
+        "condition": "max_workers=1 → sequential execution (alias для max_concurrency)",
+        "numbers": [{"value": 1, "kind": "sequential_value"}],
+        "formula": null,
+        "gwt": {"given": "spawn_agents_on_csv вызван с max_workers=1", "when": "CSV обрабатывается", "then": "строки обрабатываются последовательно, без параллельных worker-ов"}
+      }
+    },
+    {
+      "id": "SRC-0013/rule/spawn-agents-csv-missing-report",
+      "src": "SRC-0013",
+      "composition": "rule",
+      "terms": {
+        "condition": "worker должен вызвать report_agent_job_result; отсутствие отчёта = failure",
+        "numbers": [],
+        "formula": null,
+        "gwt": {"given": "worker завершился без вызова report_agent_job_result", "when": "собираются результаты CSV job", "then": "строка помечается как failure в output_csv"}
+      }
+    },
+    {
+      "id": "SRC-0013/rule/report-agent-job-result-stop-flag",
+      "src": "SRC-0013",
+      "composition": "rule",
+      "terms": {
+        "condition": "stop=true в report_agent_job_result → cancel оставшихся item-ов после записи текущего результата",
+        "numbers": [],
+        "formula": null,
+        "gwt": {"given": "worker отправляет report_agent_job_result с stop=true", "when": "результат записан", "then": "оставшиеся непроцессенные строки CSV отменяются"}
+      }
+    },
+    {
+      "id": "SRC-0013/rule/spawn-agent-v1-required-fields",
+      "src": "SRC-0013",
+      "composition": "rule",
+      "terms": {
+        "condition": "spawn_agent v1: required fields отсутствуют; required=None (все поля опциональны)",
+        "numbers": [],
+        "formula": null,
+        "gwt": null
+      }
+    },
+    {
+      "id": "SRC-0013/rule/spawn-agent-v2-required-fields",
+      "src": "SRC-0013",
+      "composition": "rule",
+      "terms": {
+        "condition": "spawn_agent v2: required = [task_name, message]",
+        "numbers": [],
+        "formula": null,
+        "gwt": {"given": "вызов spawn_agent v2 без task_name или без message", "when": "Responses API валидирует payload", "then": "запрос отклоняется как не удовлетворяющий required"}
+      }
+    },
+    {
+      "id": "SRC-0013/rule/hide-spawn-agent-metadata",
+      "src": "SRC-0013",
+      "composition": "rule",
+      "terms": {
+        "condition": "hide_agent_type_model_reasoning=true → из spawn_agent параметров удаляются поля agent_type, model, reasoning_effort",
+        "numbers": [],
+        "formula": null,
+        "gwt": {"given": "SpawnAgentToolOptions.hide_agent_type_model_reasoning=true", "when": "create_spawn_agent_tool_v1/v2 строит properties", "then": "hide_spawn_agent_metadata_options удаляет ключи agent_type, model, reasoning_effort из BTreeMap свойств"}
+      }
+    },
+    {
+      "id": "SRC-0013/rule/spawn-agent-v2-output-metadata-gate",
+      "src": "SRC-0013",
+      "composition": "rule",
+      "terms": {
+        "condition": "spawn_agent_output_schema_v2(hide_agent_metadata): hide=true → required=[task_name], properties содержит только task_name; hide=false → required=[task_name, nickname]",
+        "numbers": [],
+        "formula": null,
+        "gwt": {"given": "hide_agent_metadata=true", "when": "формируется output_schema для spawn_agent v2", "then": "output содержит только поле task_name (nickname не выдаётся)"}
+      }
+    },
+    {
+      "id": "SRC-0013/rule/spawn-agent-v2-task-name-format",
+      "src": "SRC-0013",
+      "composition": "rule",
+      "terms": {
+        "condition": "task_name для spawn_agent v2: 'Use lowercase letters, digits, and underscores.' (описание поля)",
+        "numbers": [],
+        "formula": null,
+        "gwt": null
+      }
+    },
+    {
+      "id": "SRC-0013/rule/spawn-agent-v2-fork-turns",
+      "src": "SRC-0013",
+      "composition": "rule",
+      "terms": {
+        "condition": "fork_turns (v2): строка со значениями 'none' | 'all' | положительное целое число как строка (например '3'); default = 'all'",
+        "numbers": [],
+        "formula": null,
+        "gwt": {"given": "fork_turns='3'", "when": "spawn_agent создаёт нового агента", "then": "форкаются только 3 последних turn'а из текущего thread history"}
+      }
+    },
+    {
+      "id": "SRC-0013/rule/send-input-interrupt-default",
+      "src": "SRC-0013",
+      "composition": "rule",
+      "terms": {
+        "condition": "send_input.interrupt: default=false → queue message; true → stop current task and handle immediately",
+        "numbers": [],
+        "formula": null,
+        "gwt": {"given": "send_input вызван с interrupt=false (или опущен)", "when": "целевой агент выполняет задачу", "then": "сообщение помещается в очередь, текущая задача не прерывается"}
+      }
+    },
+    {
+      "id": "SRC-0013/rule/followup-task-interrupt-queue-semantics",
+      "src": "SRC-0013",
+      "composition": "rule",
+      "terms": {
+        "condition": "followup_task.interrupt: default=false → queue message; если target уже running и turn не завершён — сообщение стартует следующий turn после завершения текущего; interrupt=true → перенаправить немедленно",
+        "numbers": [],
+        "formula": null,
+        "gwt": {"given": "followup_task с interrupt=false, target в процессе turn'а", "when": "текущий turn завершается", "then": "новый turn стартует с отправленным сообщением"}
+      }
+    },
+    {
+      "id": "SRC-0013/rule/agent-status-enumeration",
+      "src": "SRC-0013",
+      "composition": "rule",
+      "terms": {
+        "condition": "agent_status — oneOf: строка из enum [pending_init, running, interrupted, shutdown, not_found] ИЛИ {completed: string|null} ИЛИ {errored: string}",
+        "numbers": [],
+        "formula": null,
+        "gwt": {"given": "агент достиг финального статуса с сообщением 'done'", "when": "wait_agent/list_agents/close_agent возвращает status", "then": "status = {completed: 'done'}"}
+      }
+    },
+    {
+      "id": "SRC-0013/rule/list-agents-path-prefix-format",
+      "src": "SRC-0013",
+      "composition": "rule",
+      "terms": {
+        "condition": "list_agents.path_prefix: optional task-path prefix; НЕ должен заканчиваться trailing slash",
+        "numbers": [],
+        "formula": null,
+        "gwt": null
+      }
+    },
+    {
+      "id": "SRC-0013/rule/collab-input-items-types",
+      "src": "SRC-0013",
+      "composition": "rule",
+      "terms": {
+        "condition": "type поля collab_input_items ∈ {text, image, local_image, skill, mention}; для mention path = 'app://<connector-id>' или 'plugin://<plugin-name>@<marketplace-name>'",
+        "numbers": [],
+        "formula": null,
+        "gwt": {"given": "item с type='mention'", "when": "валидируется структура", "then": "path должен быть в формате 'app://<connector-id>' или 'plugin://<plugin-name>@<marketplace-name>'"}
+      }
+    },
+    {
+      "id": "SRC-0013/rule/update-plan-item-status",
+      "src": "SRC-0013",
+      "composition": "rule",
+      "terms": {
+        "condition": "update_plan.plan[*].status ∈ {pending, in_progress, completed}; не более одного шага одновременно в in_progress",
+        "numbers": [{"value": 1, "kind": "max_in_progress_steps"}],
+        "formula": null,
+        "gwt": {"given": "plan = [{step:'A', status:'in_progress'}, {step:'B', status:'in_progress'}]", "when": "модель вызывает update_plan", "then": "нарушение правила 'At most one step can be in_progress at a time'"}
+      }
+    },
+    {
+      "id": "SRC-0013/rule/list-dir-offset-min",
+      "src": "SRC-0013",
+      "composition": "rule",
+      "terms": {
+        "condition": "list_dir.offset: 'Must be 1 or greater' (1-indexed entry numbers)",
+        "numbers": [{"value": 1, "kind": "minimum"}],
+        "formula": null,
+        "gwt": null
+      }
+    },
+    {
+      "id": "SRC-0013/rule/list-dir-depth-min",
+      "src": "SRC-0013",
+      "composition": "rule",
+      "terms": {
+        "condition": "list_dir.depth: 'Must be 1 or greater'",
+        "numbers": [{"value": 1, "kind": "minimum"}],
+        "formula": null,
+        "gwt": null
+      }
+    },
+    {
+      "id": "SRC-0013/rule/list-dir-required-dir-path",
+      "src": "SRC-0013",
+      "composition": "rule",
+      "terms": {
+        "condition": "list_dir.dir_path обязателен и должен быть абсолютным путём",
+        "numbers": [],
+        "formula": null,
+        "gwt": null
+      }
+    },
+    {
+      "id": "SRC-0013/rule/request-user-input-max-questions",
+      "src": "SRC-0013",
+      "composition": "rule",
+      "terms": {
+        "condition": "request_user_input.questions: prefer 1, не превышать 3 (description); каждая question.options: provide 2-3 mutually exclusive choices",
+        "numbers": [
+          {"value": 1, "kind": "preferred_questions"},
+          {"value": 3, "kind": "max_questions"},
+          {"value": 2, "kind": "min_options_per_question"},
+          {"value": 3, "kind": "max_options_per_question"}
+        ],
+        "formula": null,
+        "gwt": {"given": "questions.len()=4", "when": "модель формирует payload", "then": "нарушение правила 'Prefer 1 and do not exceed 3'"}
+      }
+    },
+    {
+      "id": "SRC-0013/rule/request-user-input-options-nonempty",
+      "src": "SRC-0013",
+      "composition": "rule",
+      "terms": {
+        "condition": "request_user_input: каждая question обязана иметь options.len() > 0",
+        "numbers": [{"value": 0, "kind": "empty_options_rejection_threshold"}],
+        "formula": null,
+        "gwt": {"given": "args = {questions:[{..., options: []}]}", "when": "normalize_request_user_input_args обрабатывает args", "then": "возвращает Err('request_user_input requires non-empty options for every question')"}
+      }
+    },
+    {
+      "id": "SRC-0013/rule/request-user-input-header-length",
+      "src": "SRC-0013",
+      "composition": "rule",
+      "terms": {
+        "condition": "question.header: 'Short header label shown in the UI (12 or fewer chars).'",
+        "numbers": [{"value": 12, "kind": "max_header_chars"}],
+        "formula": null,
+        "gwt": null
+      }
+    },
+    {
+      "id": "SRC-0013/rule/request-user-input-option-label-words",
+      "src": "SRC-0013",
+      "composition": "rule",
+      "terms": {
+        "condition": "option.label: 'User-facing label (1-5 words)'",
+        "numbers": [{"value": 1, "kind": "min_words"}, {"value": 5, "kind": "max_words"}],
+        "formula": null,
+        "gwt": null
+      }
+    },
+    {
+      "id": "SRC-0013/rule/request-user-input-is-other-forced",
+      "src": "SRC-0013",
+      "composition": "rule",
+      "terms": {
+        "condition": "нормализация: is_other принудительно = true для каждого question (клиент добавит свободную 'Other' автоматически)",
+        "numbers": [],
+        "formula": null,
+        "gwt": {"given": "args с question.is_other=false", "when": "normalize_request_user_input_args обрабатывает", "then": "question.is_other = true"}
+      }
+    },
+    {
+      "id": "SRC-0013/rule/request-user-input-recommended-suffix",
+      "src": "SRC-0013",
+      "composition": "rule",
+      "terms": {
+        "condition": "рекомендованная опция ставится первой и помечается суффиксом '(Recommended)' в label (не добавлять 'Other' в options — добавит клиент)",
+        "numbers": [],
+        "formula": null,
+        "gwt": null
+      }
+    },
+    {
+      "id": "SRC-0013/rule/request-user-input-availability",
+      "src": "SRC-0013",
+      "composition": "rule",
+      "terms": {
+        "condition": "request_user_input доступен когда mode.allows_request_user_input() ИЛИ (default_mode_request_user_input=true AND mode=ModeKind::Default)",
+        "numbers": [],
+        "formula": "is_available = mode.allows_request_user_input() OR (default_mode_request_user_input AND mode == Default)",
+        "gwt": {"given": "mode=Default, default_mode_request_user_input=true", "when": "request_user_input_is_available вычисляется", "then": "возвращает true (несмотря на Default)"}
+      }
+    },
+    {
+      "id": "SRC-0013/rule/request-user-input-allowed-modes-formatting",
+      "src": "SRC-0013",
+      "composition": "rule",
+      "terms": {
+        "condition": "format_allowed_modes: 0 режимов → 'no modes'; 1 → '{m} mode'; 2 → '{a} or {b} mode'; ≥3 → 'modes: a,b,...'",
+        "numbers": [{"value": 0, "kind": "count"}, {"value": 1, "kind": "count"}, {"value": 2, "kind": "count"}],
+        "formula": null,
+        "gwt": {"given": "разрешены Plan и Chat", "when": "format_allowed_modes вызван", "then": "возвращает 'Plan or Chat mode'"}
+      }
+    },
+    {
+      "id": "SRC-0013/rule/apply-patch-envelope",
+      "src": "SRC-0013",
+      "composition": "rule",
+      "terms": {
+        "condition": "apply_patch envelope: '*** Begin Patch' … '*** End Patch'; внутри — последовательность файл-операций, каждая стартует одним из заголовков {'*** Add File:', '*** Delete File:', '*** Update File:'}; Update может followed '*** Move to: <new path>'; в Update — hunks с '@@' header; hunk line prefix ∈ {' ', '-', '+'}; для Add — каждая строка '+' line",
+        "numbers": [],
+        "formula": null,
+        "gwt": {"given": "patch '*** Begin Patch\\n*** Add File: hello.txt\\n+Hello world\\n*** End Patch'", "when": "apply_patch обрабатывает", "then": "создан файл hello.txt с содержимым 'Hello world'"}
+      }
+    },
+    {
+      "id": "SRC-0013/rule/apply-patch-relative-paths",
+      "src": "SRC-0013",
+      "composition": "rule",
+      "terms": {
+        "condition": "File references в apply_patch: 'can only be relative, NEVER ABSOLUTE'",
+        "numbers": [],
+        "formula": null,
+        "gwt": {"given": "patch с '*** Update File: /etc/passwd'", "when": "apply_patch обрабатывает", "then": "нарушение правила — абсолютные пути запрещены"}
+      }
+    },
+    {
+      "id": "SRC-0013/rule/apply-patch-context-lines",
+      "src": "SRC-0013",
+      "composition": "rule",
+      "terms": {
+        "condition": "apply_patch context: по умолчанию 3 строки кода непосредственно над и 3 строки под изменением; если изменение в пределах 3 строк от предыдущего — не дублировать context_after предыдущего как context_before нового",
+        "numbers": [{"value": 3, "kind": "default_context_lines"}],
+        "formula": null,
+        "gwt": {"given": "два изменения в 2 строках друг от друга", "when": "формируется patch", "then": "context_after первого изменения НЕ повторяется как context_before второго"}
+      }
+    },
+    {
+      "id": "SRC-0013/rule/apply-patch-disambiguation",
+      "src": "SRC-0013",
+      "composition": "rule",
+      "terms": {
+        "condition": "если 3 строк context недостаточно для уникальной идентификации — использовать @@ operator с class/function; для повторяющихся блоков допустимо несколько @@ statements подряд",
+        "numbers": [{"value": 3, "kind": "context_lines"}],
+        "formula": null,
+        "gwt": null
+      }
+    },
+    {
+      "id": "SRC-0013/rule/apply-patch-new-file-prefix",
+      "src": "SRC-0013",
+      "composition": "rule",
+      "terms": {
+        "condition": "новые строки (Add/Update) обязательно начинаются с '+' даже при создании нового файла",
+        "numbers": [],
+        "formula": null,
+        "gwt": null
+      }
+    },
+    {
+      "id": "SRC-0013/rule/apply-patch-input-required",
+      "src": "SRC-0013",
+      "composition": "rule",
+      "terms": {
+        "condition": "apply_patch (JSON variant): required=[input]; input — entire contents of apply_patch command",
+        "numbers": [],
+        "formula": null,
+        "gwt": null
+      }
+    },
+    {
+      "id": "SRC-0013/rule/json-schema-singleton-null-prohibited",
+      "src": "SRC-0013",
+      "composition": "rule",
+      "terms": {
+        "condition": "top-level tool input schema с type='null' (singleton) запрещён — parse_tool_input_schema возвращает Err",
+        "numbers": [],
+        "formula": null,
+        "gwt": {"given": "input_schema = {\"type\": \"null\"}", "when": "parse_tool_input_schema вызван", "then": "возвращается serde_json::Error 'tool input schema must not be a singleton null type'"}
+      }
+    },
+    {
+      "id": "SRC-0013/rule/json-schema-type-inference",
+      "src": "SRC-0013",
+      "composition": "rule",
+      "terms": {
+        "condition": "sanitize_json_schema инферит type при отсутствии: properties/required/additionalProperties → object; items/prefixItems → array; enum/format → string; minimum/maximum/exclusiveMinimum/exclusiveMaximum/multipleOf → number; иначе fallback → string",
+        "numbers": [],
+        "formula": null,
+        "gwt": {"given": "схема {properties: {a: {}}, required: ['a']} без поля type", "when": "sanitize_json_schema обрабатывает", "then": "type='object' дописывается в схему"}
+      }
+    },
+    {
+      "id": "SRC-0013/rule/json-schema-bool-to-string",
+      "src": "SRC-0013",
+      "composition": "rule",
+      "terms": {
+        "condition": "JSON Schema boolean form (true/false) заменяется на {type: 'string'} — accept-all fallback",
+        "numbers": [],
+        "formula": null,
+        "gwt": {"given": "входная схема = true", "when": "sanitize_json_schema обрабатывает", "then": "значение становится {\"type\": \"string\"}"}
+      }
+    },
+    {
+      "id": "SRC-0013/rule/json-schema-const-to-enum",
+      "src": "SRC-0013",
+      "composition": "rule",
+      "terms": {
+        "condition": "если в объекте схемы есть 'const' — удалить и вставить 'enum' с массивом из одного элемента [const_value]",
+        "numbers": [],
+        "formula": null,
+        "gwt": {"given": "{const: 'foo'}", "when": "sanitize_json_schema обрабатывает", "then": "значение становится {enum: ['foo']} без поля const"}
+      }
+    },
+    {
+      "id": "SRC-0013/rule/json-schema-object-default-properties",
+      "src": "SRC-0013",
+      "composition": "rule",
+      "terms": {
+        "condition": "если типы схемы содержат Object и ключ 'properties' отсутствует — вставляется пустой объект {} (обязательно для OpenAI Structured Outputs)",
+        "numbers": [],
+        "formula": null,
+        "gwt": {"given": "schema_types=[Object], map без properties", "when": "ensure_default_children_for_schema_types вызван", "then": "properties = {} вставляется"}
+      }
+    },
+    {
+      "id": "SRC-0013/rule/json-schema-array-default-items",
+      "src": "SRC-0013",
+      "composition": "rule",
+      "terms": {
+        "condition": "если типы схемы содержат Array и ключ 'items' отсутствует — вставляется {type: 'string'} как default items",
+        "numbers": [],
+        "formula": null,
+        "gwt": {"given": "schema_types=[Array], map без items", "when": "ensure_default_children_for_schema_types вызван", "then": "items = {type: 'string'} вставляется"}
+      }
+    },
+    {
+      "id": "SRC-0013/rule/json-schema-supported-primitive-types",
+      "src": "SRC-0013",
+      "composition": "rule",
+      "terms": {
+        "condition": "поддерживаемые primitive types ограничены: {string, number, boolean, integer, object, array, null} (mirrors OpenAI Structured Outputs); прочие имена отбрасываются в normalized_schema_types",
+        "numbers": [{"value": 7, "kind": "supported_types_count"}],
+        "formula": null,
+        "gwt": {"given": "type='date'", "when": "schema_type_from_str вызван", "then": "возвращает None — значение отфильтровывается из массива типов"}
+      }
+    },
+    {
+      "id": "SRC-0013/rule/mcp-tool-properties-required",
+      "src": "SRC-0013",
+      "composition": "rule",
+      "terms": {
+        "condition": "MCP tool: если input_schema.properties отсутствует или null — вставляется пустой {}. OpenAI models mandate 'properties' field (parity с Agents SDK)",
+        "numbers": [],
+        "formula": null,
+        "gwt": {"given": "MCP tool прислал input_schema без properties", "when": "parse_mcp_tool обрабатывает", "then": "properties = {} добавлено перед serde_json десериализацией"}
+      }
+    },
+    {
+      "id": "SRC-0013/rule/mcp-tool-requires-namespace",
+      "src": "SRC-0013",
+      "composition": "rule",
+      "terms": {
+        "condition": "MCP tools обязаны быть namespaced: если tool.name.namespace = None — tool пропускается и логируется ERROR 'Skipping MCP tool `{tool_name}`: MCP tools must be namespaced'",
+        "numbers": [],
+        "formula": null,
+        "gwt": {"given": "MCP tool с plain ToolName (без namespace)", "when": "build_tool_registry_plan обрабатывает mcp_tools", "then": "tool пропускается, handler не регистрируется"}
+      }
+    },
+    {
+      "id": "SRC-0013/rule/mcp-call-result-required-content",
+      "src": "SRC-0013",
+      "composition": "rule",
+      "terms": {
+        "condition": "mcp_call_tool_result_output_schema: required=[content]; структура {content: array<object>, structuredContent: passthrough, isError: boolean, _meta: object}",
+        "numbers": [],
+        "formula": null,
+        "gwt": {"given": "MCP tool response без content", "when": "output валидируется по схеме", "then": "нарушение required"}
+      }
+    },
+    {
+      "id": "SRC-0013/rule/tool-definition-into-deferred",
+      "src": "SRC-0013",
+      "composition": "rule",
+      "terms": {
+        "condition": "ToolDefinition::into_deferred(): output_schema=None, defer_loading=true",
+        "numbers": [],
+        "formula": null,
+        "gwt": {"given": "ToolDefinition {output_schema: Some(x), defer_loading: false}", "when": "вызван into_deferred()", "then": "ToolDefinition {output_schema: None, defer_loading: true}"}
+      }
+    },
+    {
+      "id": "SRC-0013/rule/tool-definition-to-responses-api-tool",
+      "src": "SRC-0013",
+      "composition": "rule",
+      "terms": {
+        "condition": "tool_definition_to_responses_api_tool: strict=false; defer_loading = tool_definition.defer_loading.then_some(true) (None когда false, Some(true) когда true)",
+        "numbers": [],
+        "formula": "ResponsesApiTool.defer_loading = if tool_definition.defer_loading { Some(true) } else { None }",
+        "gwt": {"given": "ToolDefinition {defer_loading: false}", "when": "tool_definition_to_responses_api_tool вызван", "then": "ResponsesApiTool.defer_loading = None (пропущено при сериализации)"}
+      }
+    },
+    {
+      "id": "SRC-0013/rule/unified-exec-shell-mode-gating",
+      "src": "SRC-0013",
+      "composition": "rule",
+      "terms": {
+        "condition": "UnifiedExecShellMode::ZshFork активируется ТОЛЬКО при выполнении ВСЕХ условий: cfg!(unix) AND shell_command_backend=ZshFork AND user_shell_type=Zsh AND shell_zsh_path.is_some() AND main_execve_wrapper_exe.is_some() AND обе конверсии в AbsolutePathBuf успешны. Иначе — Direct",
+        "numbers": [],
+        "formula": null,
+        "gwt": {"given": "cfg!(unix)=true, backend=ZshFork, user_shell=Bash", "when": "for_session вызван", "then": "возвращается UnifiedExecShellMode::Direct (нарушено условие Zsh)"}
+      }
+    },
+    {
+      "id": "SRC-0013/rule/unified-exec-allowed-in-environment",
+      "src": "SRC-0013",
+      "composition": "rule",
+      "terms": {
+        "condition": "unified_exec_allowed = !(is_windows AND windows_sandbox_level != Disabled AND !matches!(sandbox_policy, DangerFullAccess | ExternalSandbox{..})). Проще: на Windows с активным sandbox_level UnifiedExec разрешён только при DangerFullAccess или ExternalSandbox",
+        "numbers": [],
+        "formula": "allowed = !(is_windows && windows_sandbox_level != Disabled && sandbox_policy not in {DangerFullAccess, ExternalSandbox})",
+        "gwt": {"given": "is_windows=true, windows_sandbox_level=Enabled, sandbox_policy=Restricted", "when": "unified_exec_allowed_in_environment вычисляется", "then": "возвращает false — UnifiedExec заблокирован"}
+      }
+    },
+    {
+      "id": "SRC-0013/rule/shell-type-selection",
+      "src": "SRC-0013",
+      "composition": "rule",
+      "terms": {
+        "condition": "shell_type определяется каскадом: !ShellTool→Disabled; ShellZshFork→ShellCommand; UnifiedExec && unified_exec_allowed && conpty_supported→UnifiedExec else ShellCommand; model_info.shell_type=UnifiedExec && !unified_exec_allowed→ShellCommand; иначе model_info.shell_type",
+        "numbers": [],
+        "formula": null,
+        "gwt": {"given": "features=[UnifiedExec], unified_exec_allowed=true, conpty_supported=false", "when": "ToolsConfig::new определяет shell_type", "then": "shell_type=ShellCommand (conpty недоступен)"}
+      }
+    },
+    {
+      "id": "SRC-0013/rule/apply-patch-tool-type-resolution",
+      "src": "SRC-0013",
+      "composition": "rule",
+      "terms": {
+        "condition": "apply_patch_tool_type: если model_info.apply_patch_tool_type задан — используется как есть (Freeform или Function); иначе Some(Freeform) при features.ApplyPatchFreeform, иначе None",
+        "numbers": [],
+        "formula": null,
+        "gwt": {"given": "model_info.apply_patch_tool_type=None, features=[ApplyPatchFreeform]", "when": "ToolsConfig::new вычисляет", "then": "apply_patch_tool_type = Some(Freeform)"}
+      }
+    },
+    {
+      "id": "SRC-0013/rule/tool-suggest-requires-three-features",
+      "src": "SRC-0013",
+      "composition": "rule",
+      "terms": {
+        "condition": "tool_suggest активируется ТОЛЬКО при одновременно включённых фичах: ToolSuggest AND Apps AND Plugins",
+        "numbers": [],
+        "formula": "include_tool_suggest = features.enabled(ToolSuggest) && features.enabled(Apps) && features.enabled(Plugins)",
+        "gwt": {"given": "features=[ToolSuggest, Apps] (без Plugins)", "when": "ToolsConfig::new вычисляет", "then": "tool_suggest=false"}
+      }
+    },
+    {
+      "id": "SRC-0013/rule/search-tool-requires-model-support",
+      "src": "SRC-0013",
+      "composition": "rule",
+      "terms": {
+        "condition": "search_tool активен = model_info.supports_search_tool AND features.enabled(ToolSearch)",
+        "numbers": [],
+        "formula": "include_search_tool = model_info.supports_search_tool && features.enabled(ToolSearch)",
+        "gwt": {"given": "features=[ToolSearch], model_info.supports_search_tool=false", "when": "ToolsConfig::new вычисляет", "then": "search_tool=false"}
+      }
+    },
+    {
+      "id": "SRC-0013/rule/image-gen-tool-requires-all-three",
+      "src": "SRC-0013",
+      "composition": "rule",
+      "terms": {
+        "condition": "image_gen_tool = image_generation_tool_auth_allowed AND features.enabled(ImageGeneration) AND supports_image_generation(model_info). supports_image_generation = model_info.input_modalities.contains(InputModality::Image)",
+        "numbers": [],
+        "formula": "include_image_gen_tool = auth_allowed && features.enabled(ImageGeneration) && model_info.input_modalities.contains(Image)",
+        "gwt": {"given": "API-key auth (не ChatGPT)", "when": "ToolsConfig::new вычисляет", "then": "image_generation_tool_auth_allowed=false → image_gen_tool=false (API-key auth bypasses backend entitlement normalization)"}
+      }
+    },
+    {
+      "id": "SRC-0013/rule/agent-jobs-worker-tools-gating",
+      "src": "SRC-0013",
+      "composition": "rule",
+      "terms": {
+        "condition": "agent_jobs_worker_tools = features.enabled(SpawnCsv) AND session_source is SubAgent(SubAgentSource::Other(label)) with label.starts_with('agent_job:')",
+        "numbers": [],
+        "formula": null,
+        "gwt": {"given": "session_source=SubAgent(Other('agent_job:csv_123')), features=[SpawnCsv]", "when": "ToolsConfig::new вычисляет", "then": "agent_jobs_worker_tools=true — report_agent_job_result добавится в план"}
+      }
+    },
+    {
+      "id": "SRC-0013/rule/js-repl-tools-only-requires-js-repl",
+      "src": "SRC-0013",
+      "composition": "rule",
+      "terms": {
+        "condition": "js_repl_tools_only = features.enabled(JsRepl) AND features.enabled(JsReplToolsOnly) (JsReplToolsOnly не активирует без JsRepl)",
+        "numbers": [],
+        "formula": null,
+        "gwt": null
+      }
+    },
+    {
+      "id": "SRC-0013/rule/code-mode-only-requires-code-mode",
+      "src": "SRC-0013",
+      "composition": "rule",
+      "terms": {
+        "condition": "code_mode_only_enabled = features.enabled(CodeMode) AND features.enabled(CodeModeOnly) (CodeModeOnly не активирует без CodeMode)",
+        "numbers": [],
+        "formula": null,
+        "gwt": null
+      }
+    },
+    {
+      "id": "SRC-0013/rule/code-mode-nested-tools-config",
+      "src": "SRC-0013",
+      "composition": "rule",
+      "terms": {
+        "condition": "ToolsConfig::for_code_mode_nested_tools — клон с code_mode_enabled=false и code_mode_only_enabled=false (для вложенного плана code-mode)",
+        "numbers": [],
+        "formula": null,
+        "gwt": {"given": "config {code_mode_enabled: true, code_mode_only_enabled: true, ...}", "when": "for_code_mode_nested_tools вызван", "then": "новый config {code_mode_enabled: false, code_mode_only_enabled: false, остальное совпадает}"}
+      }
+    },
+    {
+      "id": "SRC-0013/rule/code-mode-wait-registered",
+      "src": "SRC-0013",
+      "composition": "rule",
+      "terms": {
+        "condition": "code_mode регистрирует ровно два обработчика: PUBLIC_TOOL_NAME → CodeModeExecute, WAIT_TOOL_NAME → CodeModeWait",
+        "numbers": [{"value": 2, "kind": "code_mode_handlers_count"}],
+        "formula": null,
+        "gwt": null
+      }
+    },
+    {
+      "id": "SRC-0013/rule/code-mode-deferred-tools-visibility",
+      "src": "SRC-0013",
+      "composition": "rule",
+      "terms": {
+        "condition": "create_code_mode_tool получает deferred_tools_available = config.search_tool AND params.deferred_mcp_tools.is_some_and(|t| !t.is_empty())",
+        "numbers": [],
+        "formula": "deferred_tools_available = config.search_tool && deferred_mcp_tools.is_some_and(|t| !t.is_empty())",
+        "gwt": null
+      }
+    },
+    {
+      "id": "SRC-0013/rule/code-mode-augment-namespace-tools",
+      "src": "SRC-0013",
+      "composition": "rule",
+      "terms": {
+        "condition": "augment_tool_spec_for_code_mode для Namespace варианта использует ToolName::namespaced(namespace.name, tool.name) при построении CodeModeToolDefinition (полное составное имя для augment)",
+        "numbers": [],
+        "formula": null,
+        "gwt": null
+      }
+    },
+    {
+      "id": "SRC-0013/rule/tool-registry-push-spec-augmentation",
+      "src": "SRC-0013",
+      "composition": "rule",
+      "terms": {
+        "condition": "ToolRegistryPlan::push_spec(spec, supports_parallel_tool_calls, code_mode_enabled): если code_mode_enabled=true → spec = augment_tool_spec_for_code_mode(spec); далее spec оборачивается в ConfiguredToolSpec и добавляется в specs",
+        "numbers": [],
+        "formula": null,
+        "gwt": {"given": "push_spec с code_mode_enabled=true", "when": "добавляется tool", "then": "description tool обогащается code-mode примером через augment"}
+      }
+    },
+    {
+      "id": "SRC-0013/rule/tool-suggest-no-code-mode-augment",
+      "src": "SRC-0013",
+      "composition": "rule",
+      "terms": {
+        "condition": "tool_suggest инструмент добавляется в план с code_mode_enabled=false жёстко (не augment-ится даже если config.code_mode_enabled=true)",
+        "numbers": [],
+        "formula": null,
+        "gwt": {"given": "config.code_mode_enabled=true, config.tool_suggest=true", "when": "build_tool_registry_plan добавляет tool_suggest", "then": "push_spec вызывается с code_mode_enabled=false — description остаётся без code-mode сэмпла"}
+      }
+    },
+    {
+      "id": "SRC-0013/rule/code-mode-tools-dedup",
+      "src": "SRC-0013",
+      "composition": "rule",
+      "terms": {
+        "condition": "collect_code_mode_tool_definitions и collect_code_mode_exec_prompt_tool_definitions: сортировка по name, затем dedup_by(name) — только первое вхождение name остаётся",
+        "numbers": [],
+        "formula": null,
+        "gwt": {"given": "specs содержат два инструмента с одинаковым name", "when": "collect_code_mode_tool_definitions вызван", "then": "в результате ровно одна запись с этим name"}
+      }
+    },
+    {
+      "id": "SRC-0013/rule/code-mode-filters-nested",
+      "src": "SRC-0013",
+      "composition": "rule",
+      "terms": {
+        "condition": "collect_code_mode_tool_definitions: фильтрует только те definitions, для которых codex_code_mode::is_code_mode_nested_tool(&definition.name) = true",
+        "numbers": [],
+        "formula": null,
+        "gwt": null
+      }
+    },
+    {
+      "id": "SRC-0013/rule/mcp-tool-sorting",
+      "src": "SRC-0013",
+      "composition": "rule",
+      "terms": {
+        "condition": "build_tool_registry_plan для mcp_tools: entries.sort_by_key(|tool| tool.name.display()) — стабильная сортировка по display name перед группировкой по namespace",
+        "numbers": [],
+        "formula": null,
+        "gwt": null
+      }
+    },
+    {
+      "id": "SRC-0013/rule/mcp-tool-inner-sort",
+      "src": "SRC-0013",
+      "composition": "rule",
+      "terms": {
+        "condition": "внутри каждого namespace группа entries.sort_by_key(|tool| tool.name.name.clone()) — сортировка по name (без namespace)",
+        "numbers": [],
+        "formula": null,
+        "gwt": null
+      }
+    },
+    {
+      "id": "SRC-0013/rule/mcp-tool-namespace-description-fallback",
+      "src": "SRC-0013",
+      "composition": "rule",
+      "terms": {
+        "condition": "описание namespace: tool_namespace.description (trim, непустое) → default_namespace_description(namespace_name) = 'Tools in the {namespace_name} namespace.'",
+        "numbers": [],
+        "formula": null,
+        "gwt": null
+      }
+    },
+    {
+      "id": "SRC-0013/rule/tool-search-source-priority",
+      "src": "SRC-0013",
+      "composition": "rule",
+      "terms": {
+        "condition": "collect_tool_search_source_infos: priority = connector_name (trim, непустое) → server_name (trim, непустое); если и то и то пустое → элемент пропускается",
+        "numbers": [],
+        "formula": null,
+        "gwt": {"given": "ToolSearchSource {connector_name: Some(' '), server_name: 'srv-1'}", "when": "collect_tool_search_source_infos вызван", "then": "возвращается ToolSearchSourceInfo {name: 'srv-1', description: None}"}
+      }
+    },
+    {
+      "id": "SRC-0013/rule/tool-search-description-dedupe",
+      "src": "SRC-0013",
+      "composition": "rule",
+      "terms": {
+        "condition": "create_tool_search_tool: при совпадающих source.name первое непустое description сохраняется (последующие не перезаписывают если первое уже есть)",
+        "numbers": [],
+        "formula": null,
+        "gwt": {"given": "sources=[{name:'Jira', description:Some('A')}, {name:'Jira', description:Some('B')}]", "when": "create_tool_search_tool строит description", "then": "description содержит '- Jira: A'"}
+      }
+    },
+    {
+      "id": "SRC-0013/rule/tool-search-empty-sources",
+      "src": "SRC-0013",
+      "composition": "rule",
+      "terms": {
+        "condition": "если searchable_sources пуст — description-секция 'None currently enabled.'",
+        "numbers": [],
+        "formula": null,
+        "gwt": null
+      }
+    },
+    {
+      "id": "SRC-0013/rule/tool-search-output-description-priority",
+      "src": "SRC-0013",
+      "composition": "rule",
+      "terms": {
+        "condition": "collect_tool_search_output_tools: description = connector_description (trim, непустое) → 'Tools for working with {connector_name}.' (если connector_name непустой) → default_namespace_description(tool_namespace)",
+        "numbers": [],
+        "formula": null,
+        "gwt": null
+      }
+    },
+    {
+      "id": "SRC-0013/rule/tui-client-excludes-plugins",
+      "src": "SRC-0013",
+      "composition": "rule",
+      "terms": {
+        "condition": "filter_tool_suggest_discoverable_tools_for_client: когда app_server_client_name=Some('codex-tui') → отфильтровывать DiscoverableTool::Plugin; для других клиентов (включая None) — пропускать без изменений",
+        "numbers": [],
+        "formula": null,
+        "gwt": {"given": "discoverable_tools=[Connector(c), Plugin(p)], client_name=Some('codex-tui')", "when": "filter вызван", "then": "результат=[Connector(c)]"}
+      }
+    },
+    {
+      "id": "SRC-0013/rule/discoverable-tool-install-url-plugin",
+      "src": "SRC-0013",
+      "composition": "rule",
+      "terms": {
+        "condition": "DiscoverableTool::install_url(): Connector → connector.install_url.as_deref(); Plugin → всегда None",
+        "numbers": [],
+        "formula": null,
+        "gwt": {"given": "DiscoverableTool::Plugin", "when": "install_url() вызван", "then": "возвращает None"}
+      }
+    },
+    {
+      "id": "SRC-0013/rule/tool-suggest-id-whitelist",
+      "src": "SRC-0013",
+      "composition": "rule",
+      "terms": {
+        "condition": "tool_suggest.tool_id: 'Must be one of: {discoverable_tool_ids}' — список id из discoverable_tools встраивается в description поля",
+        "numbers": [],
+        "formula": null,
+        "gwt": null
+      }
+    },
+    {
+      "id": "SRC-0013/rule/tool-suggest-sort",
+      "src": "SRC-0013",
+      "composition": "rule",
+      "terms": {
+        "condition": "format_discoverable_tools: сортировка по name, затем по id (стабильно) — порядок в description детерминирован",
+        "numbers": [],
+        "formula": null,
+        "gwt": null
+      }
+    },
+    {
+      "id": "SRC-0013/rule/tool-suggest-plugin-summary-fallback",
+      "src": "SRC-0013",
+      "composition": "rule",
+      "terms": {
+        "condition": "tool_description_or_fallback: если description непустой (trim) → вернуть; иначе для Connector → 'No description provided.'; для Plugin → plugin_summary (details: 'skills' if has_skills; 'MCP servers: {list}'; 'app connectors: {list}'; если всё пусто → 'No description provided.')",
+        "numbers": [],
+        "formula": null,
+        "gwt": {"given": "Plugin {description: None, has_skills: true, mcp_server_names: ['a', 'b'], app_connector_ids: []}", "when": "tool_description_or_fallback вызван", "then": "возвращает 'skills; MCP servers: a, b'"}
+      }
+    },
+    {
+      "id": "SRC-0013/rule/tool-suggest-approval-kind-value",
+      "src": "SRC-0013",
+      "composition": "rule",
+      "terms": {
+        "condition": "ToolSuggestMeta.codex_approval_kind = 'tool_suggestion' (константа TOOL_SUGGEST_APPROVAL_KIND_VALUE) — идентификатор типа approval для MCP elicitation",
+        "numbers": [],
+        "formula": null,
+        "gwt": null
+      }
+    },
+    {
+      "id": "SRC-0013/rule/verify-connector-suggestion-completed",
+      "src": "SRC-0013",
+      "composition": "rule",
+      "terms": {
+        "condition": "verified_connector_suggestion_completed(tool_id, accessible_connectors): возвращает true ТОЛЬКО если в accessible_connectors есть connector с id==tool_id AND connector.is_accessible==true",
+        "numbers": [],
+        "formula": null,
+        "gwt": {"given": "connector {id: 'stripe', is_accessible: false}", "when": "verified_connector_suggestion_completed('stripe', [connector])", "then": "возвращает false (accessible=false)"}
+      }
+    },
+    {
+      "id": "SRC-0013/rule/all-suggested-connectors-all",
+      "src": "SRC-0013",
+      "composition": "rule",
+      "terms": {
+        "condition": "all_suggested_connectors_picked_up: возвращает true только если ВСЕ expected_connector_ids прошли verified_connector_suggestion_completed (.iter().all(..))",
+        "numbers": [],
+        "formula": null,
+        "gwt": {"given": "expected=['a', 'b'], accessible=[{id:'a', is_accessible:true}, {id:'b', is_accessible:false}]", "when": "all_suggested_connectors_picked_up вызван", "then": "false (b не accessible)"}
+      }
+    },
+    {
+      "id": "SRC-0013/rule/image-detail-original-gate",
+      "src": "SRC-0013",
+      "composition": "rule",
+      "terms": {
+        "condition": "can_request_original_image_detail(model_info) = model_info.supports_image_detail_original — ворота для view_image.detail='original' и output override",
+        "numbers": [],
+        "formula": null,
+        "gwt": null
+      }
+    },
+    {
+      "id": "SRC-0013/rule/normalize-output-image-detail",
+      "src": "SRC-0013",
+      "composition": "rule",
+      "terms": {
+        "condition": "normalize_output_image_detail: возвращает Some(Original) ТОЛЬКО когда detail=Some(Original) AND can_request_original_image_detail(model_info)=true; все прочие случаи (Some(Original) без поддержки, Some(иное), None) → None",
+        "numbers": [],
+        "formula": null,
+        "gwt": {"given": "detail=Some(Original), model_info.supports_image_detail_original=false", "when": "normalize_output_image_detail вызван", "then": "возвращает None"}
+      }
+    },
+    {
+      "id": "SRC-0013/rule/sanitize-original-image-detail-early-return",
+      "src": "SRC-0013",
+      "composition": "rule",
+      "terms": {
+        "condition": "sanitize_original_image_detail: если can_request_original_image_detail=true — ранний return, items не модифицируются; иначе для каждого InputImage с Some(ImageDetail::Original) выставляется detail=None",
+        "numbers": [],
+        "formula": null,
+        "gwt": {"given": "can_request_original=false, items=[InputImage {detail: Some(Original)}]", "when": "sanitize_original_image_detail вызван", "then": "items[0].detail = None"}
+      }
+    },
+    {
+      "id": "SRC-0013/rule/view-image-detail-only-original",
+      "src": "SRC-0013",
+      "composition": "rule",
+      "terms": {
+        "condition": "view_image.detail: единственное поддерживаемое значение = 'original'; поле появляется в schema ТОЛЬКО когда can_request_original_image_detail=true",
+        "numbers": [],
+        "formula": null,
+        "gwt": {"given": "options.can_request_original_image_detail=false", "when": "create_view_image_tool строит properties", "then": "поле 'detail' НЕ добавляется в parameters"}
+      }
+    },
+    {
+      "id": "SRC-0013/rule/web-search-mode-to-external-web-access",
+      "src": "SRC-0013",
+      "composition": "rule",
+      "terms": {
+        "condition": "web_search_mode → external_web_access: Cached→Some(false); Live→Some(true); Disabled→None (возвращается None, инструмент не создаётся); None→None (инструмент не создаётся)",
+        "numbers": [],
+        "formula": null,
+        "gwt": {"given": "web_search_mode=Live", "when": "create_web_search_tool вызван", "then": "external_web_access=Some(true)"}
+      }
+    },
+    {
+      "id": "SRC-0013/rule/web-search-content-types-mapping",
+      "src": "SRC-0013",
+      "composition": "rule",
+      "terms": {
+        "condition": "web_search_tool_type: Text→search_content_types=None; TextAndImage→Some(['text', 'image']) (WEB_SEARCH_TEXT_AND_IMAGE_CONTENT_TYPES)",
+        "numbers": [],
+        "formula": null,
+        "gwt": {"given": "web_search_tool_type=TextAndImage", "when": "create_web_search_tool строит", "then": "search_content_types=Some(['text', 'image'])"}
+      }
+    },
+    {
+      "id": "SRC-0013/rule/exec-command-tty-default",
+      "src": "SRC-0013",
+      "composition": "rule",
+      "terms": {
+        "condition": "exec_command.tty: default=false (plain pipes); true → allocate PTY",
+        "numbers": [],
+        "formula": null,
+        "gwt": null
+      }
+    },
+    {
+      "id": "SRC-0013/rule/exec-command-login-default",
+      "src": "SRC-0013",
+      "composition": "rule",
+      "terms": {
+        "condition": "exec_command.login: появляется в schema только если options.allow_login_shell=true; default=true ('run the shell with -l/-i semantics')",
+        "numbers": [],
+        "formula": null,
+        "gwt": null
+      }
+    },
+    {
+      "id": "SRC-0013/rule/shell-command-login-default",
+      "src": "SRC-0013",
+      "composition": "rule",
+      "terms": {
+        "condition": "shell_command.login: появляется в schema только если options.allow_login_shell=true; default=true ('run the shell with login shell semantics')",
+        "numbers": [],
+        "formula": null,
+        "gwt": null
+      }
+    },
+    {
+      "id": "SRC-0013/rule/exec-command-output-required",
+      "src": "SRC-0013",
+      "composition": "rule",
+      "terms": {
+        "condition": "unified_exec_output_schema: required=[wall_time_seconds, output]; необязательные поля — chunk_id, exit_code, session_id, original_token_count",
+        "numbers": [],
+        "formula": null,
+        "gwt": null
+      }
+    },
+    {
+      "id": "SRC-0013/rule/exec-command-required-cmd",
+      "src": "SRC-0013",
+      "composition": "rule",
+      "terms": {
+        "condition": "exec_command.parameters: required=[cmd]; workdir defaults to turn cwd; shell defaults to user's default shell",
+        "numbers": [],
+        "formula": null,
+        "gwt": null
+      }
+    },
+    {
+      "id": "SRC-0013/rule/write-stdin-required-session",
+      "src": "SRC-0013",
+      "composition": "rule",
+      "terms": {
+        "condition": "write_stdin.parameters: required=[session_id]; chars может быть пустой строкой (poll mode)",
+        "numbers": [],
+        "formula": null,
+        "gwt": null
+      }
+    },
+    {
+      "id": "SRC-0013/rule/shell-tool-required-command",
+      "src": "SRC-0013",
+      "composition": "rule",
+      "terms": {
+        "condition": "shell.parameters: required=[command]; command — array<string> (passed to execvp()); always set workdir; do not use 'cd' unless absolutely necessary",
+        "numbers": [],
+        "formula": null,
+        "gwt": null
+      }
+    },
+    {
+      "id": "SRC-0013/rule/shell-command-required-command",
+      "src": "SRC-0013",
+      "composition": "rule",
+      "terms": {
+        "condition": "shell_command.parameters: required=[command]; command — string (shell script); always set workdir",
+        "numbers": [],
+        "formula": null,
+        "gwt": null
+      }
+    },
+    {
+      "id": "SRC-0013/rule/sandbox-permissions-description-variants",
+      "src": "SRC-0013",
+      "composition": "rule",
+      "terms": {
+        "condition": "create_approval_parameters: когда exec_permission_approvals_enabled=true — sandbox_permissions description упоминает 'with_additional_permissions' (preferred) и 'require_escalated'; когда false — упоминает только 'require_escalated'. В обоих случаях default = 'use_default'",
+        "numbers": [],
+        "formula": null,
+        "gwt": null
+      }
+    },
+    {
+      "id": "SRC-0013/rule/approval-parameters-escalation-only",
+      "src": "SRC-0013",
+      "composition": "rule",
+      "terms": {
+        "condition": "justification и prefix_rule: указываются ТОЛЬКО когда sandbox_permissions='require_escalated'",
+        "numbers": [],
+        "formula": null,
+        "gwt": null
+      }
+    },
+    {
+      "id": "SRC-0013/rule/approval-parameters-additional-permissions-gate",
+      "src": "SRC-0013",
+      "composition": "rule",
+      "terms": {
+        "condition": "additional_permissions (permission_profile_schema с network+file_system) добавляется в approval parameters ТОЛЬКО когда exec_permission_approvals_enabled=true",
+        "numbers": [],
+        "formula": null,
+        "gwt": null
+      }
+    },
+    {
+      "id": "SRC-0013/rule/request-permissions-required",
+      "src": "SRC-0013",
+      "composition": "rule",
+      "terms": {
+        "condition": "request_permissions.parameters: required=[permissions]; reason опционален",
+        "numbers": [],
+        "formula": null,
+        "gwt": null
+      }
+    },
+    {
+      "id": "SRC-0013/rule/request-permissions-scope-semantics",
+      "src": "SRC-0013",
+      "composition": "rule",
+      "terms": {
+        "condition": "Granted permissions: применяются автоматически к последующим shell-like командам в текущем turn; для остатка сессии — только если клиент утверждает в session scope",
+        "numbers": [],
+        "formula": null,
+        "gwt": null
+      }
+    },
+    {
+      "id": "SRC-0013/rule/read-mcp-resource-required",
+      "src": "SRC-0013",
+      "composition": "rule",
+      "terms": {
+        "condition": "read_mcp_resource.parameters: required=[server, uri]; server должен точно соответствовать имени из list_mcp_resources; uri должен быть из возвращённых list_mcp_resources",
+        "numbers": [],
+        "formula": null,
+        "gwt": null
+      }
+    },
+    {
+      "id": "SRC-0013/rule/mcp-resource-tool-preference",
+      "src": "SRC-0013",
+      "composition": "rule",
+      "terms": {
+        "condition": "list_mcp_resources/list_mcp_resource_templates: 'Prefer resources over web search when possible.' — resources preferred",
+        "numbers": [],
+        "formula": null,
+        "gwt": null
+      }
+    },
+    {
+      "id": "SRC-0013/rule/tool-search-preferred-over-list-mcp",
+      "src": "SRC-0013",
+      "composition": "rule",
+      "terms": {
+        "condition": "'For MCP tool discovery, always use tool_search instead of list_mcp_resources or list_mcp_resource_templates.'",
+        "numbers": [],
+        "formula": null,
+        "gwt": null
+      }
+    },
+    {
+      "id": "SRC-0013/rule/tool-suggest-strict-plugin-rule",
+      "src": "SRC-0013",
+      "composition": "rule",
+      "terms": {
+        "condition": "tool_suggest: для discoverable plugin install suggestions применяется stricter explicit-and-unambiguous rule; для connector install suggestions — обычный clear-fit standard",
+        "numbers": [],
+        "formula": null,
+        "gwt": null
+      }
+    },
+    {
+      "id": "SRC-0013/rule/tool-suggest-only-after-search-exhausted",
+      "src": "SRC-0013",
+      "composition": "rule",
+      "terms": {
+        "condition": "tool_suggest вызывается ТОЛЬКО когда: (a) все средства поиска существующего инструмента исчерпаны (включая tool_search если доступен); (b) запрос пользователя чётко матчится с discoverable tool из списка",
+        "numbers": [],
+        "formula": null,
+        "gwt": null
+      }
+    },
+    {
+      "id": "SRC-0013/rule/spawn-agent-only-on-explicit-request",
+      "src": "SRC-0013",
+      "composition": "rule",
+      "terms": {
+        "condition": "spawn_agent используется ТОЛЬКО если пользователь явно просит sub-agents, delegation или parallel agent work; запросы на depth/thoroughness/research/investigation/detailed codebase analysis НЕ считаются разрешением",
+        "numbers": [],
+        "formula": null,
+        "gwt": {"given": "пользователь просит 'do a detailed codebase analysis'", "when": "агент рассматривает spawn_agent", "then": "spawn_agent НЕ вызывается — это не explicit permission"}
+      }
+    },
+    {
+      "id": "SRC-0013/rule/wait-agent-sparing",
+      "src": "SRC-0013",
+      "composition": "rule",
+      "terms": {
+        "condition": "wait_agent вызывать 'very sparingly': только когда результат нужен немедленно для следующего critical-path шага и агент заблокирован до получения",
+        "numbers": [],
+        "formula": null,
+        "gwt": null
+      }
+    },
+    {
+      "id": "SRC-0013/rule/update-plan-explanation-optional",
+      "src": "SRC-0013",
+      "composition": "rule",
+      "terms": {
+        "condition": "update_plan.parameters: required=[plan] (explanation опционален)",
+        "numbers": [],
+        "formula": null,
+        "gwt": null
+      }
+    },
+    {
+      "id": "SRC-0013/rule/test-sync-barrier-participants",
+      "src": "SRC-0013",
+      "composition": "rule",
+      "terms": {
+        "condition": "test_sync_tool.barrier: required=[id, participants]; participants — число tool-calls, которые должны rendezvous до открытия barrier",
+        "numbers": [],
+        "formula": null,
+        "gwt": {"given": "barrier={id:'B1', participants:3}", "when": "три конкурентных вызова test_sync_tool с id='B1' прибывают", "then": "barrier открывается, все три продолжают"}
+      }
+    },
+    {
+      "id": "SRC-0013/rule/js-repl-freeform-anti-json",
+      "src": "SRC-0013",
+      "composition": "rule",
+      "terms": {
+        "condition": "js_repl: freeform tool — 'send raw JavaScript source text'; НЕ отправлять JSON/quoted strings/markdown fences; optional first-line pragma '// codex-js-repl: timeout_ms=...'",
+        "numbers": [],
+        "formula": null,
+        "gwt": {"given": "input='{\"code\": \"1+1\"}'", "when": "grammar валидирует", "then": "отклонение — plain source не должен начинаться с '{' или '\"' или '`'"}
+      }
+    },
+    {
+      "id": "SRC-0013/rule/code-mode-grammar",
+      "src": "SRC-0013",
+      "composition": "rule",
+      "terms": {
+        "condition": "code_mode: freeform grammar допускает optional PRAGMA_LINE '// @exec:...' с NEWLINE перед SOURCE, либо сразу SOURCE",
+        "numbers": [],
+        "formula": null,
+        "gwt": null
+      }
+    },
+    {
+      "id": "SRC-0013/rule/resume-agent-required-id",
+      "src": "SRC-0013",
+      "composition": "rule",
+      "terms": {
+        "condition": "resume_agent.parameters: required=[id]",
+        "numbers": [],
+        "formula": null,
+        "gwt": null
+      }
+    },
+    {
+      "id": "SRC-0013/rule/followup-task-required-target-message",
+      "src": "SRC-0013",
+      "composition": "rule",
+      "terms": {
+        "condition": "followup_task.parameters: required=[target, message]",
+        "numbers": [],
+        "formula": null,
+        "gwt": null
+      }
+    },
+    {
+      "id": "SRC-0013/rule/send-input-required-target",
+      "src": "SRC-0013",
+      "composition": "rule",
+      "terms": {
+        "condition": "send_input.parameters: required=[target]",
+        "numbers": [],
+        "formula": null,
+        "gwt": null
+      }
+    },
+    {
+      "id": "SRC-0013/rule/send-message-required-target-message",
+      "src": "SRC-0013",
+      "composition": "rule",
+      "terms": {
+        "condition": "send_message.parameters: required=[target, message]",
+        "numbers": [],
+        "formula": null,
+        "gwt": null
+      }
+    },
+    {
+      "id": "SRC-0013/rule/close-agent-required-target",
+      "src": "SRC-0013",
+      "composition": "rule",
+      "terms": {
+        "condition": "close_agent (v1, v2).parameters: required=[target]",
+        "numbers": [],
+        "formula": null,
+        "gwt": null
+      }
+    },
+    {
+      "id": "SRC-0013/rule/wait-agent-v1-required-targets",
+      "src": "SRC-0013",
+      "composition": "rule",
+      "terms": {
+        "condition": "wait_agent v1.parameters: required=[targets]; targets — array<string> agent ids (несколько = wait for whichever finishes first)",
+        "numbers": [],
+        "formula": null,
+        "gwt": null
+      }
+    },
+    {
+      "id": "SRC-0013/rule/wait-agent-timeout-description-interpolation",
+      "src": "SRC-0013",
+      "composition": "rule",
+      "terms": {
+        "condition": "wait_agent_tool_parameters_v1/v2: timeout_ms description интерполирует значения из WaitAgentTimeoutOptions: 'Optional timeout in milliseconds. Defaults to {default}, min {min}, max {max}.' (v1 добавляет 'Prefer longer waits (minutes) to avoid busy polling.')",
+        "numbers": [],
+        "formula": null,
+        "gwt": null
+      }
+    },
+    {
+      "id": "SRC-0013/rule/additional-properties-false-everywhere",
+      "src": "SRC-0013",
+      "composition": "rule",
+      "terms": {
+        "condition": "почти все object-схемы параметров инструментов строятся с additional_properties=false (строгая проверка лишних полей)",
+        "numbers": [],
+        "formula": null,
+        "gwt": null
+      }
+    },
+    {
+      "id": "SRC-0013/rule/strict-false-for-all-function-tools",
+      "src": "SRC-0013",
+      "composition": "rule",
+      "terms": {
+        "condition": "во всех ResponsesApiTool фабриках strict=false (TODO в коде: 'When strict is set to true, the JSON schema, required and additional_properties must be present. All fields in properties must be present in required.')",
+        "numbers": [],
+        "formula": null,
+        "gwt": null
+      }
+    },
+    {
+      "id": "SRC-0013/rule/ui-hint-agent-role-guidance",
+      "src": "SRC-0013",
+      "composition": "rule",
+      "terms": {
+        "condition": "available_models_description генерируется ТОЛЬКО когда !hide_agent_type_model_reasoning; фильтрует по model.show_in_picker; fallback 'No picker-visible models are currently loaded.' когда visible_models пусты",
+        "numbers": [],
+        "formula": null,
+        "gwt": {"given": "available_models=[m1 {show_in_picker: false}, m2 {show_in_picker: true}]", "when": "spawn_agent_models_description вызван", "then": "возвращает строку только с m2"}
+      }
+    },
+    {
+      "id": "SRC-0013/rule/ui-hint-spawn-agent-role-guidance-disclaimer",
+      "src": "SRC-0013",
+      "composition": "rule",
+      "terms": {
+        "condition": "при include_usage_hint без явного usage_hint_text и available_models_description.is_some() — добавляется disclaimer: 'Agent-role guidance below only helps choose which agent to use after spawning is already authorized; it never authorizes spawning by itself.'",
+        "numbers": [],
+        "formula": null,
+        "gwt": null
+      }
+    },
+    {
+      "id": "SRC-0013/rule/windows-destructive-rules",
+      "src": "SRC-0013",
+      "composition": "rule",
+      "terms": {
+        "condition": "Windows safety rules (встраиваются в описание exec_command, shell, shell_command на Windows): (1) не композировать destructive filesystem команды через несколько shell-ов; использовать один shell end-to-end, предпочитать native PowerShell cmdlets Remove-Item/Move-Item с -LiteralPath; (2) перед recursive delete/move на Windows — проверить что resolved absolute target paths в пределах intended workspace или явно названной target directory",
+        "numbers": [],
+        "formula": null,
+        "gwt": null
+      }
+    },
+    {
+      "id": "SRC-0013/rule/tool-name-display-formats",
+      "src": "SRC-0013",
+      "composition": "rule",
+      "terms": {
+        "condition": "ToolSpec::name() для типовых вариантов возвращает литералы: ToolSearch→'tool_search'; LocalShell→'local_shell'; ImageGeneration→'image_generation'; WebSearch→'web_search'; для Function/Freeform/Namespace — возвращает tool.name/namespace.name из внутренней структуры",
+        "numbers": [],
+        "formula": null,
+        "gwt": null
+      }
+    },
+    {
+      "id": "SRC-0013/rule/code-mode-tool-definition-variants",
+      "src": "SRC-0013",
+      "composition": "rule",
+      "terms": {
+        "condition": "code_mode_tool_definitions_for_spec: Function→CodeModeToolKind::Function с input_schema из parameters и output_schema; Freeform→CodeModeToolKind::Freeform с input_schema=None, output_schema=None; Namespace→для каждой Function строится CodeModeToolDefinition с ToolName::namespaced и name=tool_name.display(); LocalShell/ImageGeneration/ToolSearch/WebSearch→пустой Vec",
+        "numbers": [],
+        "formula": null,
+        "gwt": {"given": "ToolSpec::LocalShell {}", "when": "code_mode_tool_definitions_for_spec вызван", "then": "возвращает Vec::new() — code-mode не применим"}
+      }
+    },
+    {
+      "id": "SRC-0013/rule/spawn-agents-csv-required-fields",
+      "src": "SRC-0013",
+      "composition": "rule",
+      "terms": {
+        "condition": "spawn_agents_on_csv.parameters: required=[csv_path, instruction]",
+        "numbers": [],
+        "formula": null,
+        "gwt": null
+      }
+    },
+    {
+      "id": "SRC-0013/rule/report-agent-job-result-required-fields",
+      "src": "SRC-0013",
+      "composition": "rule",
+      "terms": {
+        "condition": "report_agent_job_result.parameters: required=[job_id, item_id, result]; stop опционален",
+        "numbers": [],
+        "formula": null,
+        "gwt": null
+      }
+    },
+    {
+      "id": "SRC-0013/rule/view-image-required-path",
+      "src": "SRC-0013",
+      "composition": "rule",
+      "terms": {
+        "condition": "view_image.parameters: required=[path]; описание 'only use if given a full filepath by the user, and the image isn't already attached to the thread context within <image ...> tags'",
+        "numbers": [],
+        "formula": null,
+        "gwt": null
+      }
+    },
+    {
+      "id": "SRC-0013/rule/view-image-output-required",
+      "src": "SRC-0013",
+      "composition": "rule",
+      "terms": {
+        "condition": "view_image_output_schema: required=[image_url, detail]; detail — 'original' либо null (null когда resized)",
+        "numbers": [],
+        "formula": null,
+        "gwt": null
+      }
+    },
+    {
+      "id": "SRC-0013/rule/wait-tool-required-cell-id",
+      "src": "SRC-0013",
+      "composition": "rule",
+      "terms": {
+        "condition": "create_wait_tool (code-mode companion): required=[cell_id]; описание строится как 'Waits on a yielded `{PUBLIC_TOOL_NAME}` cell and returns new output or completion.\\n{build_wait_tool_description}'",
+        "numbers": [],
+        "formula": null,
+        "gwt": null
+      }
+    },
+    {
+      "id": "SRC-0013/rule/ui-hint-agent-role-no-picker",
+      "src": "SRC-0013",
+      "composition": "rule",
+      "terms": {
+        "condition": "spawn_agent_models_description: модель формата '- {display_name} (`{model}`): {description} Default reasoning effort: {default_reasoning_effort}. Supported reasoning efforts: {efforts_joined_comma}.'",
+        "numbers": [],
+        "formula": null,
+        "gwt": null
+      }
+    }
+  ]
+}

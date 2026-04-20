@@ -1,0 +1,612 @@
+{
+  "src": "SRC-0012",
+  "schema_version": "2.0",
+  "lens": "structural",
+  "compositions": [
+    {
+      "id": "SRC-0012/entity/turn-item",
+      "src": "SRC-0012",
+      "composition": "entity",
+      "terms": {
+        "object": "TurnItem — единица turn-активности агента (сообщение пользователя, сообщение агента, reasoning, web-search, image generation, hook prompt)",
+        "attributes": [
+          "variant: enum (UserMessage | AgentMessage | Reasoning | WebSearch | ImageGeneration | HookPrompt)",
+          "id: string (из ResponseItem.id или сгенерированный Uuid v4 если отсутствует)",
+          "content: список фрагментов (text / image) — для UserMessage/AgentMessage",
+          "phase: MessagePhase (для AgentMessage — финальный ответ или Commentary)",
+          "memory_citation: опциональная ссылка на память (для AgentMessage, заполняется после strip_citations)",
+          "summary_text: список текстов саммари (для Reasoning)",
+          "raw_content: список текстов полного reasoning (для Reasoning)",
+          "query: строка поискового запроса (для WebSearch)",
+          "action: WebSearchAction (для WebSearch; default WebSearchAction::Other если action отсутствует)",
+          "status: строка статуса (для ImageGeneration — например 'in_progress')",
+          "revised_prompt: опциональный переписанный промпт (для ImageGeneration)",
+          "result: base64-закодированное изображение (для ImageGeneration)",
+          "saved_path: AbsolutePathBuf к сохранённому файлу (для ImageGeneration, заполняется после сохранения)"
+        ],
+        "relationships": [
+          {"to": "SRC-0012/entity/response-item", "rel": "parsed_from", "card": "1:1"},
+          {"to": "SRC-0012/entity/turn-timing-state", "rel": "triggers_ttfm_on_agent_message", "card": "N:1"}
+        ],
+        "enumerations": {
+          "variant": ["UserMessage", "AgentMessage", "Reasoning", "WebSearch", "ImageGeneration", "HookPrompt"],
+          "role_mapping (ResponseItem.Message.role → TurnItem)": ["user → HookPrompt или UserMessage", "assistant → AgentMessage", "system → None (пропускается)"]
+        },
+        "data_flows": [
+          {"source": "ResponseItem (из model stream)", "transform": "parse_turn_item — matching role и ResponseItem variant", "sink": "TurnItem"},
+          {"source": "AgentMessageItem.content (raw текст)", "transform": "strip_citations + strip_proposed_plan_blocks (в plan_mode)", "sink": "AgentMessageItem.content (stripped) + memory_citation"},
+          {"source": "ImageGenerationItem.result (base64)", "transform": "base64 decode + запись файла", "sink": "saved_path (файл на диске)"}
+        ],
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0012/entity/response-item",
+      "src": "SRC-0012",
+      "composition": "entity",
+      "terms": {
+        "object": "ResponseItem — элемент ответа модели из stream; источник для парсинга в TurnItem и для записи в conversation history",
+        "attributes": [
+          "variant: enum (Message | Reasoning | WebSearchCall | ImageGenerationCall | FunctionCall | LocalShellCall | CustomToolCall | ToolSearchCall | FunctionCallOutput | CustomToolCallOutput | ToolSearchOutput | GhostSnapshot | Compaction | Other)",
+          "role: string ('user' | 'assistant' | 'system') — для Message",
+          "content: список ContentItem (InputText | InputImage | OutputText) — для Message",
+          "id: опциональная строка id",
+          "phase: опциональный MessagePhase — для Message",
+          "summary: список ReasoningItemReasoningSummary — для Reasoning",
+          "action: опциональный WebSearchAction — для WebSearchCall",
+          "status: строка — для ImageGenerationCall",
+          "revised_prompt: опциональная строка — для ImageGenerationCall",
+          "result: строка base64 — для ImageGenerationCall"
+        ],
+        "relationships": [
+          {"to": "SRC-0012/entity/turn-item", "rel": "parsed_into", "card": "1:0..1"},
+          {"to": "SRC-0012/entity/conversation-history", "rel": "recorded_into", "card": "N:1"}
+        ],
+        "enumerations": {
+          "variant": ["Message", "Reasoning", "WebSearchCall", "ImageGenerationCall", "FunctionCall", "LocalShellCall", "CustomToolCall", "ToolSearchCall", "FunctionCallOutput", "CustomToolCallOutput", "ToolSearchOutput", "GhostSnapshot", "Compaction", "Other"],
+          "role (Message.role)": ["user", "assistant", "system"],
+          "records_turn_ttft (by variant)": ["Message (если есть непустой assistant текст)", "Reasoning (если есть непустой summary/content)", "LocalShellCall (always)", "FunctionCall (always)", "CustomToolCall (always)", "ToolSearchCall (always)", "WebSearchCall (always)", "ImageGenerationCall (always)", "GhostSnapshot (always)", "Compaction (always)", "FunctionCallOutput (no)", "CustomToolCallOutput (no)", "ToolSearchOutput (no)", "Other (no)"],
+          "external_context_variants (may pollute thread memory)": ["ToolSearchCall", "ToolSearchOutput", "WebSearchCall"],
+          "variants_deferring_mailbox_next_turn": ["Message (role=assistant, phase≠Commentary, non-empty final answer)", "ImageGenerationCall (always)"]
+        },
+        "data_flows": [
+          {"source": "model output stream", "transform": "handle_output_item_done — route в tool call или non-tool обработку", "sink": "conversation history + TurnItem"},
+          {"source": "ResponseInputItem", "transform": "response_input_to_response_item — маппинг FunctionCallOutput/CustomToolCallOutput/McpToolCallOutput/ToolSearchOutput", "sink": "ResponseItem"}
+        ],
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0012/entity/content-item",
+      "src": "SRC-0012",
+      "composition": "entity",
+      "terms": {
+        "object": "ContentItem — фрагмент содержимого сообщения (текст или изображение)",
+        "attributes": [
+          "variant: enum (InputText | InputImage | OutputText)",
+          "text: string — для InputText/OutputText",
+          "image_url: string — для InputImage"
+        ],
+        "relationships": [
+          {"to": "SRC-0012/entity/response-item", "rel": "belongs_to_message_content", "card": "N:1"},
+          {"to": "SRC-0012/entity/turn-item", "rel": "transformed_to_user_input_or_agent_content", "card": "N:1"}
+        ],
+        "enumerations": {
+          "variant": ["InputText", "InputImage", "OutputText"]
+        },
+        "data_flows": [
+          {"source": "ContentItem::InputText (user message)", "transform": "parse_user_message — пропуск image-tag обёрток вокруг соседнего InputImage, push UserInput::Text", "sink": "UserMessageItem.content (Vec<UserInput>)"},
+          {"source": "ContentItem::InputImage (user message)", "transform": "push UserInput::Image с image_url", "sink": "UserMessageItem.content"},
+          {"source": "ContentItem::InputText/OutputText (assistant message)", "transform": "parse_agent_message — push AgentMessageContent::Text", "sink": "AgentMessageItem.content"},
+          {"source": "ContentItem::OutputText в user message", "transform": "warn log 'Output text in user message'", "sink": "tracing warn (пропускается)"}
+        ],
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0012/entity/contextual-developer-message",
+      "src": "SRC-0012",
+      "composition": "entity",
+      "terms": {
+        "object": "Contextual developer/user message — rollback-trimmable фрагмент, которое может быть срезано при откате turn",
+        "attributes": [
+          "prefix: string (обязательный маркер в начале InputText после trim_start)",
+          "kind: classification — контекстуальный developer (prefix-based) или контекстуальный user (делегируется is_contextual_user_fragment)",
+          "case_sensitivity: case-insensitive сравнение префикса (eq_ignore_ascii_case)"
+        ],
+        "relationships": [
+          {"to": "SRC-0012/entity/content-item", "rel": "classified_by_prefix", "card": "1:1"}
+        ],
+        "enumerations": {
+          "CONTEXTUAL_DEVELOPER_PREFIXES": [
+            "<permissions instructions>",
+            "<model_switch>",
+            "COLLABORATION_MODE_OPEN_TAG (из codex_protocol::protocol)",
+            "REALTIME_CONVERSATION_OPEN_TAG (из codex_protocol::protocol)",
+            "<personality_spec>"
+          ]
+        },
+        "data_flows": [
+          {"source": "ContentItem::InputText.text", "transform": "trim_start + startswith любого CONTEXTUAL_DEVELOPER_PREFIXES (case-insensitive)", "sink": "bool (is_contextual_dev_fragment)"}
+        ],
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0012/entity/image-generation-artifact",
+      "src": "SRC-0012",
+      "composition": "entity",
+      "terms": {
+        "object": "Image generation artifact — сохранённое PNG изображение, сгенерированное моделью",
+        "attributes": [
+          "saved_path: AbsolutePathBuf — путь к файлу",
+          "session_id: string — sanitized",
+          "call_id: string — sanitized, используется как имя файла",
+          "content: bytes — декодированные из base64 result",
+          "default_filename_on_empty: 'generated_image' (когда sanitized = пустая строка)"
+        ],
+        "relationships": [
+          {"to": "SRC-0012/entity/turn-item", "rel": "attached_as_saved_path_to_image-generation-turn-item", "card": "1:1"}
+        ],
+        "enumerations": {
+          "sanitization_allowed_chars": ["ASCII alphanumeric", "-", "_"],
+          "sanitization_replacement_for_other_chars": ["_"]
+        },
+        "data_flows": [
+          {"source": "ImageGenerationCall.result (base64 строка в ResponseItem)", "transform": "base64 STANDARD decode (после trim) → bytes; формирование path через codex_home.join(GENERATED_IMAGE_ARTIFACTS_DIR).join(sanitize(session_id)).join(sanitize(call_id) + '.png'); create_dir_all parent; tokio::fs::write", "sink": "файл .png в файловой системе"},
+          {"source": "успех сохранения", "transform": "создание DeveloperInstructions с текстом 'Generated images are saved to {output_dir} as {output_path} by default. If you need to use a generated image at another path, copy it and leave the original in place unless the user explicitly asks you to delete it.' и image_output_path с placeholder '<image_id>'", "sink": "ResponseItem (записывается в conversation)"}
+        ],
+        "config": {
+          "GENERATED_IMAGE_ARTIFACTS_DIR": {"value": "generated_images", "source": "hardcoded const в stream_events_utils.rs:34", "default": "generated_images"},
+          "file_extension": {"value": ".png", "source": "hardcoded в image_generation_artifact_path (stream_events_utils.rs:61)", "default": ".png"},
+          "codex_home": {"value": "AbsolutePathBuf", "source": "turn_context.config.codex_home (внешний конфиг)", "default": null}
+        }
+      }
+    },
+    {
+      "id": "SRC-0012/entity/output-item-result",
+      "src": "SRC-0012",
+      "composition": "entity",
+      "terms": {
+        "object": "OutputItemResult — результат обработки одного output item из модели (что передать наверх после handle_output_item_done)",
+        "attributes": [
+          "last_agent_message: Option<String> — stripped финальный текст ассистента (для non-tool items)",
+          "needs_follow_up: bool — требуется ли ещё один turn (tool call emitted, MissingLocalShellCallId, RespondToModel)",
+          "tool_future: Option<InFlightFuture<'static>> — future исполнения tool call (если был tool call)"
+        ],
+        "relationships": [
+          {"to": "SRC-0012/entity/response-item", "rel": "produced_from", "card": "1:1"},
+          {"to": "SRC-0012/entity/tool-call", "rel": "may_hold_future_of", "card": "1:0..1"}
+        ],
+        "enumerations": {
+          "default_values": ["last_agent_message = None", "needs_follow_up = false", "tool_future = None"]
+        },
+        "data_flows": [
+          {"source": "ResponseItem + previously_active_item", "transform": "handle_output_item_done — ToolRouter::build_tool_call routing", "sink": "OutputItemResult"}
+        ],
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0012/entity/handle-output-ctx",
+      "src": "SRC-0012",
+      "composition": "entity",
+      "terms": {
+        "object": "HandleOutputCtx — контекст обработки output items (группирует session, turn context, tool runtime, cancellation)",
+        "attributes": [
+          "sess: Arc<Session> — текущая сессия",
+          "turn_context: Arc<TurnContext> — контекст turn",
+          "tool_runtime: ToolCallRuntime — рантайм tool calls",
+          "cancellation_token: CancellationToken — root токен для отмены tool futures (child_token используется для конкретного tool call)"
+        ],
+        "relationships": [
+          {"to": "SRC-0012/entity/output-item-result", "rel": "produces", "card": "1:N"}
+        ],
+        "enumerations": null,
+        "data_flows": null,
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0012/entity/turn-diff-tracker",
+      "src": "SRC-0012",
+      "composition": "entity",
+      "terms": {
+        "object": "TurnDiffTracker — трекер изменений файлов в пределах turn; поддерживает in-memory baseline snapshot и вычисляет агрегированный unified diff",
+        "attributes": [
+          "external_to_temp_name: HashMap<PathBuf, String> — карта внешнего пути к внутреннему стабильному имени (uuid)",
+          "baseline_file_info: HashMap<String, BaselineFileInfo> — внутренний uuid → baseline snapshot",
+          "temp_name_to_current_path: HashMap<String, PathBuf> — внутренний uuid → текущий внешний путь (отражает rename)",
+          "git_root_cache: Vec<PathBuf> — кэш известных git worktree roots"
+        ],
+        "relationships": [
+          {"to": "SRC-0012/entity/baseline-file-info", "rel": "stores", "card": "1:N"},
+          {"to": "SRC-0012/entity/file-change", "rel": "consumes_via_on_patch_begin", "card": "1:N"}
+        ],
+        "enumerations": {
+          "diff_line_prefixes": ["diff --git a/{left} b/{right}", "new file mode {mode}", "deleted file mode {mode}", "old mode {mode}", "new mode {mode}", "index {left_oid}..{right_oid}", "--- {old_header}", "+++ {new_header}", "Binary files differ"]
+        },
+        "data_flows": [
+          {"source": "FileChange (apply_patch changes)", "transform": "on_patch_begin — создать baseline snapshot если внешний путь впервые виден и файл существует; для addition не создаётся baseline (diff как /dev/null); отслеживать rename через move_path", "sink": "baseline_file_info + temp_name_to_current_path"},
+          {"source": "baseline snapshots + текущее состояние файлов на диске", "transform": "get_unified_diff — сортировка по relative_to_git_root_str, get_file_diff per file", "sink": "aggregated unified diff (Option<String>)"},
+          {"source": "file path + repo root", "transform": "git_blob_oid_for_path — 'git -C {root} hash-object -- {rel}'; stdout trim, length==40", "sink": "blob OID (Option<String>)"},
+          {"source": "bytes", "transform": "git_blob_sha1_hex_bytes — sha1 of 'blob {len}\\0{data}'", "sink": "hex OID"},
+          {"source": "символьная ссылка (Symlink)", "transform": "symlink_blob_bytes — read_link → os_str bytes (unix only; на non-unix возвращает None)", "sink": "blob content"},
+          {"source": "left_bytes == right_bytes", "transform": "fast path — пустой diff", "sink": "empty output"}
+        ],
+        "config": {
+          "ZERO_OID": {"value": "0000000000000000000000000000000000000000", "source": "hardcoded const в turn_diff_tracker.rs:15", "default": "0000000000000000000000000000000000000000"},
+          "DEV_NULL": {"value": "/dev/null", "source": "hardcoded const в turn_diff_tracker.rs:16", "default": "/dev/null"},
+          "context_radius": {"value": 3, "source": "hardcoded в TextDiff::unified_diff (turn_diff_tracker.rs:346)", "default": 3}
+        }
+      }
+    },
+    {
+      "id": "SRC-0012/entity/baseline-file-info",
+      "src": "SRC-0012",
+      "composition": "entity",
+      "terms": {
+        "object": "BaselineFileInfo — снимок файла в момент первого видимого patch в этом turn",
+        "attributes": [
+          "path: PathBuf — исходный внешний путь",
+          "content: Vec<u8> — полное байтовое содержимое (для Symlink — байты target read_link)",
+          "mode: FileMode (Regular | Executable | Symlink)",
+          "oid: String — git blob OID (40 hex символов) или ZERO_OID для отсутствующего файла"
+        ],
+        "relationships": [
+          {"to": "SRC-0012/entity/turn-diff-tracker", "rel": "owned_by_by_internal_uuid_key", "card": "N:1"}
+        ],
+        "enumerations": null,
+        "data_flows": [
+          {"source": "file existing on disk", "transform": "file_mode_for_path → mode; blob_bytes(path, mode) → content; git_blob_oid_for_path ИЛИ git_blob_sha1_hex_bytes fallback → oid (для Symlink всегда sha1)", "sink": "BaselineFileInfo"},
+          {"source": "file not existing on disk (addition scenario)", "transform": "создать BaselineFileInfo с content=vec![], mode=Regular, oid=ZERO_OID", "sink": "BaselineFileInfo (представляет /dev/null)"}
+        ],
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0012/entity/file-mode",
+      "src": "SRC-0012",
+      "composition": "entity",
+      "terms": {
+        "object": "FileMode — режим файла в git blob нотации",
+        "attributes": [
+          "variant: enum",
+          "git_mode_string: '100644' | '100755' | '120000' (as_str / Display)"
+        ],
+        "relationships": [
+          {"to": "SRC-0012/entity/baseline-file-info", "rel": "describes_mode_of", "card": "1:N"}
+        ],
+        "enumerations": {
+          "variant": ["Regular", "Executable (only on unix — gated #[cfg(unix)])", "Symlink"],
+          "git_mode_string_by_variant": [
+            "Regular → 100644",
+            "Executable → 100755",
+            "Symlink → 120000"
+          ],
+          "detection_rule_unix": [
+            "fs::symlink_metadata.is_symlink() → Symlink",
+            "permissions().mode() & 0o111 != 0 → Executable",
+            "иначе → Regular"
+          ],
+          "detection_rule_non_unix": ["default → Regular (Executable/Symlink не детектируются)"]
+        },
+        "data_flows": null,
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0012/entity/turn-metadata-bag",
+      "src": "SRC-0012",
+      "composition": "entity",
+      "terms": {
+        "object": "TurnMetadataBag — сериализуемый bag метаданных turn, отправляемый как HTTP header или client metadata",
+        "attributes": [
+          "session_id: Option<String>",
+          "thread_source: Option<&'static str> — имя источника thread (из SessionSource.thread_source_name())",
+          "turn_id: Option<String>",
+          "workspaces: BTreeMap<String, TurnMetadataWorkspace> — ключ = repo_root, значение = workspace git metadata (включается только если git metadata непустой)",
+          "sandbox: Option<String> — sandbox_tag (из sandbox_policy + windows_sandbox_level)"
+        ],
+        "relationships": [
+          {"to": "SRC-0012/entity/turn-metadata-workspace", "rel": "contains_by_repo_root", "card": "1:N"},
+          {"to": "SRC-0012/entity/turn-metadata-state", "rel": "owned_as_base_metadata_by", "card": "1:1"}
+        ],
+        "enumerations": {
+          "serde_skip_rules": [
+            "session_id skip if None",
+            "thread_source skip if None",
+            "turn_id skip if None",
+            "workspaces skip if BTreeMap empty",
+            "sandbox skip if None"
+          ]
+        },
+        "data_flows": [
+          {"source": "TurnMetadataBag (Serialize)", "transform": "serde_json::to_string", "sink": "JSON header string (Option<String>)"},
+          {"source": "session_id + session_source + turn_id + sandbox + repo_root + workspace_git_metadata", "transform": "build_turn_metadata_bag — вставить (repo_root → workspace) в workspaces только если workspace_git_metadata не пуст", "sink": "TurnMetadataBag"}
+        ],
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0012/entity/workspace-git-metadata",
+      "src": "SRC-0012",
+      "composition": "entity",
+      "terms": {
+        "object": "WorkspaceGitMetadata — git-метаданные рабочего каталога, собираемые асинхронно",
+        "attributes": [
+          "associated_remote_urls: Option<BTreeMap<String, String>> — имена remote → URL",
+          "latest_git_commit_hash: Option<String> — SHA HEAD commit",
+          "has_changes: Option<bool> — есть ли незакоммиченные изменения"
+        ],
+        "relationships": [
+          {"to": "SRC-0012/entity/turn-metadata-workspace", "rel": "converts_to_via_From_impl", "card": "1:1"},
+          {"to": "SRC-0012/entity/turn-metadata-state", "rel": "fetched_asynchronously_by", "card": "1:N"}
+        ],
+        "enumerations": {
+          "is_empty_condition": ["associated_remote_urls is None AND latest_git_commit_hash is None AND has_changes is None"]
+        },
+        "data_flows": [
+          {"source": "cwd (AbsolutePathBuf)", "transform": "tokio::join! из get_head_commit_hash + get_git_remote_urls_assume_git_repo + get_has_changes (параллельно); head_commit_hash.map(|sha| sha.0)", "sink": "WorkspaceGitMetadata"}
+        ],
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0012/entity/turn-metadata-workspace",
+      "src": "SRC-0012",
+      "composition": "entity",
+      "terms": {
+        "object": "TurnMetadataWorkspace — сериализуемая проекция WorkspaceGitMetadata для отправки (same fields, with serde skip rules)",
+        "attributes": [
+          "associated_remote_urls: Option<BTreeMap<String, String>> (skip_serializing_if None)",
+          "latest_git_commit_hash: Option<String> (skip_serializing_if None)",
+          "has_changes: Option<bool> (skip_serializing_if None)"
+        ],
+        "relationships": [
+          {"to": "SRC-0012/entity/workspace-git-metadata", "rel": "created_from_via_From_impl", "card": "1:1"},
+          {"to": "SRC-0012/entity/turn-metadata-bag", "rel": "embedded_as_workspaces_value", "card": "N:1"}
+        ],
+        "enumerations": null,
+        "data_flows": null,
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0012/entity/turn-metadata-state",
+      "src": "SRC-0012",
+      "composition": "entity",
+      "terms": {
+        "object": "TurnMetadataState — состояние метаданных turn с ленивой git-энричмент задачей и client metadata merge",
+        "attributes": [
+          "cwd: AbsolutePathBuf",
+          "repo_root: Option<String> (заполняется только если cwd — внутри git репо)",
+          "base_metadata: TurnMetadataBag — исходный bag без git workspace info",
+          "base_header: String — сериализованный base_metadata (или '{}' если сериализация провалилась)",
+          "enriched_header: Arc<RwLock<Option<String>>> — обогащённый git метаданными header (заполняется task-ом)",
+          "responsesapi_client_metadata: Arc<RwLock<Option<HashMap<String, String>>>> — дополнительные key-value от ResponsesAPI клиента",
+          "enrichment_task: Arc<Mutex<Option<JoinHandle<()>>>> — handle асинхронной task git-энричмента"
+        ],
+        "relationships": [
+          {"to": "SRC-0012/entity/turn-metadata-bag", "rel": "owns_as_base_metadata", "card": "1:1"},
+          {"to": "SRC-0012/entity/workspace-git-metadata", "rel": "fetches_asynchronously", "card": "1:N"}
+        ],
+        "enumerations": {
+          "header_resolution_priority": ["enriched_header (если Some) → base_header (fallback)"],
+          "merge_responsesapi_client_metadata_rules": [
+            "parse header как JSON object",
+            "для каждой (key, value) из responsesapi_client_metadata — entry(key).or_insert_with String(value) (не перезаписывать существующий ключ)",
+            "возврат: serde_json to_string"
+          ],
+          "enrichment_idempotency": ["enrichment_task создаётся только если task_guard is_none", "если repo_root is_none — task не запускается"],
+          "poison_error_handling": ["RwLock/Mutex poisoned — unwrap_or_else(PoisonError::into_inner), не падать"]
+        },
+        "data_flows": [
+          {"source": "session_id + session_source + turn_id + cwd + sandbox_policy + windows_sandbox_level", "transform": "new — get_git_repo_root(cwd); sandbox_tag(sandbox_policy, windows_sandbox_level); build_turn_metadata_bag без workspace info; to_header_value или '{}'", "sink": "TurnMetadataState"},
+          {"source": "базовый header + responsesapi_client_metadata", "transform": "current_header_value — выбрать enriched или base, затем merge_responsesapi_client_metadata", "sink": "Option<String> (JSON header)"},
+          {"source": "current_header_value", "transform": "serde_json::from_str в Value", "sink": "Option<Value> (current_meta_value)"},
+          {"source": "spawn_git_enrichment_task", "transform": "tokio::spawn async — fetch_workspace_git_metadata → если workspaces не пуст → build_turn_metadata_bag(с workspace) → to_header_value → записать в enriched_header", "sink": "enriched_header (RwLock<Option<String>>)"},
+          {"source": "cancel_git_enrichment_task", "transform": "task_guard.take(); task.abort()", "sink": "tokio task abort"}
+        ],
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0012/entity/turn-timing-state",
+      "src": "SRC-0012",
+      "composition": "entity",
+      "terms": {
+        "object": "TurnTimingState — состояние тайминга turn: started_at, first_token_at (TTFT), first_message_at (TTFM)",
+        "attributes": [
+          "state: Mutex<TurnTimingStateInner> — tokio async Mutex",
+          "TurnTimingStateInner.started_at: Option<Instant>",
+          "TurnTimingStateInner.started_at_unix_secs: Option<i64>",
+          "TurnTimingStateInner.first_token_at: Option<Instant> — момент первого токена (TTFT recorded)",
+          "TurnTimingStateInner.first_message_at: Option<Instant> — момент первого сообщения (TTFM recorded)"
+        ],
+        "relationships": [
+          {"to": "SRC-0012/entity/response-event", "rel": "records_ttft_from", "card": "1:N"},
+          {"to": "SRC-0012/entity/turn-item", "rel": "records_ttfm_from_agent_message", "card": "1:N"}
+        ],
+        "enumerations": {
+          "mark_turn_started_reset_fields": [
+            "started_at = Some(Instant)",
+            "started_at_unix_secs = Some(now_unix_timestamp_secs)",
+            "first_token_at = None",
+            "first_message_at = None"
+          ],
+          "ttft_idempotency": ["record_turn_ttft возвращает None если first_token_at уже Some"],
+          "ttfm_idempotency": ["record_turn_ttfm возвращает None если first_message_at уже Some"],
+          "ttfm_event_filter": ["только TurnItem::AgentMessage триггерит record_ttfm_for_turn_item"],
+          "unix_secs_overflow_handling": ["i64::try_from на overflow → i64::MAX", "duration_since(UNIX_EPOCH) error → Duration::default()"],
+          "duration_ms_overflow_handling": ["as_millis().try_into::<i64>() on error → i64::MAX"]
+        },
+        "data_flows": [
+          {"source": "Instant (mark_turn_started)", "transform": "lock state; set started_at + started_at_unix_secs; reset first_token_at + first_message_at", "sink": "TurnTimingStateInner"},
+          {"source": "ResponseEvent", "transform": "record_ttft_for_response_event: если response_event_records_turn_ttft → record_turn_ttft; вернуть Duration с момента started_at", "sink": "Option<Duration> (для TURN_TTFT_DURATION_METRIC)"},
+          {"source": "TurnItem (AgentMessage)", "transform": "record_ttfm_for_turn_item: matches AgentMessage → record_turn_ttfm; вернуть Duration", "sink": "Option<Duration> (для TURN_TTFM_DURATION_METRIC)"},
+          {"source": "completed_at_and_duration_ms", "transform": "now_unix_timestamp_secs + started_at.elapsed().as_millis() (или i64::MAX при overflow)", "sink": "(Option<i64> completed_at, Option<i64> duration_ms)"}
+        ],
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0012/entity/response-event",
+      "src": "SRC-0012",
+      "composition": "entity",
+      "terms": {
+        "object": "ResponseEvent — событие SSE стрима ответа модели, классифицируется по признаку 'начинает ли turn TTFT'",
+        "attributes": [
+          "variant: enum"
+        ],
+        "relationships": [
+          {"to": "SRC-0012/entity/response-item", "rel": "may_wrap_in_OutputItemDone_OutputItemAdded", "card": "1:0..1"},
+          {"to": "SRC-0012/entity/turn-timing-state", "rel": "may_trigger_ttft_via", "card": "N:1"}
+        ],
+        "enumerations": {
+          "variant": [
+            "OutputItemDone(ResponseItem)",
+            "OutputItemAdded(ResponseItem)",
+            "OutputTextDelta(_)",
+            "ReasoningSummaryDelta",
+            "ReasoningContentDelta",
+            "Created",
+            "ServerModel(_)",
+            "ServerReasoningIncluded(_)",
+            "Completed",
+            "ReasoningSummaryPartAdded",
+            "RateLimits(_)",
+            "ModelsEtag(_)"
+          ],
+          "records_turn_ttft (true for)": [
+            "OutputItemDone/OutputItemAdded (если внутри response_item_records_turn_ttft возвращает true)",
+            "OutputTextDelta",
+            "ReasoningSummaryDelta",
+            "ReasoningContentDelta"
+          ],
+          "does_not_record_ttft": [
+            "Created",
+            "ServerModel",
+            "ServerReasoningIncluded",
+            "Completed",
+            "ReasoningSummaryPartAdded",
+            "RateLimits",
+            "ModelsEtag"
+          ]
+        },
+        "data_flows": null,
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0012/entity/turn-context",
+      "src": "SRC-0012",
+      "composition": "entity",
+      "terms": {
+        "object": "TurnContext — контекст turn, содержащий конфиг, sub_id, collaboration_mode, session_telemetry, turn_timing_state (используется как внешний контракт в этом SRC)",
+        "attributes": [
+          "config: Arc — config проекта (содержит memories.no_memories_if_mcp_or_web_search, codex_home, memories)",
+          "sub_id: идентификатор (используется в defer_mailbox_delivery_to_next_turn и accept_mailbox_delivery_for_current_turn)",
+          "collaboration_mode.mode: ModeKind (Plan и т.д.)",
+          "session_telemetry: телеметрия (log_tool_failed, record_duration для TURN_TTFT_DURATION_METRIC и TURN_TTFM_DURATION_METRIC)",
+          "turn_timing_state: TurnTimingState"
+        ],
+        "relationships": [
+          {"to": "SRC-0012/entity/turn-timing-state", "rel": "owns", "card": "1:1"},
+          {"to": "SRC-0012/entity/handle-output-ctx", "rel": "embedded_via_Arc_in", "card": "N:1"}
+        ],
+        "enumerations": {
+          "ModeKind (used branches)": ["Plan (triggers plan_mode behaviors: strip_proposed_plan_blocks, completed_item_defers_mailbox_delivery_to_next_turn)"]
+        },
+        "data_flows": null,
+        "config": {
+          "memories.no_memories_if_mcp_or_web_search": {"value": "bool (gate для mark_thread_memory_mode_polluted)", "source": "turn_context.config.memories (внешний конфиг)", "default": null}
+        }
+      }
+    },
+    {
+      "id": "SRC-0012/entity/tool-call",
+      "src": "SRC-0012",
+      "composition": "entity",
+      "terms": {
+        "object": "Tool call — вызов инструмента моделью (routed через ToolRouter::build_tool_call)",
+        "attributes": [
+          "tool_name: имя инструмента (отображается через display())",
+          "payload: payload вызова (log_payload для preview)",
+          "cancellation_token: child_token отсоединённый от ctx.cancellation_token (для отмены конкретного tool future)"
+        ],
+        "relationships": [
+          {"to": "SRC-0012/entity/response-item", "rel": "built_from", "card": "1:1"},
+          {"to": "SRC-0012/entity/output-item-result", "rel": "produces_future_in", "card": "1:1"}
+        ],
+        "enumerations": {
+          "FunctionCallError_variants (routing from Err branch)": [
+            "MissingLocalShellCallId — LocalShellCall без call_id/id → log 'LocalShellCall without call_id or id', session_telemetry.log_tool_failed('local_shell', msg), FunctionCallOutput с call_id=String::new(), needs_follow_up=true",
+            "RespondToModel(message) — tool denied или direct answer → FunctionCallOutput с message, needs_follow_up=true",
+            "Fatal(message) — fatal error → возврат CodexErr::Fatal"
+          ]
+        },
+        "data_flows": [
+          {"source": "ResponseItem", "transform": "ToolRouter::build_tool_call(sess, item)", "sink": "Result<Option<ToolCall>, FunctionCallError>"},
+          {"source": "ToolCall + cancellation_token child", "transform": "ctx.tool_runtime.clone().handle_tool_call(call, cancellation_token)", "sink": "InFlightFuture → OutputItemResult.tool_future"}
+        ],
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0012/entity/conversation-history",
+      "src": "SRC-0012",
+      "composition": "entity",
+      "terms": {
+        "object": "Conversation history — последовательность записанных ResponseItem (session.record_conversation_items, session.emit_turn_item_started/completed)",
+        "attributes": [
+          "items: последовательность ResponseItem (записываемая immediately, чтобы history/rollout оставались синхронизированы даже при отмене turn)",
+          "deferred_mailbox_delivery: флаг для следующего turn (если последний assistant item — финальный ответ или image generation, mailbox delivery откладывается)"
+        ],
+        "relationships": [
+          {"to": "SRC-0012/entity/response-item", "rel": "contains_sequence_of", "card": "1:N"},
+          {"to": "SRC-0012/entity/turn-item", "rel": "emits_started_completed_events_for", "card": "1:N"}
+        ],
+        "enumerations": {
+          "record_completed_response_item_steps": [
+            "sess.record_conversation_items(turn_context, [item])",
+            "if completed_item_defers_mailbox_delivery_to_next_turn(item, plan_mode) → sess.defer_mailbox_delivery_to_next_turn(sub_id)",
+            "mark_thread_memory_mode_polluted_if_external_context",
+            "record_stage1_output_usage_for_completed_item"
+          ]
+        },
+        "data_flows": [
+          {"source": "raw_text ассистент item + strip_citations citations", "transform": "get_thread_id_from_citations → thread_ids; если не пусто и есть state_db → db.record_stage1_output_usage(thread_ids)", "sink": "state_db (storage/threads usage)"},
+          {"source": "item с external context (ToolSearchCall/ToolSearchOutput/WebSearchCall) + memories.no_memories_if_mcp_or_web_search=true", "transform": "state_db::mark_thread_memory_mode_polluted(services.state_db, conversation_id, 'record_completed_response_item')", "sink": "state_db (thread memory polluted flag)"}
+        ],
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0012/entity/response-input-to-response-item-mapping",
+      "src": "SRC-0012",
+      "composition": "entity",
+      "terms": {
+        "object": "ResponseInputItem → ResponseItem mapping — преобразование input типов в item-типы для записи в conversation",
+        "attributes": [
+          "input: ResponseInputItem",
+          "output: Option<ResponseItem>"
+        ],
+        "relationships": [
+          {"to": "SRC-0012/entity/response-item", "rel": "produces", "card": "1:0..1"}
+        ],
+        "enumerations": {
+          "supported_mappings": [
+            "ResponseInputItem::FunctionCallOutput { call_id, output } → ResponseItem::FunctionCallOutput { call_id, output } (clone)",
+            "ResponseInputItem::CustomToolCallOutput { call_id, name, output } → ResponseItem::CustomToolCallOutput { call_id, name, output } (clone)",
+            "ResponseInputItem::McpToolCallOutput { call_id, output } → ResponseItem::FunctionCallOutput { call_id, output.as_function_call_output_payload() }",
+            "ResponseInputItem::ToolSearchOutput { call_id, status, execution, tools } → ResponseItem::ToolSearchOutput { call_id: Some(call_id), status, execution, tools }",
+            "иные варианты → None"
+          ]
+        },
+        "data_flows": null,
+        "config": null
+      }
+    }
+  ]
+}

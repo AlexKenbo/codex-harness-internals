@@ -1,0 +1,506 @@
+{
+  "src": "SRC-0015",
+  "schema_version": "2.0",
+  "lens": "structural",
+  "compositions": [
+    {
+      "id": "SRC-0015/entity/network-approval-service",
+      "src": "SRC-0015",
+      "composition": "entity",
+      "terms": {
+        "object": "NetworkApprovalService — stateful сервис гейта сетевых вызовов: хранит активные approval-вызовы, кэш approved/denied хостов сессии, pending-ожидания решений по хосту",
+        "attributes": [
+          "active_calls: IndexMap<registration_id: String, ActiveNetworkApprovalCall> — активные tool-вызовы, требующие network approval (ordered map)",
+          "call_outcomes: HashMap<registration_id: String, NetworkApprovalOutcome> — результат approval-потока per call (DeniedByUser | DeniedByPolicy(message))",
+          "pending_host_approvals: HashMap<HostApprovalKey, PendingHostApproval> — ожидающие решения по хосту (дедупликация одновременных запросов к одному host)",
+          "session_approved_hosts: HashSet<HostApprovalKey> — хосты, одобренные на всю сессию",
+          "session_denied_hosts: HashSet<HostApprovalKey> — хосты, запрещённые на всю сессию"
+        ],
+        "relationships": [
+          {"to": "SRC-0015/entity/host-approval-key", "rel": "indexes_by", "card": "1:N", "note": "ключ для pending/approved/denied hosts"},
+          {"to": "SRC-0015/entity/active-network-approval-call", "rel": "tracks", "card": "1:N", "note": "активные tool calls"},
+          {"to": "SRC-0015/entity/pending-host-approval", "rel": "tracks", "card": "1:N", "note": "pending per-host approval ожидания"},
+          {"to": "SRC-0015/entity/network-approval-outcome", "rel": "records", "card": "1:N"},
+          {"to": "SRC-0015/entity/network-approval-spec", "rel": "consumes", "card": "N:1", "note": "spec из ToolRuntime.network_approval_spec на начале approval"}
+        ],
+        "enumerations": null,
+        "data_flows": [
+          {"source": "NetworkPolicyRequest (inline network proxy decider)", "transform": "host lowercase + protocol label + port → HostApprovalKey", "sink": "проверка session_denied_hosts → session_approved_hosts → pending_host_approvals"},
+          {"source": "owner request (is_owner=true)", "transform": "если turn_context отсутствует / sandbox policy не разрешает / approval_policy=Never → автоматический Deny; иначе запрос guardian или session.request_command_approval", "sink": "PendingApprovalDecision (AllowOnce/AllowForSession/Deny)"},
+          {"source": "ReviewDecision пользователя или guardian", "transform": "маппинг на PendingApprovalDecision; для NetworkPolicyAmendment — persist + message; для Denied через guardian — guardian_rejection_message", "sink": "call_outcomes + session_approved_hosts / session_denied_hosts"},
+          {"source": "BlockedRequest от NetworkProxy", "transform": "denied_network_policy_message → DeniedByPolicy(message)", "sink": "call_outcomes единственного активного call"},
+          {"source": "session_approved_hosts источника сессии", "transform": "clone hashset", "sink": "session_approved_hosts целевой сессии (sync_session_approved_hosts_to — перенос approved-кэша между сессиями)"}
+        ],
+        "config": {
+          "sandbox_policy_allows_network_approval_flow": {"value": "ReadOnly | WorkspaceWrite", "source": "SandboxPolicy (turn_context.sandbox_policy)", "default": null, "note": "при других sandbox policy approval-поток отключён — немедленный Deny"},
+          "allows_network_approval_flow": {"value": "любая AskForApproval != Never", "source": "turn_context.approval_policy", "default": null, "note": "политика Never запрещает approval-поток — немедленный Deny"}
+        }
+      }
+    },
+    {
+      "id": "SRC-0015/entity/network-approval-spec",
+      "src": "SRC-0015",
+      "composition": "entity",
+      "terms": {
+        "object": "NetworkApprovalSpec — спецификация network approval, возвращаемая ToolRuntime для данного tool call (опциональна). Определяет наличие NetworkProxy и режим approval",
+        "attributes": [
+          "network: Option<NetworkProxy> — прокси-инстанс для tool call (None → network approval не активируется)",
+          "mode: NetworkApprovalMode — Immediate (approval дождаться до run) | Deferred (approval продолжается после run)"
+        ],
+        "relationships": [
+          {"to": "SRC-0015/entity/active-network-approval", "rel": "converts_to", "card": "1:1", "note": "begin_network_approval преобразует spec+turn_id в ActiveNetworkApproval если managed_network_active и spec.network = Some"},
+          {"to": "SRC-0015/entity/tool-runtime", "rel": "produced_by", "card": "N:1", "note": "ToolRuntime::network_approval_spec → NetworkApprovalSpec"}
+        ],
+        "enumerations": {
+          "mode": ["Immediate", "Deferred"]
+        },
+        "data_flows": [
+          {"source": "ToolRuntime.network_approval_spec(req, ctx)", "transform": "при managed_network_active && spec.network.is_some() → генерируется registration_id (uuid), регистрируется в active_calls", "sink": "ActiveNetworkApproval{registration_id, mode}"}
+        ],
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0015/entity/active-network-approval",
+      "src": "SRC-0015",
+      "composition": "entity",
+      "terms": {
+        "object": "ActiveNetworkApproval — активная registration network approval для tool call на время исполнения. Переходит в Deferred или завершается при finish_immediate",
+        "attributes": [
+          "registration_id: Option<String> — UUID регистрации в NetworkApprovalService.active_calls (None если не создана)",
+          "mode: NetworkApprovalMode — Immediate / Deferred"
+        ],
+        "relationships": [
+          {"to": "SRC-0015/entity/deferred-network-approval", "rel": "converts_to", "card": "1:1", "note": "into_deferred: только при mode=Deferred И registration_id=Some"},
+          {"to": "SRC-0015/entity/network-approval-service", "rel": "registered_in", "card": "N:1", "note": "active_calls[registration_id]"}
+        ],
+        "enumerations": null,
+        "data_flows": [
+          {"source": "begin_network_approval(session, turn_id, managed_network_active, spec)", "transform": "uuid v4 → registration_id; register_call(registration_id, turn_id)", "sink": "active_calls + ActiveNetworkApproval"},
+          {"source": "finish_immediate_network_approval(active)", "transform": "take_call_outcome → unregister_call; outcome→ToolError::Rejected или Ok", "sink": "вызывающий код (Result<(), ToolError>)"}
+        ],
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0015/entity/deferred-network-approval",
+      "src": "SRC-0015",
+      "composition": "entity",
+      "terms": {
+        "object": "DeferredNetworkApproval — отложенный approval, продолжающий жить после завершения tool run. Единственное поле — registration_id для поздней очистки",
+        "attributes": [
+          "registration_id: String — идентификатор регистрации в NetworkApprovalService.active_calls"
+        ],
+        "relationships": [
+          {"to": "SRC-0015/entity/network-approval-service", "rel": "registered_in", "card": "N:1"}
+        ],
+        "enumerations": null,
+        "data_flows": [
+          {"source": "ActiveNetworkApproval::into_deferred", "transform": "если mode=Deferred И registration_id=Some → DeferredNetworkApproval{registration_id}; иначе None", "sink": "возвращает Option<DeferredNetworkApproval>"},
+          {"source": "finish_deferred_network_approval(session, deferred)", "transform": "если deferred=Some → unregister_call(registration_id)", "sink": "active_calls (удаление)"}
+        ],
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0015/entity/active-network-approval-call",
+      "src": "SRC-0015",
+      "composition": "entity",
+      "terms": {
+        "object": "ActiveNetworkApprovalCall — запись в active_calls service: tool call, требующий network approval, с привязкой к turn",
+        "attributes": [
+          "registration_id: String — UUID регистрации",
+          "turn_id: String — идентификатор turn, в рамках которого создан call"
+        ],
+        "relationships": [
+          {"to": "SRC-0015/entity/network-approval-service", "rel": "stored_in", "card": "N:1", "note": "active_calls IndexMap"}
+        ],
+        "enumerations": null,
+        "data_flows": [
+          {"source": "register_call(registration_id, turn_id)", "transform": "Arc::new(ActiveNetworkApprovalCall{registration_id, turn_id})", "sink": "active_calls[key=registration_id]"},
+          {"source": "resolve_single_active_call", "transform": "если active_calls.len()==1 → возвращает единственный call", "sink": "owner_call для attribution outcome"}
+        ],
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0015/entity/host-approval-key",
+      "src": "SRC-0015",
+      "composition": "entity",
+      "terms": {
+        "object": "HostApprovalKey — составной ключ идентификации сетевого назначения для approval-кэша: (host, protocol, port)",
+        "attributes": [
+          "host: String — имя хоста в lowercase (нормализация регистра)",
+          "protocol: &'static str — ярлык протокола: http | https | socks5-tcp | socks5-udp",
+          "port: u16 — TCP/UDP порт"
+        ],
+        "relationships": [
+          {"to": "SRC-0015/entity/network-approval-service", "rel": "used_as_key_in", "card": "N:1", "note": "pending_host_approvals / session_approved_hosts / session_denied_hosts"}
+        ],
+        "enumerations": {
+          "protocol_label": ["http", "https", "socks5-tcp", "socks5-udp"]
+        },
+        "data_flows": [
+          {"source": "NetworkPolicyRequest{host, port, protocol}", "transform": "host.to_ascii_lowercase(); protocol_key_label(NetworkApprovalProtocol) → &'static str", "sink": "HostApprovalKey"},
+          {"source": "HostApprovalKey", "transform": "format!(\"network#{protocol}#{host}#{port}\")", "sink": "approval_id_for_key (guardian/session approval id)"},
+          {"source": "HostApprovalKey", "transform": "format!(\"{protocol}://{host}:{port}\")", "sink": "format_network_target (target строка для prompt)"}
+        ],
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0015/entity/network-approval-outcome",
+      "src": "SRC-0015",
+      "composition": "entity",
+      "terms": {
+        "object": "NetworkApprovalOutcome — итог approval-потока per tool call, записывается в call_outcomes и читается на finish_immediate_network_approval",
+        "attributes": [
+          "kind: enum — DeniedByUser (нет payload) | DeniedByPolicy(message: String)"
+        ],
+        "relationships": [
+          {"to": "SRC-0015/entity/network-approval-service", "rel": "stored_in", "card": "N:1", "note": "call_outcomes"},
+          {"to": "SRC-0015/entity/tool-error", "rel": "maps_to", "card": "1:1", "note": "на finish_immediate: DeniedByUser → ToolError::Rejected(\"rejected by user\"); DeniedByPolicy(m) → ToolError::Rejected(m)"}
+        ],
+        "enumerations": {
+          "kind": ["DeniedByUser", "DeniedByPolicy(String)"]
+        },
+        "data_flows": [
+          {"source": "ReviewDecision::Denied | Abort без guardian", "transform": "DeniedByUser", "sink": "call_outcomes[owner_call.registration_id]"},
+          {"source": "ReviewDecision::Denied | Abort с guardian", "transform": "guardian_rejection_message → DeniedByPolicy(message)", "sink": "call_outcomes[owner_call.registration_id]"},
+          {"source": "ReviewDecision::NetworkPolicyAmendment{Deny}", "transform": "DeniedByUser", "sink": "call_outcomes[owner_call.registration_id]"},
+          {"source": "ReviewDecision::TimedOut", "transform": "guardian_timeout_message → DeniedByPolicy(message)", "sink": "call_outcomes[owner_call.registration_id]"},
+          {"source": "BlockedRequest (через record_blocked_request)", "transform": "denied_network_policy_message(blocked) → DeniedByPolicy(message)", "sink": "call_outcomes[single_active_call.registration_id]"},
+          {"source": "turn_context=None / sandbox policy не разрешает / approval_policy=Never (в handle_inline_policy_request)", "transform": "DeniedByPolicy(\"Network access to {target} was blocked by policy.\")", "sink": "call_outcomes[single_active_call.registration_id]"}
+        ],
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0015/entity/pending-approval-decision",
+      "src": "SRC-0015",
+      "composition": "entity",
+      "terms": {
+        "object": "PendingApprovalDecision — внутренний итог решения approval, транслируется в NetworkDecision и управляет кэшами сессии",
+        "attributes": [
+          "kind: enum"
+        ],
+        "relationships": [
+          {"to": "SRC-0015/entity/network-approval-service", "rel": "drives_cache_update", "card": "N:1", "note": "AllowForSession → session_approved_hosts.insert; Deny (через NetworkPolicyAmendment) → session_denied_hosts.insert и approved_hosts.remove"}
+        ],
+        "enumerations": {
+          "kind": ["AllowOnce", "AllowForSession", "Deny"]
+        },
+        "data_flows": [
+          {"source": "PendingApprovalDecision", "transform": "to_network_decision(): AllowOnce|AllowForSession → NetworkDecision::Allow; Deny → NetworkDecision::deny(\"not_allowed\")", "sink": "NetworkDecision (ответ в NetworkPolicyDecider)"},
+          {"source": "ReviewDecision", "transform": "Approved | ApprovedExecpolicyAmendment → AllowOnce; ApprovedForSession → AllowForSession; NetworkPolicyAmendment{Allow} → AllowForSession (+ persist amendment); NetworkPolicyAmendment{Deny} → Deny (+ persist amendment + cache_session_deny); Denied | Abort | TimedOut → Deny", "sink": "resolved: PendingApprovalDecision"}
+        ],
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0015/entity/pending-host-approval",
+      "src": "SRC-0015",
+      "composition": "entity",
+      "terms": {
+        "object": "PendingHostApproval — дедупликатор одновременных approval-запросов к одному хосту: первый запрос становится owner и инициирует approval, остальные ждут решения через Notify",
+        "attributes": [
+          "decision: Option<PendingApprovalDecision> — итоговое решение после ответа user/guardian (Mutex)",
+          "notify: Notify — ожидание пробуждения после set_decision"
+        ],
+        "relationships": [
+          {"to": "SRC-0015/entity/host-approval-key", "rel": "keyed_by", "card": "N:1", "note": "pending_host_approvals HashMap<HostApprovalKey, PendingHostApproval>"},
+          {"to": "SRC-0015/entity/pending-approval-decision", "rel": "carries", "card": "1:1"}
+        ],
+        "enumerations": null,
+        "data_flows": [
+          {"source": "get_or_create_pending_approval(key)", "transform": "если key в map → (existing, is_owner=false); иначе insert new → (created, is_owner=true)", "sink": "(pending, is_owner)"},
+          {"source": "is_owner=false", "transform": "wait_for_decision loop: notified.await пока decision=None; при decision=Some → to_network_decision", "sink": "NetworkDecision (возврат не-owner)"},
+          {"source": "set_decision(decision)", "transform": "lock → *current=Some(decision); notify_waiters", "sink": "все waiters пробуждаются"}
+        ],
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0015/entity/network-approval-context",
+      "src": "SRC-0015",
+      "composition": "entity",
+      "terms": {
+        "object": "NetworkApprovalContext — контекст network approval, прокидываемый в ApprovalCtx и в approval_request для guardian/user prompt. Описывает целевой хост и протокол",
+        "attributes": [
+          "host: String — имя хоста",
+          "protocol: NetworkApprovalProtocol — Http | Https | Socks5Tcp | Socks5Udp"
+        ],
+        "relationships": [
+          {"to": "SRC-0015/entity/approval-ctx", "rel": "embedded_in", "card": "1:1", "note": "ApprovalCtx.network_approval_context: Option<NetworkApprovalContext>"},
+          {"to": "SRC-0015/entity/host-approval-key", "rel": "sibling_of", "card": "1:1"}
+        ],
+        "enumerations": {
+          "protocol": ["Http", "Https", "Socks5Tcp", "Socks5Udp"]
+        },
+        "data_flows": [
+          {"source": "NetworkPolicyRequest", "transform": "host.clone() + mapped protocol", "sink": "NetworkApprovalContext"},
+          {"source": "ReviewDecision::NetworkPolicyAmendment{amendment}", "transform": "session.persist_network_policy_amendment(&amendment, &context)", "sink": "persisted amendment + record_network_policy_amendment_message"}
+        ],
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0015/entity/approval-store",
+      "src": "SRC-0015",
+      "composition": "entity",
+      "terms": {
+        "object": "ApprovalStore — кэш решений approval per session per tool: сериализованный ключ → ReviewDecision. Используется для 'Allow for session' семантики на tool-level",
+        "attributes": [
+          "map: HashMap<String (JSON-serialized key), ReviewDecision>"
+        ],
+        "relationships": [
+          {"to": "SRC-0015/entity/session-services", "rel": "owned_by", "card": "N:1", "note": "services.tool_approvals"},
+          {"to": "SRC-0015/entity/review-decision", "rel": "stores", "card": "1:N"}
+        ],
+        "enumerations": null,
+        "data_flows": [
+          {"source": "with_cached_approval(services, tool_name, keys, fetch)", "transform": "для всех keys: store.get(key) == Some(ApprovedForSession) → short-circuit return ApprovedForSession; иначе fetch().await", "sink": "ReviewDecision"},
+          {"source": "fetch вернул ApprovedForSession", "transform": "для каждого ключа: store.put(key, ApprovedForSession)", "sink": "map (кэш session-wide)"},
+          {"source": "каждый запрос approval (fetch)", "transform": "session_telemetry.counter(\"codex.approval.requested\", 1, [(\"tool\", tool_name), (\"approved\", decision.to_opaque_string())])", "sink": "telemetry"}
+        ],
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0015/entity/approval-ctx",
+      "src": "SRC-0015",
+      "composition": "entity",
+      "terms": {
+        "object": "ApprovalCtx — контекст запроса approval, передаваемый в Approvable::start_approval_async",
+        "attributes": [
+          "session: &Arc<Session> — ссылка на сессию",
+          "turn: &Arc<TurnContext> — текущий turn",
+          "call_id: &str — идентификатор tool call под review",
+          "guardian_review_id: Option<String> — ID review при маршрутизации через guardian (отдельный от call_id — ID review, не tool item)",
+          "retry_reason: Option<String> — причина retry при повторной попытке",
+          "network_approval_context: Option<NetworkApprovalContext> — контекст для network approval"
+        ],
+        "relationships": [
+          {"to": "SRC-0015/entity/network-approval-context", "rel": "contains", "card": "1:0..1"},
+          {"to": "SRC-0015/entity/approvable", "rel": "consumed_by", "card": "N:N", "note": "Approvable::start_approval_async(&mut self, req, ctx)"}
+        ],
+        "enumerations": null,
+        "data_flows": null,
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0015/entity/exec-approval-requirement",
+      "src": "SRC-0015",
+      "composition": "entity",
+      "terms": {
+        "object": "ExecApprovalRequirement — инструкция tool orchestrator: что сделать с tool call (пропустить approval / спросить / запретить). Решение о требовании approval исходя из политики и sandbox kind",
+        "attributes": [
+          "variant: enum — Skip{bypass_sandbox, proposed_execpolicy_amendment} | NeedsApproval{reason, proposed_execpolicy_amendment} | Forbidden{reason}",
+          "bypass_sandbox: bool (в Skip) — первый attempt пропускает sandbox (трастовая команда)",
+          "proposed_execpolicy_amendment: Option<ExecPolicyAmendment> (в Skip|NeedsApproval) — предлагаемое изменение exec policy для будущих auto-approval",
+          "reason: Option<String> (в NeedsApproval) | String (в Forbidden) — причина требования/запрета"
+        ],
+        "relationships": [
+          {"to": "SRC-0015/entity/sandbox-override", "rel": "drives", "card": "1:1", "note": "sandbox_override_for_first_attempt: Skip{bypass_sandbox=true} → BypassSandboxFirstAttempt"},
+          {"to": "SRC-0015/entity/approvable", "rel": "returned_by", "card": "N:N", "note": "Approvable::exec_approval_requirement (Option override)"}
+        ],
+        "enumerations": {
+          "variant": ["Skip{bypass_sandbox, proposed_execpolicy_amendment}", "NeedsApproval{reason, proposed_execpolicy_amendment}", "Forbidden{reason}"]
+        },
+        "data_flows": [
+          {"source": "AskForApproval policy + FileSystemSandboxPolicy.kind", "transform": "default_exec_approval_requirement: вычисляет needs_approval по политике; если Granular && !allows_sandbox_approval → Forbidden; иначе NeedsApproval или Skip{bypass_sandbox=false}", "sink": "ExecApprovalRequirement"},
+          {"source": "ExecApprovalRequirement::Skip | NeedsApproval", "transform": "proposed_execpolicy_amendment() извлекает &ExecPolicyAmendment если есть", "sink": "ExecPolicyAmendment (для последующего применения)"}
+        ],
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0015/entity/ask-for-approval-policy",
+      "src": "SRC-0015",
+      "composition": "entity",
+      "terms": {
+        "object": "AskForApproval — политика запроса approval у пользователя (внешняя enum, но здесь наблюдаемый полный перечень значений и правил их трактовки в default_exec_approval_requirement / wants_no_sandbox_approval / allows_network_approval_flow / should_bypass_approval)",
+        "attributes": [
+          "variant: enum",
+          "granular_config.allows_sandbox_approval: bool (для Granular) — разрешает ли sandbox approval prompt",
+          "granular_config.sandbox_approval: bool (для Granular) — разрешает ли no-sandbox approval"
+        ],
+        "relationships": [
+          {"to": "SRC-0015/entity/exec-approval-requirement", "rel": "determines", "card": "1:1"},
+          {"to": "SRC-0015/entity/network-approval-service", "rel": "gates_flow", "card": "1:1", "note": "allows_network_approval_flow: Never → поток запрещён"}
+        ],
+        "enumerations": {
+          "variant": ["Never", "OnFailure", "OnRequest", "Granular(GranularConfig)", "UnlessTrusted"]
+        },
+        "data_flows": [
+          {"source": "AskForApproval", "transform": "default_exec_approval_requirement вычисляет needs_approval: Never|OnFailure→false; OnRequest|Granular→только если FS kind=Restricted; UnlessTrusted→true", "sink": "ExecApprovalRequirement"},
+          {"source": "AskForApproval", "transform": "wants_no_sandbox_approval: OnFailure→true; UnlessTrusted→true; Never→false; OnRequest→false; Granular→granular_config.sandbox_approval", "sink": "bool (можно ли запросить no-sandbox approval)"},
+          {"source": "AskForApproval", "transform": "allows_network_approval_flow: любое кроме Never → true", "sink": "bool"},
+          {"source": "AskForApproval", "transform": "should_bypass_approval: already_approved → true; Never → true; иначе false", "sink": "bool"}
+        ],
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0015/entity/sandbox-override",
+      "src": "SRC-0015",
+      "composition": "entity",
+      "terms": {
+        "object": "SandboxOverride — указатель, нужно ли обойти sandbox на первой попытке исполнения tool call",
+        "attributes": [
+          "variant: enum"
+        ],
+        "relationships": [
+          {"to": "SRC-0015/entity/sandbox-attempt", "rel": "drives", "card": "1:1", "note": "BypassSandboxFirstAttempt → первый attempt без sandbox"}
+        ],
+        "enumerations": {
+          "variant": ["NoOverride", "BypassSandboxFirstAttempt"]
+        },
+        "data_flows": [
+          {"source": "SandboxPermissions.requires_escalated_permissions() || ExecApprovalRequirement::Skip{bypass_sandbox=true}", "transform": "sandbox_override_for_first_attempt: true → BypassSandboxFirstAttempt; иначе NoOverride", "sink": "SandboxOverride"}
+        ],
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0015/entity/sandbox-attempt",
+      "src": "SRC-0015",
+      "composition": "entity",
+      "terms": {
+        "object": "SandboxAttempt — описание одной попытки исполнения под sandbox: тип sandbox, политика, FS/network/manager. Строит ExecRequest через SandboxManager.transform",
+        "attributes": [
+          "sandbox: SandboxType — тип sandbox (macOS/Linux/Windows/…)",
+          "policy: &SandboxPolicy — общая политика sandbox",
+          "file_system_policy: &FileSystemSandboxPolicy — политика FS",
+          "network_policy: NetworkSandboxPolicy — политика сети (sandbox-уровня)",
+          "enforce_managed_network: bool — инфорсить managed network (проксирование через NetworkProxy)",
+          "manager: &SandboxManager — трансформатор команды (pub(crate))",
+          "sandbox_cwd: &AbsolutePathBuf — cwd для sandbox (pub(crate))",
+          "codex_linux_sandbox_exe: Option<&PathBuf> — путь к бинарю Linux sandbox",
+          "use_legacy_landlock: bool — использовать legacy Landlock API",
+          "windows_sandbox_level: WindowsSandboxLevel — уровень Windows sandbox",
+          "windows_sandbox_private_desktop: bool — использовать private desktop (Windows)"
+        ],
+        "relationships": [
+          {"to": "SRC-0015/entity/tool-runtime", "rel": "consumed_by", "card": "1:N", "note": "ToolRuntime::run(&req, attempt, ctx)"},
+          {"to": "SRC-0015/entity/network-approval-service", "rel": "coordinates_with", "card": "N:1", "note": "через NetworkProxy при enforce_managed_network"}
+        ],
+        "enumerations": null,
+        "data_flows": [
+          {"source": "SandboxAttempt.env_for(command, options, network)", "transform": "SandboxManager.transform(SandboxTransformRequest{command, policy, file_system_policy, network_policy, sandbox, enforce_managed_network, network, sandbox_policy_cwd, codex_linux_sandbox_exe, use_legacy_landlock, windows_sandbox_level, windows_sandbox_private_desktop})", "sink": "ExecRequest (через ExecRequest::from_sandbox_exec_request(request, options)) | SandboxTransformError"}
+        ],
+        "config": {
+          "use_legacy_landlock": {"value": "bool", "source": "SandboxAttempt параметр (передаётся из вышестоящего config)", "default": null, "note": "выбор между legacy и новым Landlock API на Linux"},
+          "windows_sandbox_level": {"value": "WindowsSandboxLevel", "source": "config_types::WindowsSandboxLevel", "default": null},
+          "windows_sandbox_private_desktop": {"value": "bool", "source": "SandboxAttempt параметр", "default": null},
+          "enforce_managed_network": {"value": "bool", "source": "SandboxAttempt параметр", "default": null, "note": "включает проксирование сети через NetworkProxy"}
+        }
+      }
+    },
+    {
+      "id": "SRC-0015/entity/tool-runtime",
+      "src": "SRC-0015",
+      "composition": "entity",
+      "terms": {
+        "object": "ToolRuntime<Req, Out> — трейт runtime исполнения tool call: наследует Approvable + Sandboxable, предоставляет network_approval_spec и run. Роль — контракт tool runtime",
+        "attributes": [
+          "network_approval_spec(req, ctx) -> Option<NetworkApprovalSpec> (default: None) — указывает, требуется ли network approval для этого tool call",
+          "run(&mut self, req, attempt: &SandboxAttempt, ctx: &ToolCtx) -> Result<Out, ToolError> — исполнение под sandbox attempt"
+        ],
+        "relationships": [
+          {"to": "SRC-0015/entity/approvable", "rel": "extends", "card": "1:1"},
+          {"to": "SRC-0015/entity/sandboxable", "rel": "extends", "card": "1:1"},
+          {"to": "SRC-0015/entity/network-approval-spec", "rel": "produces", "card": "1:0..1"},
+          {"to": "SRC-0015/entity/sandbox-attempt", "rel": "consumes", "card": "N:1", "note": "в run()"},
+          {"to": "SRC-0015/entity/tool-ctx", "rel": "consumes", "card": "N:1"}
+        ],
+        "enumerations": null,
+        "data_flows": null,
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0015/entity/approvable",
+      "src": "SRC-0015",
+      "composition": "entity",
+      "terms": {
+        "object": "Approvable<Req> — трейт-роль: tool, подлежащий approval. Содержит associated type ApprovalKey + методы approval_keys / sandbox_mode_for_first_attempt / should_bypass_approval / exec_approval_requirement / wants_no_sandbox_approval / start_approval_async",
+        "attributes": [
+          "ApprovalKey: Hash+Eq+Clone+Debug+Serialize — тип ключа approval для кэширования per-session",
+          "approval_keys(&self, req: &Req) -> Vec<ApprovalKey> — обычно один ключ; apply_patch может возвращать много (per-file), чтобы 'Allow for session' работало per-key",
+          "sandbox_mode_for_first_attempt(&self, req) -> SandboxOverride (default NoOverride) — некоторые tools могут пропустить sandbox на первом attempt (например, escalated permissions)",
+          "should_bypass_approval(policy: AskForApproval, already_approved: bool) -> bool — true если уже approved; true если policy=Never",
+          "exec_approval_requirement(&self, req) -> Option<ExecApprovalRequirement> (default None) — кастомный override exec approval",
+          "wants_no_sandbox_approval(policy: AskForApproval) -> bool — можно ли запросить no-sandbox approval (см. AskForApproval data flows)",
+          "start_approval_async<'a>(&'a mut self, req: &'a Req, ctx: ApprovalCtx<'a>) -> BoxFuture<'a, ReviewDecision> — асинхронный запуск approval"
+        ],
+        "relationships": [
+          {"to": "SRC-0015/entity/approval-store", "rel": "keyed_by_via", "card": "N:1", "note": "через ApprovalKey + with_cached_approval"},
+          {"to": "SRC-0015/entity/exec-approval-requirement", "rel": "returns", "card": "1:0..1"},
+          {"to": "SRC-0015/entity/approval-ctx", "rel": "consumes", "card": "N:1"}
+        ],
+        "enumerations": null,
+        "data_flows": null,
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0015/entity/sandboxable",
+      "src": "SRC-0015",
+      "composition": "entity",
+      "terms": {
+        "object": "Sandboxable — трейт-роль: tool, исполняемый под sandbox. Предоставляет предпочтение sandbox и политику эскалации при падении",
+        "attributes": [
+          "sandbox_preference(&self) -> SandboxablePreference — предпочтение sandbox",
+          "escalate_on_failure(&self) -> bool (default true) — эскалировать запрос прав при падении в sandbox"
+        ],
+        "relationships": [
+          {"to": "SRC-0015/entity/tool-runtime", "rel": "extended_by", "card": "1:1"}
+        ],
+        "enumerations": null,
+        "data_flows": null,
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0015/entity/tool-ctx",
+      "src": "SRC-0015",
+      "composition": "entity",
+      "terms": {
+        "object": "ToolCtx — контекст tool runtime при исполнении: session, turn, call_id, tool_name",
+        "attributes": [
+          "session: Arc<Session>",
+          "turn: Arc<TurnContext>",
+          "call_id: String",
+          "tool_name: String"
+        ],
+        "relationships": [
+          {"to": "SRC-0015/entity/tool-runtime", "rel": "consumed_by", "card": "1:N", "note": "в run() и network_approval_spec()"}
+        ],
+        "enumerations": null,
+        "data_flows": null,
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0015/entity/tool-error",
+      "src": "SRC-0015",
+      "composition": "entity",
+      "terms": {
+        "object": "ToolError — итог неуспешного tool runtime: Rejected(message) или Codex(CodexErr)",
+        "attributes": [
+          "variant: enum"
+        ],
+        "relationships": [
+          {"to": "SRC-0015/entity/network-approval-outcome", "rel": "mapped_from", "card": "1:1", "note": "DeniedByUser → Rejected(\"rejected by user\"); DeniedByPolicy(m) → Rejected(m)"}
+        ],
+        "enumerations": {
+          "variant": ["Rejected(String)", "Codex(CodexErr)"]
+        },
+        "data_flows": null,
+        "config": null
+      }
+    }
+  ]
+}

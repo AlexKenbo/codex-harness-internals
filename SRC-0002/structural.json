@@ -1,0 +1,599 @@
+{
+  "src": "SRC-0002",
+  "schema_version": "2.0",
+  "lens": "structural",
+  "compositions": [
+    {
+      "id": "SRC-0002/entity/permissions",
+      "src": "SRC-0002",
+      "composition": "entity",
+      "terms": {
+        "object": "Permissions — снимок политик доступа агента (sandbox + filesystem + network), используется для проверок и эскалации",
+        "attributes": [
+          "sandbox_policy: SandboxPolicy (legacy единая политика)",
+          "file_system_sandbox_policy: FileSystemSandboxPolicy (split filesystem-часть)",
+          "network_sandbox_policy: NetworkSandboxPolicy (split network-часть)"
+        ],
+        "relationships": [
+          {"to": "SRC-0002/entity/file-system-sandbox-policy", "rel": "composes", "card": "1:1"},
+          {"to": "SRC-0002/entity/network-sandbox-policy", "rel": "composes", "card": "1:1"},
+          {"to": "SRC-0002/entity/escalation-permissions", "rel": "used_by", "card": "1:N"}
+        ],
+        "enumerations": null,
+        "data_flows": null,
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0002/entity/escalation-permissions",
+      "src": "SRC-0002",
+      "composition": "entity",
+      "terms": {
+        "object": "EscalationPermissions — заявка на повышение прав: либо именованный профиль, либо явный набор Permissions",
+        "attributes": [
+          "variant PermissionProfile(PermissionProfile) — ссылка на именованный профиль разрешений",
+          "variant Permissions(Permissions) — встроенный snapshot разрешений"
+        ],
+        "relationships": [
+          {"to": "SRC-0002/entity/permissions", "rel": "wraps", "card": "1:1"}
+        ],
+        "enumerations": {"variant": ["PermissionProfile", "Permissions"]},
+        "data_flows": null,
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0002/entity/exec-policy-amendment",
+      "src": "SRC-0002",
+      "composition": "entity",
+      "terms": {
+        "object": "ExecPolicyAmendment — предлагаемая правка execpolicy: префикс команды, который агент сможет запускать без аппрува (преобразуется в prefix_rule(..., decision=\"allow\"))",
+        "attributes": [
+          "command: Vec<String> — токены префикса команды (TS-тип Array<string>)"
+        ],
+        "relationships": [
+          {"to": "SRC-0002/entity/exec-approval-request-event", "rel": "proposed_in", "card": "N:1"}
+        ],
+        "enumerations": null,
+        "data_flows": [
+          {"source": "Vec<String>", "transform": "ExecPolicyAmendment::from / ::new", "sink": "execpolicy prefix_rule(decision=allow)"}
+        ],
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0002/entity/network-approval-protocol",
+      "src": "SRC-0002",
+      "composition": "entity",
+      "terms": {
+        "object": "NetworkApprovalProtocol — протокол сетевого запроса, под который запрашивается аппрув (snake_case в wire-формате)",
+        "attributes": [
+          "вариант (enum)"
+        ],
+        "relationships": [
+          {"to": "SRC-0002/entity/network-approval-context", "rel": "used_by", "card": "1:N"},
+          {"to": "SRC-0002/entity/guardian-assessment-action", "rel": "used_by", "card": "1:N"},
+          {"to": "SRC-0002/entity/network-policy-decision-payload", "rel": "used_by", "card": "1:N"}
+        ],
+        "enumerations": {
+          "NetworkApprovalProtocol": ["Http", "Https (alias: https_connect, http-connect)", "Socks5Tcp", "Socks5Udp"]
+        },
+        "data_flows": null,
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0002/entity/network-approval-context",
+      "src": "SRC-0002",
+      "composition": "entity",
+      "terms": {
+        "object": "NetworkApprovalContext — контекст блокированного сетевого запроса, который можно одобрить (хост + протокол)",
+        "attributes": [
+          "host: String — хост, к которому шёл запрос",
+          "protocol: NetworkApprovalProtocol — протокол запроса"
+        ],
+        "relationships": [
+          {"to": "SRC-0002/entity/network-approval-protocol", "rel": "uses", "card": "N:1"},
+          {"to": "SRC-0002/entity/exec-approval-request-event", "rel": "attached_to", "card": "1:1"}
+        ],
+        "enumerations": null,
+        "data_flows": null,
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0002/entity/network-policy-rule-action",
+      "src": "SRC-0002",
+      "composition": "entity",
+      "terms": {
+        "object": "NetworkPolicyRuleAction — решение правила сетевой политики (snake_case в wire-формате)",
+        "attributes": [
+          "вариант (enum)"
+        ],
+        "relationships": [
+          {"to": "SRC-0002/entity/network-policy-amendment", "rel": "used_by", "card": "1:N"}
+        ],
+        "enumerations": {"NetworkPolicyRuleAction": ["Allow", "Deny"]},
+        "data_flows": null,
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0002/entity/network-policy-amendment",
+      "src": "SRC-0002",
+      "composition": "entity",
+      "terms": {
+        "object": "NetworkPolicyAmendment — предлагаемая правка сетевой политики: разрешить/запретить хост в будущем",
+        "attributes": [
+          "host: String — целевой хост",
+          "action: NetworkPolicyRuleAction — Allow или Deny"
+        ],
+        "relationships": [
+          {"to": "SRC-0002/entity/network-policy-rule-action", "rel": "uses", "card": "N:1"},
+          {"to": "SRC-0002/entity/exec-approval-request-event", "rel": "proposed_in", "card": "N:1"}
+        ],
+        "enumerations": null,
+        "data_flows": null,
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0002/entity/guardian-risk-level",
+      "src": "SRC-0002",
+      "composition": "entity",
+      "terms": {
+        "object": "GuardianRiskLevel — крупная метка риска, выставляемая Guardian-обзором (lowercase в wire-формате)",
+        "attributes": [
+          "вариант (enum)"
+        ],
+        "relationships": [
+          {"to": "SRC-0002/entity/guardian-assessment-event", "rel": "used_by", "card": "1:N"}
+        ],
+        "enumerations": {"GuardianRiskLevel": ["Low", "Medium", "High", "Critical"]},
+        "data_flows": null,
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0002/entity/guardian-user-authorization",
+      "src": "SRC-0002",
+      "composition": "entity",
+      "terms": {
+        "object": "GuardianUserAuthorization — насколько прямо транскрипт пользователя авторизует рассматриваемое действие (lowercase в wire-формате)",
+        "attributes": [
+          "вариант (enum)"
+        ],
+        "relationships": [
+          {"to": "SRC-0002/entity/guardian-assessment-event", "rel": "used_by", "card": "1:N"}
+        ],
+        "enumerations": {"GuardianUserAuthorization": ["Unknown", "Low", "Medium", "High"]},
+        "data_flows": null,
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0002/entity/guardian-assessment-status",
+      "src": "SRC-0002",
+      "composition": "entity",
+      "terms": {
+        "object": "GuardianAssessmentStatus — статус жизненного цикла Guardian-обзора (snake_case в wire-формате)",
+        "attributes": [
+          "вариант (enum)"
+        ],
+        "relationships": [
+          {"to": "SRC-0002/entity/guardian-assessment-event", "rel": "used_by", "card": "1:N"}
+        ],
+        "enumerations": {"GuardianAssessmentStatus": ["InProgress", "Approved", "Denied", "TimedOut", "Aborted"]},
+        "data_flows": null,
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0002/entity/guardian-assessment-decision-source",
+      "src": "SRC-0002",
+      "composition": "entity",
+      "terms": {
+        "object": "GuardianAssessmentDecisionSource — кто произвёл финальное решение Guardian-обзора (snake_case в wire-формате)",
+        "attributes": [
+          "вариант (enum)"
+        ],
+        "relationships": [
+          {"to": "SRC-0002/entity/guardian-assessment-event", "rel": "used_by", "card": "1:N"}
+        ],
+        "enumerations": {"GuardianAssessmentDecisionSource": ["Agent"]},
+        "data_flows": null,
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0002/entity/guardian-command-source",
+      "src": "SRC-0002",
+      "composition": "entity",
+      "terms": {
+        "object": "GuardianCommandSource — источник команды, попавшей под Guardian-обзор (snake_case в wire-формате)",
+        "attributes": [
+          "вариант (enum)"
+        ],
+        "relationships": [
+          {"to": "SRC-0002/entity/guardian-assessment-action", "rel": "used_by", "card": "1:N"}
+        ],
+        "enumerations": {"GuardianCommandSource": ["Shell", "UnifiedExec"]},
+        "data_flows": null,
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0002/entity/guardian-assessment-action",
+      "src": "SRC-0002",
+      "composition": "entity",
+      "terms": {
+        "object": "GuardianAssessmentAction — каноническое описание действия, переданного на Guardian-обзор (тегированный union по полю type)",
+        "attributes": [
+          "Command { source: GuardianCommandSource, command: String, cwd: AbsolutePathBuf }",
+          "Execve { source: GuardianCommandSource, program: String, argv: Vec<String>, cwd: AbsolutePathBuf }",
+          "ApplyPatch { cwd: AbsolutePathBuf, files: Vec<AbsolutePathBuf> }",
+          "NetworkAccess { target: String, host: String, protocol: NetworkApprovalProtocol, port: u16 }",
+          "McpToolCall { server: String, tool_name: String, connector_id: Option<String>, connector_name: Option<String>, tool_title: Option<String> }"
+        ],
+        "relationships": [
+          {"to": "SRC-0002/entity/guardian-command-source", "rel": "uses", "card": "N:1"},
+          {"to": "SRC-0002/entity/network-approval-protocol", "rel": "uses", "card": "N:1"},
+          {"to": "SRC-0002/entity/guardian-assessment-event", "rel": "embedded_in", "card": "1:1"}
+        ],
+        "enumerations": {
+          "GuardianAssessmentAction.type": ["command", "execve", "apply_patch", "network_access", "mcp_tool_call"]
+        },
+        "data_flows": null,
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0002/entity/guardian-assessment-event",
+      "src": "SRC-0002",
+      "composition": "entity",
+      "terms": {
+        "object": "GuardianAssessmentEvent — событие жизненного цикла Guardian-обзора одного действия (id, статус, риск, рационал, действие)",
+        "attributes": [
+          "id: String — стабильный идентификатор lifecycle обзора",
+          "target_item_id: Option<String> — thread item, если обзор привязан к конкретному элементу",
+          "turn_id: String (default для обратной совместимости) — turn, к которому относится обзор",
+          "status: GuardianAssessmentStatus — текущий статус обзора",
+          "risk_level: Option<GuardianRiskLevel> — выставляется по завершении (omitted while in_progress)",
+          "user_authorization: Option<GuardianUserAuthorization> — насколько транскрипт авторизует действие",
+          "rationale: Option<String> — человекочитаемое объяснение финального решения (omitted while in_progress)",
+          "decision_source: Option<GuardianAssessmentDecisionSource> — кто принял финальное решение",
+          "action: GuardianAssessmentAction — каноническая полезная нагрузка действия"
+        ],
+        "relationships": [
+          {"to": "SRC-0002/entity/guardian-assessment-action", "rel": "embeds", "card": "1:1"},
+          {"to": "SRC-0002/entity/guardian-assessment-status", "rel": "uses", "card": "N:1"},
+          {"to": "SRC-0002/entity/guardian-risk-level", "rel": "uses", "card": "N:1"},
+          {"to": "SRC-0002/entity/guardian-user-authorization", "rel": "uses", "card": "N:1"},
+          {"to": "SRC-0002/entity/guardian-assessment-decision-source", "rel": "uses", "card": "N:1"}
+        ],
+        "enumerations": null,
+        "data_flows": null,
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0002/entity/exec-approval-request-event",
+      "src": "SRC-0002",
+      "composition": "entity",
+      "terms": {
+        "object": "ExecApprovalRequestEvent — запрос аппрува на выполнение команды: что выполняется, в каком cwd, какие правки политики предлагаются и какие решения доступны",
+        "attributes": [
+          "call_id: String — id связанного command-execution item",
+          "approval_id: Option<String> — id конкретного callback'а аппрува; если None — аппрув для самого command item (call_id). Присутствует для subcommand-аппрувов через execve intercept",
+          "turn_id: String (default для обратной совместимости)",
+          "command: Vec<String> — команда к выполнению",
+          "cwd: AbsolutePathBuf — рабочая директория команды",
+          "reason: Option<String> — человекочитаемая причина аппрува (например retry без sandbox)",
+          "network_approval_context: Option<NetworkApprovalContext> — сетевой контекст для блокированного запроса, который можно одобрить",
+          "proposed_execpolicy_amendment: Option<ExecPolicyAmendment> — предложение разрешить префикс команды на будущее",
+          "proposed_network_policy_amendments: Option<Vec<NetworkPolicyAmendment>> — предложения allow/deny хостов на будущее",
+          "additional_permissions: Option<PermissionProfile> — дополнительно запрашиваемые filesystem-права для команды",
+          "available_decisions: Option<Vec<ReviewDecision>> — упорядоченный список решений, доступных клиенту; при отсутствии — клиент выводит legacy default из остальных полей",
+          "parsed_cmd: Vec<ParsedCommand> — распарсенная структура команды"
+        ],
+        "relationships": [
+          {"to": "SRC-0002/entity/network-approval-context", "rel": "may_carry", "card": "1:1"},
+          {"to": "SRC-0002/entity/exec-policy-amendment", "rel": "may_propose", "card": "1:1"},
+          {"to": "SRC-0002/entity/network-policy-amendment", "rel": "may_propose", "card": "1:N"}
+        ],
+        "enumerations": null,
+        "data_flows": [
+          {"source": "ExecApprovalRequestEvent.approval_id ?? call_id", "transform": "effective_approval_id()", "sink": "идентификатор аппрува для клиента"},
+          {"source": "available_decisions ?? default_available_decisions(network_ctx, exec_amend, net_amends, add_perms)", "transform": "effective_available_decisions()", "sink": "список ReviewDecision для UI клиента"}
+        ],
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0002/entity/elicitation-request",
+      "src": "SRC-0002",
+      "composition": "entity",
+      "terms": {
+        "object": "ElicitationRequest — запрос дополнительной информации у пользователя в одном из двух режимов (тегированный union по полю mode, snake_case)",
+        "attributes": [
+          "Form { _meta: Option<JsonValue>, message: String, requested_schema: JsonValue }",
+          "Url { _meta: Option<JsonValue>, message: String, url: String, elicitation_id: String }"
+        ],
+        "relationships": [
+          {"to": "SRC-0002/entity/elicitation-request-event", "rel": "embedded_in", "card": "1:1"}
+        ],
+        "enumerations": {"ElicitationRequest.mode": ["form", "url"]},
+        "data_flows": null,
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0002/entity/elicitation-request-event",
+      "src": "SRC-0002",
+      "composition": "entity",
+      "terms": {
+        "object": "ElicitationRequestEvent — событие, поднимающее ElicitationRequest от MCP-сервера для конкретного turn",
+        "attributes": [
+          "turn_id: Option<String> — turn, к которому относится elicitation, если известен",
+          "server_name: String — имя MCP-сервера, инициировавшего elicitation",
+          "id: RequestId (TS: string | number)",
+          "request: ElicitationRequest"
+        ],
+        "relationships": [
+          {"to": "SRC-0002/entity/elicitation-request", "rel": "embeds", "card": "1:1"}
+        ],
+        "enumerations": null,
+        "data_flows": null,
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0002/entity/elicitation-action",
+      "src": "SRC-0002",
+      "composition": "entity",
+      "terms": {
+        "object": "ElicitationAction — реакция пользователя на ElicitationRequest (lowercase в wire-формате)",
+        "attributes": [
+          "вариант (enum)"
+        ],
+        "relationships": [
+          {"to": "SRC-0002/entity/elicitation-request", "rel": "responds_to", "card": "N:1"}
+        ],
+        "enumerations": {"ElicitationAction": ["Accept", "Decline", "Cancel"]},
+        "data_flows": null,
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0002/entity/apply-patch-approval-request-event",
+      "src": "SRC-0002",
+      "composition": "entity",
+      "terms": {
+        "object": "ApplyPatchApprovalRequestEvent — запрос аппрува на применение патча: какие файлы меняются и нужно ли расширить writable-root на сессию",
+        "attributes": [
+          "call_id: String — Responses API call id связанного patch apply call (если доступен)",
+          "turn_id: String (default для обратной совместимости)",
+          "changes: HashMap<PathBuf, FileChange> — карта файл → изменение",
+          "reason: Option<String> — пояснение (например запрос дополнительного write-доступа)",
+          "grant_root: Option<PathBuf> — если задан, агент просит разрешить запись под этим корнем до конца сессии"
+        ],
+        "relationships": null,
+        "enumerations": null,
+        "data_flows": null,
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0002/entity/network-policy-decision-payload",
+      "src": "SRC-0002",
+      "composition": "entity",
+      "terms": {
+        "object": "NetworkPolicyDecisionPayload — полезная нагрузка решения сетевой политики, приходящая из network proxy: что решено, кем, по какому хосту/порту/протоколу и почему (camelCase в wire-формате)",
+        "attributes": [
+          "decision: NetworkPolicyDecision — решение прокси (внешний тип из codex_network_proxy)",
+          "source: NetworkDecisionSource — источник решения (внешний тип из codex_network_proxy)",
+          "protocol: Option<NetworkApprovalProtocol> — протокол запроса",
+          "host: Option<String> — целевой хост",
+          "reason: Option<String> — причина решения",
+          "port: Option<u16> — целевой порт"
+        ],
+        "relationships": [
+          {"to": "SRC-0002/entity/network-approval-protocol", "rel": "uses", "card": "N:1"}
+        ],
+        "enumerations": null,
+        "data_flows": [
+          {"source": "NetworkPolicyDecision (codex_network_proxy)", "transform": "is_ask_from_decider() = (decision==Ask) && (source==Decider)", "sink": "признак, что решение требует ask от decider"}
+        ],
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0002/entity/network-sandbox-policy",
+      "src": "SRC-0002",
+      "composition": "entity",
+      "terms": {
+        "object": "NetworkSandboxPolicy — политика сетевого sandbox: разрешён ли исходящий сетевой доступ из песочницы (kebab-case в wire-формате; default = restricted)",
+        "attributes": [
+          "вариант (enum)",
+          "is_enabled() = (variant == Enabled)"
+        ],
+        "relationships": [
+          {"to": "SRC-0002/entity/permissions", "rel": "embedded_in", "card": "1:1"},
+          {"to": "SRC-0002/entity/file-system-sandbox-policy", "rel": "input_to_legacy_projection", "card": "N:1"}
+        ],
+        "enumerations": {"NetworkSandboxPolicy": ["Restricted (default)", "Enabled"]},
+        "data_flows": [
+          {"source": "SandboxPolicy", "transform": "From<&SandboxPolicy>: has_full_network_access() ? Enabled : Restricted", "sink": "NetworkSandboxPolicy"}
+        ],
+        "config": {
+          "default": {"value": "Restricted", "source": "Default derive on enum NetworkSandboxPolicy", "default": "Restricted"}
+        }
+      }
+    },
+    {
+      "id": "SRC-0002/entity/file-system-access-mode",
+      "src": "SRC-0002",
+      "composition": "entity",
+      "terms": {
+        "object": "FileSystemAccessMode — режим доступа к одной filesystem-записи. Когда две одинаково специфичные записи указывают на тот же путь, конфликт разрешается по precedence: None > Write > Read (none beats write, write beats read)",
+        "attributes": [
+          "вариант (enum)",
+          "can_read() = (variant != None)",
+          "can_write() = (variant == Write)",
+          "Ord: None > Write > Read (conflict precedence, не capability breadth)"
+        ],
+        "relationships": [
+          {"to": "SRC-0002/entity/file-system-sandbox-entry", "rel": "used_by", "card": "1:N"}
+        ],
+        "enumerations": {"FileSystemAccessMode": ["Read", "Write", "None"]},
+        "data_flows": null,
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0002/entity/file-system-special-path",
+      "src": "SRC-0002",
+      "composition": "entity",
+      "terms": {
+        "object": "FileSystemSpecialPath — символическая ссылка на специальное место в файловой системе (тегированный union по полю kind, snake_case). Для совместимости вперёд: неизвестные :special_path токены сохраняются как Unknown, чтобы старый рантайм мог warn-and-ignore вместо отказа загрузить config",
+        "attributes": [
+          "Root — корень файловой системы",
+          "Minimal — минимальный platform-default набор",
+          "CurrentWorkingDirectory — текущий cwd",
+          "ProjectRoots { subpath: Option<PathBuf> } — корни проекта, опционально с подпутём",
+          "Tmpdir — каталог из переменной окружения TMPDIR",
+          "SlashTmp — путь /tmp",
+          "Unknown { path: String, subpath: Option<PathBuf> } — неизвестный :special_path токен (для forward compatibility)"
+        ],
+        "relationships": [
+          {"to": "SRC-0002/entity/file-system-path", "rel": "embedded_in", "card": "1:1"}
+        ],
+        "enumerations": {
+          "FileSystemSpecialPath.kind": ["root", "minimal", "current_working_directory", "project_roots", "tmpdir", "slash_tmp", "unknown"]
+        },
+        "data_flows": [
+          {"source": "FileSystemSpecialPath::Tmpdir", "transform": "resolve_file_system_special_path: читает env var TMPDIR", "sink": "AbsolutePathBuf"},
+          {"source": "FileSystemSpecialPath::SlashTmp", "transform": "resolve: вернуть /tmp если is_dir, иначе None", "sink": "AbsolutePathBuf"},
+          {"source": "FileSystemSpecialPath::CurrentWorkingDirectory / ProjectRoots", "transform": "resolve относительно переданного cwd", "sink": "AbsolutePathBuf"}
+        ],
+        "config": {
+          "TMPDIR": {"value": "из env", "source": "env var TMPDIR (std::env::var_os)", "default": null}
+        }
+      }
+    },
+    {
+      "id": "SRC-0002/entity/file-system-path",
+      "src": "SRC-0002",
+      "composition": "entity",
+      "terms": {
+        "object": "FileSystemPath — путь записи политики: либо абсолютный путь, либо специальный токен (тегированный union по полю type, snake_case)",
+        "attributes": [
+          "Path { path: AbsolutePathBuf }",
+          "Special { value: FileSystemSpecialPath }"
+        ],
+        "relationships": [
+          {"to": "SRC-0002/entity/file-system-special-path", "rel": "embeds", "card": "1:1"},
+          {"to": "SRC-0002/entity/file-system-sandbox-entry", "rel": "embedded_in", "card": "1:1"}
+        ],
+        "enumerations": {"FileSystemPath.type": ["path", "special"]},
+        "data_flows": null,
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0002/entity/file-system-sandbox-entry",
+      "src": "SRC-0002",
+      "composition": "entity",
+      "terms": {
+        "object": "FileSystemSandboxEntry — запись filesystem-политики: путь + режим доступа",
+        "attributes": [
+          "path: FileSystemPath",
+          "access: FileSystemAccessMode"
+        ],
+        "relationships": [
+          {"to": "SRC-0002/entity/file-system-path", "rel": "uses", "card": "N:1"},
+          {"to": "SRC-0002/entity/file-system-access-mode", "rel": "uses", "card": "N:1"},
+          {"to": "SRC-0002/entity/file-system-sandbox-policy", "rel": "embedded_in", "card": "N:1"}
+        ],
+        "enumerations": null,
+        "data_flows": null,
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0002/entity/file-system-sandbox-kind",
+      "src": "SRC-0002",
+      "composition": "entity",
+      "terms": {
+        "object": "FileSystemSandboxKind — общий вид filesystem-политики (kebab-case в wire-формате; default = restricted)",
+        "attributes": [
+          "вариант (enum)"
+        ],
+        "relationships": [
+          {"to": "SRC-0002/entity/file-system-sandbox-policy", "rel": "used_by", "card": "1:N"}
+        ],
+        "enumerations": {"FileSystemSandboxKind": ["Restricted (default)", "Unrestricted", "ExternalSandbox"]},
+        "data_flows": null,
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0002/entity/file-system-sandbox-policy",
+      "src": "SRC-0002",
+      "composition": "entity",
+      "terms": {
+        "object": "FileSystemSandboxPolicy — split-модель filesystem-политики: вид (kind) + список записей (entries) с путями и режимами доступа. Default: Restricted с одной записью (Special::Root, Read)",
+        "attributes": [
+          "kind: FileSystemSandboxKind",
+          "entries: Vec<FileSystemSandboxEntry>",
+          "default(): kind=Restricted, entries=[(Special::Root, Read)]",
+          "constructors: unrestricted(), external_sandbox(), restricted(entries)",
+          "запросы доступа: has_full_disk_read_access(), has_full_disk_write_access(), include_platform_defaults()",
+          "проверки путей: resolve_access_with_cwd(path, cwd), can_read_path_with_cwd, can_write_path_with_cwd",
+          "получение корней: get_readable_roots_with_cwd, get_writable_roots_with_cwd, get_unreadable_roots_with_cwd",
+          "расширение прав: with_additional_readable_roots, with_additional_writable_roots",
+          "признак: needs_direct_runtime_enforcement(network_policy, cwd) — сравнение semantic_signature до/после roundtrip через legacy",
+          "конверсии: from_legacy_sandbox_policy(SandboxPolicy, cwd), to_legacy_sandbox_policy(network_policy, cwd) -> io::Result<SandboxPolicy>"
+        ],
+        "relationships": [
+          {"to": "SRC-0002/entity/file-system-sandbox-kind", "rel": "uses", "card": "N:1"},
+          {"to": "SRC-0002/entity/file-system-sandbox-entry", "rel": "contains", "card": "1:N"},
+          {"to": "SRC-0002/entity/permissions", "rel": "embedded_in", "card": "1:1"},
+          {"to": "SRC-0002/entity/network-sandbox-policy", "rel": "depends_on_for_legacy_projection", "card": "N:1"}
+        ],
+        "enumerations": null,
+        "data_flows": [
+          {"source": "SandboxPolicy (legacy)", "transform": "From<&SandboxPolicy>: DangerFullAccess→unrestricted; ExternalSandbox→external_sandbox; ReadOnly→restricted entries (cwd Read + опц. Minimal + readable_roots); WorkspaceWrite→restricted entries (опц. Minimal/readable_roots Read; cwd Write; опц. SlashTmp/Tmpdir Write; writable_roots Write)", "sink": "FileSystemSandboxPolicy"},
+          {"source": "FileSystemSandboxPolicy", "transform": "to_legacy_sandbox_policy(network_policy, cwd): агрегирует записи в legacy форму (DangerFullAccess / ExternalSandbox / WorkspaceWrite / ReadOnly); ошибка если запрошен write вне workspace_root", "sink": "SandboxPolicy"},
+          {"source": "FileSystemSandboxPolicy + WorkspaceWrite legacy", "transform": "from_legacy_sandbox_policy: убирает редундантные read-записи, лежащие под уже writable root; добавляет default read-only subpaths для cwd (.git/.agents/.codex; .codex protect_missing=true) и для каждого writable_root (.codex protect_missing=false)", "sink": "FileSystemSandboxPolicy"},
+          {"source": "FileSystemSandboxPolicy + cwd", "transform": "resolve_access_with_cwd: фильтрует записи по starts_with, выбирает max по (specificity, access) precedence; Unrestricted/ExternalSandbox→Write всегда", "sink": "FileSystemAccessMode"},
+          {"source": "FileSystemSandboxPolicy", "transform": "semantic_signature(cwd): {has_full_disk_read, has_full_disk_write, include_platform_defaults, readable_roots, writable_roots, unreadable_roots}", "sink": "FileSystemSemanticSignature (для сравнения политик)"}
+        ],
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0002/entity/writable-root-protected-subpaths",
+      "src": "SRC-0002",
+      "composition": "entity",
+      "terms": {
+        "object": "WritableRoot.read_only_subpaths — список путей внутри writable_root, которые остаются read-only по умолчанию (защита проектных метаданных и git-окружения)",
+        "attributes": [
+          ".git — каталог или pointer-файл git (для repo, worktree, submodule, bare)",
+          "gitdir, разрешённый из pointer-файла .git (если .git — файл с `gitdir: <path>`)",
+          ".agents — каталог .agents в корне (если существует)",
+          ".codex — каталог метаданных проекта; для cwd-корня защищается даже до создания (protect_missing_dot_codex=true), для остальных writable_roots — только если уже существует (protect_missing_dot_codex=false)"
+        ],
+        "relationships": [
+          {"to": "SRC-0002/entity/file-system-sandbox-policy", "rel": "produced_by", "card": "N:1"}
+        ],
+        "enumerations": {"protected_subpaths": [".git", ".agents", ".codex", "gitdir-from-pointer"]},
+        "data_flows": [
+          {"source": "writable_root + protect_missing_dot_codex", "transform": "default_read_only_subpaths_for_writable_root", "sink": "Vec<AbsolutePathBuf> read-only carveouts"},
+          {"source": ".git pointer file", "transform": "is_git_pointer_file → resolve_gitdir_from_file: читает текст, парсит `gitdir: <path>`, резолвит относительно parent .git", "sink": "AbsolutePathBuf или ошибка-лог при невалидном формате/несуществующем пути"}
+        ],
+        "config": null
+      }
+    }
+  ]
+}

@@ -1,0 +1,419 @@
+{
+  "src": "SRC-0012",
+  "schema_version": "2.0",
+  "lens": "use_case",
+  "compositions": [
+    {
+      "id": "SRC-0012/uc.sub/parse-response-item-to-turn-item",
+      "src": "SRC-0012",
+      "composition": "use_case",
+      "level": "sub",
+      "strategic_domain": null,
+      "terms": {
+        "actor": "Event Mapper (event_mapping.rs)",
+        "goal": "Преобразовать ResponseItem из модели в TurnItem соответствующего варианта",
+        "steps": [
+          "1. Event Mapper получает ResponseItem",
+          "2. Event Mapper matches на variant (Message | Reasoning | WebSearchCall | ImageGenerationCall | прочее)",
+          "3. Для Message: Event Mapper ветвится по role.as_str() ('user' | 'assistant' | 'system' | прочее)",
+          "4. Для role='user': Event Mapper сначала пытается parse_visible_hook_prompt_message → TurnItem::HookPrompt; иначе parse_user_message → TurnItem::UserMessage",
+          "5. Для role='assistant': Event Mapper вызывает parse_agent_message с id, content, phase и оборачивает в TurnItem::AgentMessage",
+          "6. Для Reasoning: Event Mapper собирает summary_text (из SummaryText.text) и raw_content (из ReasoningText/Text); оборачивает в TurnItem::Reasoning",
+          "7. Для WebSearchCall: Event Mapper сохраняет action и вычисляет query через web_search_action_detail (если action отсутствует — WebSearchAction::Other + пустая query); оборачивает в TurnItem::WebSearch",
+          "8. Для ImageGenerationCall: Event Mapper клонирует id/status/revised_prompt/result; saved_path = None (заполнится позже при сохранении); оборачивает в TurnItem::ImageGeneration"
+        ],
+        "extensions (Cockburn)": [
+          {"step": 3, "condition": "role='user' И content содержит contextual_user_fragment (is_contextual_user_message_content)", "action": "parse_user_message возвращает None → TurnItem не создаётся для user варианта (HookPrompt ветка может отработать отдельно)"},
+          {"step": 3, "condition": "role='system'", "action": "вернуть None (системные сообщения не становятся TurnItem)"},
+          {"step": 3, "condition": "role ∉ {user, assistant, system}", "action": "вернуть None"},
+          {"step": 5, "condition": "в agent message встречен ContentItem не InputText и не OutputText (например InputImage)", "action": "warn log 'Unexpected content item in agent message: {item}', фрагмент пропускается"},
+          {"step": 5, "condition": "у assistant message id отсутствует (None)", "action": "сгенерировать Uuid::new_v4().to_string() и использовать как id"},
+          {"step": 4, "condition": "в user message встречен ContentItem::OutputText", "action": "warn log 'Output text in user message: {text}'; фрагмент пропускается"},
+          {"step": 4, "condition": "в user message InputText является image open/close tag (local или standard) и соседняя позиция содержит InputImage", "action": "пропустить этот текстовый tag (не добавлять в UserInput), чтобы не дублировать с InputImage"},
+          {"step": 2, "condition": "variant ResponseItem не входит в {Message, Reasoning, WebSearchCall, ImageGenerationCall}", "action": "вернуть None"}
+        ],
+        "edge_cases": [
+          {"condition": "WebSearchCall.action = None", "action": "action = WebSearchAction::Other, query = пустая строка"},
+          {"condition": "WebSearchCall.id = None", "action": "id = String::default() (пустая строка)"},
+          {"condition": "Reasoning.content = None", "action": "raw_content = пустой Vec (unwrap_or_default)"},
+          {"condition": "Reasoning.summary пуст", "action": "summary_text = пустой Vec"}
+        ],
+        "lifecycle": null,
+        "ux": null,
+        "result": "Возвращён Option<TurnItem>: Some(TurnItem) соответствующего варианта или None (если ResponseItem не маппится в TurnItem)"
+      }
+    },
+    {
+      "id": "SRC-0012/uc.sub/classify-contextual-developer-message",
+      "src": "SRC-0012",
+      "composition": "use_case",
+      "level": "sub",
+      "strategic_domain": null,
+      "terms": {
+        "actor": "Event Mapper (is_contextual_dev_fragment и смежные функции в event_mapping.rs)",
+        "goal": "Определить является ли фрагмент developer-сообщения rollback-trimmable (контекстуальным) или содержит persistent developer text",
+        "steps": [
+          "1. Event Mapper получает ContentItem из developer message",
+          "2. Event Mapper проверяет что ContentItem — это InputText (иначе фрагмент не контекстуальный)",
+          "3. Event Mapper применяет trim_start к тексту",
+          "4. Event Mapper проверяет начало trimmed текста на соответствие любому из CONTEXTUAL_DEVELOPER_PREFIXES (case-insensitive сравнение через eq_ignore_ascii_case)",
+          "5. Event Mapper возвращает bool: true если совпал хотя бы один префикс"
+        ],
+        "extensions (Cockburn)": [
+          {"step": 2, "condition": "ContentItem не является InputText (например InputImage или OutputText)", "action": "вернуть false — фрагмент не контекстуальный"},
+          {"step": 4, "condition": "text короче чем один из префиксов (prefix.len() > text.len())", "action": "get(..prefix.len()) возвращает None → этот префикс не совпал, пробуется следующий"}
+        ],
+        "edge_cases": [
+          {"condition": "callers заботятся об инвалидации reference baseline", "action": "is_contextual_dev_message_content должен быть парным с has_non_contextual_dev_message_content — потому что build_initial_context может склеить контекстуальные фрагменты с persistent developer text в одно сообщение"}
+        ],
+        "lifecycle": null,
+        "ux": null,
+        "result": "bool — классифицирован ли фрагмент как контекстуальный; позволяет каллерам корректно обрезать сообщения при rollback без потери persistent developer text"
+      }
+    },
+    {
+      "id": "SRC-0012/uc.sub/handle-completed-output-item",
+      "src": "SRC-0012",
+      "composition": "use_case",
+      "level": "sub",
+      "strategic_domain": null,
+      "terms": {
+        "actor": "Output Handler (handle_output_item_done в stream_events_utils.rs)",
+        "goal": "Обработать завершённый output item из модели: либо запустить tool call, либо преобразовать в TurnItem и эмитнуть события, обеспечив синхронизацию history и rollout даже при отмене turn",
+        "steps": [
+          "1. Output Handler определяет plan_mode = (turn_context.collaboration_mode.mode == ModeKind::Plan)",
+          "2. Output Handler вызывает ToolRouter::build_tool_call(session, item.clone()) для определения — является ли item tool call",
+          "3. Для Ok(Some(call)) — tool call path: Session.accept_mailbox_delivery_for_current_turn(sub_id) →triggers SRC-0012/uc.sub/record-completed-response-item; создание payload_preview через call.payload.log_payload().into_owned() и info-лог 'ToolCall: {name} {payload_preview}'; record_completed_response_item; создание cancellation_token.child_token(); построение InFlightFuture через ctx.tool_runtime.clone().handle_tool_call(call, cancellation_token); выставление needs_follow_up=true и tool_future=Some",
+          "4. Для Ok(None) — non-tool path: Output Handler вызывает handle_non_tool_response_item(session, turn_context, item, plan_mode) →triggers SRC-0012/uc.sub/convert-non-tool-response-to-turn-item",
+          "5. Для Ok(None) с полученным turn_item: если previously_active_item отсутствует — Output Handler эмитит emit_turn_item_started (для ImageGeneration стартовая копия мутируется: status='in_progress', revised_prompt=None, result.clear(), saved_path=None); затем эмитит emit_turn_item_completed",
+          "6. Output Handler вызывает record_completed_response_item →triggers SRC-0012/uc.sub/record-completed-response-item",
+          "7. Output Handler вычисляет last_agent_message через last_assistant_message_from_item(item, plan_mode)",
+          "8. Output Handler возвращает OutputItemResult"
+        ],
+        "extensions (Cockburn)": [
+          {"step": 2, "condition": "build_tool_call вернул Err(FunctionCallError::MissingLocalShellCallId) — LocalShellCall без call_id/id", "action": "session_telemetry.log_tool_failed('local_shell', 'LocalShellCall without call_id or id'); tracing::error с тем же msg; сформировать ResponseInputItem::FunctionCallOutput с пустым call_id и body Text('LocalShellCall without call_id or id'); record_completed_response_item; если response_input_to_response_item вернул Some(response_item) — session.record_conversation_items(turn_context, [response_item]); needs_follow_up=true"},
+          {"step": 2, "condition": "build_tool_call вернул Err(FunctionCallError::RespondToModel(message)) — tool был отклонён или требует прямого ответа модели", "action": "сформировать ResponseInputItem::FunctionCallOutput с пустым call_id и body Text(message); record_completed_response_item; если response_input_to_response_item вернул Some(response_item) — записать в conversation; needs_follow_up=true"},
+          {"step": 2, "condition": "build_tool_call вернул Err(FunctionCallError::Fatal(message))", "action": "вернуть Err(CodexErr::Fatal(message)) — обработка прекращается"},
+          {"step": 4, "condition": "handle_non_tool_response_item вернул None (item типа FunctionCallOutput/CustomToolCallOutput/ToolSearchOutput или иной)", "action": "turn_item события не эмитятся; продолжается только record_completed_response_item"},
+          {"step": 5, "condition": "previously_active_item уже существует (элемент был ранее started)", "action": "emit_turn_item_started не эмитится — только emit_turn_item_completed"}
+        ],
+        "edge_cases": [
+          {"condition": "turn отменён после record_completed_response_item", "action": "item уже записан в history/rollout — синхронизация сохранена по комментарию в коде: 'This records items immediately so history and rollout stay in sync even if the turn is later cancelled'"},
+          {"condition": "item — ImageGeneration и сохранение результата упадёт позже", "action": "emit_turn_item_started отправляет промежуточное состояние status='in_progress' без результата, чтобы UI показал прогресс до финального completed"}
+        ],
+        "lifecycle": {
+          "entity": "SRC-0012/entity/turn-item",
+          "states": ["started (эмит emit_turn_item_started)", "completed (эмит emit_turn_item_completed)"],
+          "transition": {
+            "from": "started",
+            "to": "completed",
+            "guard": "previously_active_item.is_none() → сначала started, затем completed; иначе сразу completed",
+            "side_effect": "для ImageGeneration started-копия искусственно понижается до status='in_progress' с очищенным result/revised_prompt/saved_path"
+          }
+        },
+        "ux": null,
+        "result": "OutputItemResult содержит: last_agent_message (stripped assistant текст, если non-tool), needs_follow_up (true если tool call был эмитнут или зафиксирована ошибка требующая повторного раунда), tool_future (Some для tool call path, иначе None)"
+      }
+    },
+    {
+      "id": "SRC-0012/uc.sub/convert-non-tool-response-to-turn-item",
+      "src": "SRC-0012",
+      "composition": "use_case",
+      "level": "sub",
+      "strategic_domain": null,
+      "terms": {
+        "actor": "Non-Tool Response Converter (handle_non_tool_response_item в stream_events_utils.rs)",
+        "goal": "Преобразовать non-tool ResponseItem в TurnItem с очисткой hidden markup, парсингом memory citation и сохранением image generation артефакта",
+        "steps": [
+          "1. Non-Tool Response Converter логирует debug ?item 'Output item'",
+          "2. Converter matches на ResponseItem variant: Message | Reasoning | WebSearchCall | ImageGenerationCall — продолжить; FunctionCallOutput | CustomToolCallOutput | ToolSearchOutput — вернуть None с debug 'unexpected tool output from stream'; прочее — вернуть None",
+          "3. Converter вызывает parse_turn_item(item) →triggers SRC-0012/uc.sub/parse-response-item-to-turn-item; если None — вернуть None",
+          "4. Для TurnItem::AgentMessage: собрать combined текст из всех AgentMessageContent::Text; применить strip_hidden_assistant_markup_and_parse_memory_citation(combined, plan_mode) — получить (stripped, memory_citation); заменить agent_message.content на один элемент AgentMessageContent::Text{stripped}; сохранить memory_citation",
+          "5. Для TurnItem::ImageGeneration: получить session_id=sess.conversation_id.to_string(); вызвать save_image_generation_result(codex_home, session_id, image_item.id, image_item.result) →triggers SRC-0012/uc.sub/save-image-generation-result",
+          "6. При успехе save_image_generation_result: записать saved_path в image_item; вычислить image_output_path через image_generation_artifact_path(codex_home, session_id, '<image_id>'); image_output_dir = image_output_path.parent() или codex_home; сформировать DeveloperInstructions с текстом 'Generated images are saved to {output_dir} as {output_path} by default. If you need to use a generated image at another path, copy it and leave the original in place unless the user explicitly asks you to delete it.'; record_conversation_items(turn_context, [message])",
+          "7. Converter возвращает Some(turn_item)"
+        ],
+        "extensions (Cockburn)": [
+          {"step": 6, "condition": "save_image_generation_result вернул Err(err)", "action": "вычислить output_path и output_dir через image_generation_artifact_path с реальным image_item.id; tracing::warn call_id=id output_dir=dir 'failed to save generated image: {err}'; saved_path остаётся None; DeveloperInstructions не добавляется; turn_item всё равно возвращается"},
+          {"step": 2, "condition": "item = FunctionCallOutput | CustomToolCallOutput | ToolSearchOutput", "action": "debug 'unexpected tool output from stream'; вернуть None"},
+          {"step": 2, "condition": "item иного типа (FunctionCall, LocalShellCall, GhostSnapshot и т.п.)", "action": "вернуть None"}
+        ],
+        "edge_cases": [
+          {"condition": "image_output_path.parent() возвращает None", "action": "использовать codex_home.clone() как дефолтный output_dir (unwrap_or_else)"},
+          {"condition": "agent_message.content пусто", "action": "combined = пустая строка; strip_citations/plan stripping работает корректно; stripped может быть пустой — всё равно записывается как один Text элемент"}
+        ],
+        "lifecycle": null,
+        "ux": null,
+        "result": "Option<TurnItem>: Some с очищенным от hidden markup AgentMessage или обогащённым saved_path ImageGeneration; None для tool-output вариантов"
+      }
+    },
+    {
+      "id": "SRC-0012/uc.sub/save-image-generation-result",
+      "src": "SRC-0012",
+      "composition": "use_case",
+      "level": "sub",
+      "strategic_domain": null,
+      "terms": {
+        "actor": "Image Artifact Saver (save_image_generation_result и image_generation_artifact_path в stream_events_utils.rs)",
+        "goal": "Сохранить сгенерированное моделью изображение на диск по sanitized пути и вернуть абсолютный путь файла",
+        "steps": [
+          "1. Image Artifact Saver получает codex_home, session_id, call_id, result (base64 строка)",
+          "2. Saver trim'ит result и декодирует как base64 STANDARD",
+          "3. Saver вычисляет путь: codex_home.join('generated_images').join(sanitize(session_id)).join('{sanitize(call_id)}.png')",
+          "4. Saver sanitize'ит каждый компонент: разрешены только ASCII alphanumeric, '-', '_'; остальные символы заменяются на '_'; если sanitized пуст — использовать 'generated_image'",
+          "5. Saver создаёт родительский каталог через tokio::fs::create_dir_all (если parent существует)",
+          "6. Saver записывает decoded байты в файл через tokio::fs::write",
+          "7. Saver возвращает Ok(AbsolutePathBuf) с итоговым путём"
+        ],
+        "extensions (Cockburn)": [
+          {"step": 2, "condition": "base64 decode вернул Err", "action": "вернуть CodexErr::InvalidRequest('invalid image generation payload: {err}')"},
+          {"step": 5, "condition": "path.parent() вернул None", "action": "пропустить create_dir_all (используется if let Some(parent))"},
+          {"step": 5, "condition": "create_dir_all вернул io error", "action": "ошибка проброшена через ? → результат Err"},
+          {"step": 6, "condition": "tokio::fs::write вернул io error", "action": "ошибка проброшена через ? → результат Err"}
+        ],
+        "edge_cases": [
+          {"condition": "session_id или call_id содержит все небезопасные символы (sanitized будет пустой)", "action": "default имя = 'generated_image'"},
+          {"condition": "вызов image_generation_artifact_path с call_id='<image_id>'", "action": "sanitization заменит '<' и '>' на '_' → имя файла '_image_id_.png' — используется как плейсхолдер в DeveloperInstructions о дефолтном пути"}
+        ],
+        "lifecycle": null,
+        "ux": null,
+        "result": "Result<AbsolutePathBuf> — абсолютный путь сохранённого PNG-файла или CodexErr при невалидном payload/ошибке IO"
+      }
+    },
+    {
+      "id": "SRC-0012/uc.sub/record-completed-response-item",
+      "src": "SRC-0012",
+      "composition": "use_case",
+      "level": "sub",
+      "strategic_domain": null,
+      "terms": {
+        "actor": "Response Recorder (record_completed_response_item и смежные функции в stream_events_utils.rs)",
+        "goal": "Записать завершённый ResponseItem в conversation и применить побочные эффекты: отложенная доставка mailbox, пометка thread memory как polluted, учёт stage1 output usage",
+        "steps": [
+          "1. Response Recorder вызывает sess.record_conversation_items(turn_context, [item])",
+          "2. Response Recorder вычисляет plan_mode = (turn_context.collaboration_mode.mode == ModeKind::Plan)",
+          "3. Response Recorder проверяет completed_item_defers_mailbox_delivery_to_next_turn(item, plan_mode); если true — sess.defer_mailbox_delivery_to_next_turn(sub_id)",
+          "4. Response Recorder вызывает mark_thread_memory_mode_polluted_if_external_context(sess, turn_context, item)",
+          "5. Response Recorder вызывает record_stage1_output_usage_for_completed_item(turn_context, item)"
+        ],
+        "extensions (Cockburn)": [
+          {"step": 3, "condition": "item = Message, role!='assistant' ИЛИ phase=Some(Commentary)", "action": "completed_item_defers_mailbox_delivery_to_next_turn возвращает false — mailbox не откладывается"},
+          {"step": 3, "condition": "item = Message с role='assistant' и phase ≠ Commentary, но last_assistant_message_from_item вернул None (нет финального текста)", "action": "mailbox не откладывается"},
+          {"step": 3, "condition": "item = Message с phase = None (untagged provider)", "action": "трактовать как финальный ответ — mailbox откладывается (по комментарию 'Treat `None` like final-answer text so untagged providers default to the safer \"defer mailbox mail\" behavior')"},
+          {"step": 3, "condition": "item = ImageGenerationCall", "action": "mailbox откладывается (always true для этого варианта)"},
+          {"step": 4, "condition": "turn_context.config.memories.no_memories_if_mcp_or_web_search = false", "action": "mark_thread_memory_mode_polluted не выполняется (ранний return)"},
+          {"step": 4, "condition": "item не относится к external-context вариантам (не ToolSearchCall/ToolSearchOutput/WebSearchCall)", "action": "mark_thread_memory_mode_polluted не выполняется"},
+          {"step": 4, "condition": "все условия совпали", "action": "state_db::mark_thread_memory_mode_polluted(services.state_db, conversation_id, reason='record_completed_response_item')"},
+          {"step": 5, "condition": "item не содержит raw_assistant_output_text (не assistant Message)", "action": "record_stage1_output_usage — ранний return"},
+          {"step": 5, "condition": "после strip_citations thread_ids пусто", "action": "ранний return — ничего не записывается"},
+          {"step": 5, "condition": "state_db::get_state_db вернул None", "action": "запись usage не выполняется (if let Some(db))"}
+        ],
+        "edge_cases": [
+          {"condition": "state_db недоступна", "action": "тихо пропускается — базовый record_conversation_items уже выполнен, критичная запись в history произошла"}
+        ],
+        "lifecycle": null,
+        "ux": null,
+        "result": "ResponseItem записан в conversation; при необходимости — mailbox delivery отложен на следующий turn, thread memory помечен polluted, stage1 output usage учтён для thread_ids из citations"
+      }
+    },
+    {
+      "id": "SRC-0012/uc.sub/track-turn-diff-baseline",
+      "src": "SRC-0012",
+      "composition": "use_case",
+      "level": "sub",
+      "strategic_domain": null,
+      "terms": {
+        "actor": "Turn Diff Tracker (TurnDiffTracker::on_patch_begin в turn_diff_tracker.rs)",
+        "goal": "Зафиксировать baseline snapshot файлов в момент первого apply_patch и отслеживать rename для последующего построения агрегированного diff",
+        "steps": [
+          "1. Turn Diff Tracker получает HashMap<PathBuf, FileChange>",
+          "2. Для каждой (path, change) — если path ещё не в external_to_temp_name: Tracker генерирует internal = Uuid::new_v4().to_string(); вставляет (path → internal) в external_to_temp_name; (internal → path) в temp_name_to_current_path",
+          "3. Tracker проверяет существует ли path на диске",
+          "4. Если существует: Tracker вычисляет mode = file_mode_for_path(path).unwrap_or(FileMode::Regular); content = blob_bytes(path, mode).unwrap_or_default(); oid = git_blob_sha1_hex_bytes для Symlink, иначе git_blob_oid_for_path с fallback на git_blob_sha1_hex_bytes",
+          "5. Если не существует: Tracker создаёт BaselineFileInfo с content=vec![], mode=Regular, oid=ZERO_OID (представляет /dev/null для будущей diff)",
+          "6. Tracker вставляет BaselineFileInfo в baseline_file_info по ключу internal",
+          "7. Для FileChange::Update с move_path=Some(dest): Tracker получает uuid_filename из external_to_temp_name.get(path); обновляет temp_name_to_current_path[internal] = dest; удаляет старый путь из external_to_temp_name; вставляет (dest → uuid_filename)"
+        ],
+        "extensions (Cockburn)": [
+          {"step": 2, "condition": "path уже есть в external_to_temp_name (видели ранее в этом turn)", "action": "baseline не пересоздаётся — сохраняется исходный snapshot момента первого видимого patch"},
+          {"step": 4, "condition": "file_mode_for_path вернул None (не удалось прочитать symlink_metadata)", "action": "mode_val = FileMode::Regular (unwrap_or)"},
+          {"step": 4, "condition": "blob_bytes вернул None (ошибка чтения)", "action": "content = vec![] (unwrap_or_default)"},
+          {"step": 4, "condition": "git_blob_oid_for_path вернул None (нет репо или git-команда упала)", "action": "oid = git_blob_sha1_hex_bytes(content) — SHA-1 вычисляется локально по формуле 'blob {len}\\0{data}'"},
+          {"step": 7, "condition": "rename источник не замэплен (external_to_temp_name.get(path) = None)", "action": "редкий случай: сгенерировать новый uuid и вставить baseline с content=vec![], mode=Regular, oid=ZERO_OID"}
+        ],
+        "edge_cases": [
+          {"condition": "файл только что создан (addition)", "action": "baseline НЕ создаётся с snapshot'ом — используется оставить запись отсутствующей чтобы diff отобразился как proper addition с /dev/null; код создаёт baseline с ZERO_OID и пустым content"},
+          {"condition": "symlink", "action": "content читается через read_link → target bytes (unix only); oid всегда sha1 локальный (не git hash-object), потому что git hash-object может интерпретировать ссылку иначе"},
+          {"condition": "non-unix платформа + symlink", "action": "symlink_blob_bytes возвращает None → content пустой"}
+        ],
+        "lifecycle": {
+          "entity": "SRC-0012/entity/baseline-file-info",
+          "states": ["unseen (path не в external_to_temp_name)", "baseline_captured (snapshot зафиксирован)", "renamed (temp_name_to_current_path обновлён на dest)"],
+          "transition": {
+            "from": "unseen",
+            "to": "baseline_captured",
+            "guard": "path видится впервые в текущем turn",
+            "side_effect": "генерация internal uuid и вставка в три мапы (external_to_temp_name, temp_name_to_current_path, baseline_file_info)"
+          }
+        },
+        "ux": null,
+        "result": "TurnDiffTracker имеет актуальный baseline snapshot каждого затронутого пути (с git OID'ом) и отражённый rename mapping, что позволяет далее вычислить unified diff против текущего состояния файлов"
+      }
+    },
+    {
+      "id": "SRC-0012/uc.sub/compute-aggregated-unified-diff",
+      "src": "SRC-0012",
+      "composition": "use_case",
+      "level": "sub",
+      "strategic_domain": null,
+      "terms": {
+        "actor": "Turn Diff Tracker (TurnDiffTracker::get_unified_diff и TurnDiffTracker::get_file_diff в turn_diff_tracker.rs)",
+        "goal": "Вычислить агрегированный unified diff всех отслеживаемых файлов turn, сравнив сохранённые baseline snapshots с текущим состоянием на диске",
+        "steps": [
+          "1. Turn Diff Tracker собирает все internal filenames из baseline_file_info.keys()",
+          "2. Tracker сортирует internal filenames лексикографически по relative_to_git_root_str(current_path) — чтобы порядок совпадал с поведением git",
+          "3. Для каждого internal — Tracker вычисляет per-file diff через get_file_diff",
+          "4. Tracker склеивает per-file diffs, добавляя '\\n' если предыдущий не заканчивался переводом строки",
+          "5. Если aggregated.trim() пуст — Tracker возвращает Ok(None); иначе Ok(Some(aggregated))"
+        ],
+        "extensions (Cockburn)": [
+          {"step": 3, "condition": "get_path_for_internal вернул None", "action": "per-file diff = пустая строка, переход к следующему файлу"},
+          {"step": 3, "condition": "left_bytes == right_bytes (быстрый путь: идентично или оба отсутствуют)", "action": "вернуть пустую строку — этот файл не попадает в diff"},
+          {"step": 3, "condition": "is_add (baseline отсутствует, текущий файл есть)", "action": "добавить 'new file mode {current_mode}' в diff header"},
+          {"step": 3, "condition": "is_delete (baseline был, текущий файл отсутствует)", "action": "добавить 'deleted file mode {baseline_mode}' в diff header"},
+          {"step": 3, "condition": "baseline_mode != current_mode (без add/delete)", "action": "добавить 'old mode {baseline_mode}\\nnew mode {current_mode}'"},
+          {"step": 3, "condition": "бинарные данные (хотя бы одна сторона не UTF-8 и это не pure add/delete)", "action": "добавить 'index {left_oid}..{right_oid}\\n--- {old_header}\\n+++ {new_header}\\nBinary files differ\\n'"},
+          {"step": 3, "condition": "текст можно диффить (обе стороны UTF-8, или addition/delete с одной UTF-8 стороной)", "action": "similar::TextDiff::from_lines(l, r).unified_diff().context_radius(3).header(old_header, new_header).to_string()"}
+        ],
+        "edge_cases": [
+          {"condition": "relative_to_git_root_str не нашёл git root", "action": "использовать абсолютный display path + replace('\\\\', '/')"},
+          {"condition": "baseline_external_path пуст (info отсутствует)", "action": "подставить PathBuf::new() и FileMode::Regular, left_oid = ZERO_OID"},
+          {"condition": "git_blob_oid_for_path не вернул результат для правой стороны", "action": "fallback на git_blob_sha1_hex_bytes (локальный SHA-1)"}
+        ],
+        "lifecycle": null,
+        "ux": null,
+        "result": "Result<Option<String>> — агрегированный unified diff в формате git (diff --git a/... b/..., index OID..OID, заголовки --- / +++, unified hunks с context_radius=3) или None если изменений не обнаружено"
+      }
+    },
+    {
+      "id": "SRC-0012/uc.sub/record-turn-ttft-and-ttfm",
+      "src": "SRC-0012",
+      "composition": "use_case",
+      "level": "sub",
+      "strategic_domain": null,
+      "terms": {
+        "actor": "Turn Timing Recorder (TurnTimingState и record_turn_ttft_metric/record_turn_ttfm_metric в turn_timing.rs)",
+        "goal": "Записать время первого токена (TTFT) и время первого сообщения агента (TTFM) от начала turn, эмитнуть соответствующие OTel метрики",
+        "steps": [
+          "1. Turn Timing Recorder при старте turn фиксирует started_at = Instant::now() и started_at_unix_secs = текущий unix timestamp; сбрасывает first_token_at и first_message_at в None",
+          "2. Turn Timing Recorder на каждый ResponseEvent вызывает response_event_records_turn_ttft(event); для событий, квалифицирующихся как первый токен — захватывает первый раз first_token_at = Instant::now() и вычисляет Duration = first_token_at - started_at",
+          "3. При успешной записи TTFT — turn_context.session_telemetry.record_duration(TURN_TTFT_DURATION_METRIC, duration, [])",
+          "4. Turn Timing Recorder на каждый завершённый TurnItem проверяет matches(item, TurnItem::AgentMessage(_)); если совпало — захватывает первый раз first_message_at = Instant::now() и вычисляет Duration = first_message_at - started_at",
+          "5. При успешной записи TTFM — turn_context.session_telemetry.record_duration(TURN_TTFM_DURATION_METRIC, duration, [])",
+          "6. При запросе completed_at_and_duration_ms — Turn Timing Recorder возвращает (now_unix_timestamp_secs, started_at.elapsed().as_millis() как i64 или i64::MAX при overflow)"
+        ],
+        "extensions (Cockburn)": [
+          {"step": 2, "condition": "response_event_records_turn_ttft(event) = false (Created | ServerModel | ServerReasoningIncluded | Completed | ReasoningSummaryPartAdded | RateLimits | ModelsEtag)", "action": "ничего не записывать, вернуть None"},
+          {"step": 2, "condition": "event = OutputItemDone/OutputItemAdded с ResponseItem, для которого response_item_records_turn_ttft = false (FunctionCallOutput | CustomToolCallOutput | ToolSearchOutput | Other, ИЛИ Message с пустым assistant текстом, ИЛИ Reasoning с пустыми summary и content)", "action": "TTFT не записывается"},
+          {"step": 2, "condition": "first_token_at уже Some (повторная запись)", "action": "record_turn_ttft возвращает None — идемпотентно"},
+          {"step": 2, "condition": "started_at = None (mark_turn_started не вызывался)", "action": "record_turn_ttft возвращает None (через ? оператор на started_at)"},
+          {"step": 4, "condition": "TurnItem не AgentMessage", "action": "record_ttfm_for_turn_item возвращает None — метрика не эмитится"},
+          {"step": 4, "condition": "first_message_at уже Some", "action": "идемпотентный None"},
+          {"step": 4, "condition": "started_at = None", "action": "вернуть None"}
+        ],
+        "edge_cases": [
+          {"condition": "SystemTime::now().duration_since(UNIX_EPOCH) вернул Err (время до эпохи)", "action": "Duration::default() → now_unix_timestamp_secs = 0"},
+          {"condition": "duration.as_secs() или elapsed.as_millis() превышает i64::MAX", "action": "i64::try_from возвращает Err → использовать i64::MAX"}
+        ],
+        "lifecycle": {
+          "entity": "SRC-0012/entity/turn-timing-state",
+          "states": ["not_started (started_at=None)", "started (started_at=Some, first_token/message=None)", "ttft_recorded (first_token_at=Some)", "ttfm_recorded (first_message_at=Some)"],
+          "transition": {
+            "from": "started",
+            "to": "ttft_recorded",
+            "guard": "response_event_records_turn_ttft = true AND first_token_at.is_none()",
+            "side_effect": "record_duration TURN_TTFT_DURATION_METRIC"
+          }
+        },
+        "ux": null,
+        "result": "TTFT и TTFM зафиксированы идемпотентно (только первое срабатывание); метрики TURN_TTFT_DURATION_METRIC и TURN_TTFM_DURATION_METRIC эмитятся через OTel; completed_at и duration_ms доступны для отчётности"
+      }
+    },
+    {
+      "id": "SRC-0012/uc.sub/enrich-turn-metadata-with-git",
+      "src": "SRC-0012",
+      "composition": "use_case",
+      "level": "sub",
+      "strategic_domain": null,
+      "terms": {
+        "actor": "Turn Metadata State (TurnMetadataState::spawn_git_enrichment_task и fetch_workspace_git_metadata в turn_metadata.rs)",
+        "goal": "Асинхронно собрать git-метаданные рабочего каталога (remote URLs, HEAD commit, has_changes) и обновить enriched header для отправки вместе с запросом к модели",
+        "steps": [
+          "1. Turn Metadata State при конструкции сохраняет cwd и пытается получить repo_root через get_git_repo_root(cwd); создаёт base_metadata без workspace информации; base_header = serialized base_metadata или '{}'",
+          "2. При вызове spawn_git_enrichment_task: Turn Metadata State проверяет repo_root — если None, task не запускается",
+          "3. Turn Metadata State проверяет enrichment_task — если уже Some, новый task не создаётся (идемпотентность)",
+          "4. Turn Metadata State клонирует self и запускает tokio::spawn; внутри task вызывает fetch_workspace_git_metadata — tokio::join! параллельно get_head_commit_hash, get_git_remote_urls_assume_git_repo, get_has_changes",
+          "5. Turn Metadata State формирует WorkspaceGitMetadata из трёх результатов; если repo_root уже None к моменту завершения — task просто завершается",
+          "6. Turn Metadata State вызывает build_turn_metadata_bag с session_id/thread_source/turn_id/sandbox от base_metadata и новым workspace_git_metadata по ключу repo_root",
+          "7. Если enriched_metadata.workspaces пусто — task завершается без обновления",
+          "8. Иначе enriched_metadata.to_header_value() записывается в enriched_header (Arc<RwLock<Option<String>>>) под write-lock (poison-safe через into_inner)"
+        ],
+        "extensions (Cockburn)": [
+          {"step": 2, "condition": "repo_root = None (cwd не внутри git репо)", "action": "spawn_git_enrichment_task — ранний return, enriched_header не заполняется"},
+          {"step": 3, "condition": "enrichment_task уже запущен (task_guard.is_some())", "action": "ранний return — не плодить параллельные задачи"},
+          {"step": 5, "condition": "workspace_git_metadata.is_empty() (все три поля None)", "action": "workspaces не заполняется через build_turn_metadata_bag (условие if let внутри функции)"},
+          {"step": 7, "condition": "enriched_metadata.workspaces пусто (repo_root был, но workspace пуст)", "action": "task завершается без побочных эффектов"},
+          {"step": 8, "condition": "to_header_value вернул None (сериализация упала)", "action": "enriched_header не обновляется"},
+          {"step": 8, "condition": "RwLock/Mutex poisoned", "action": "unwrap_or_else(PoisonError::into_inner) — продолжить работу с corrupted guard, не падать"}
+        ],
+        "edge_cases": [
+          {"condition": "cancel_git_enrichment_task вызван", "action": "task_guard.take() + task.abort() — tokio отменяет выполняющуюся задачу"},
+          {"condition": "одно из get_head_commit_hash/get_git_remote_urls/get_has_changes вернуло None", "action": "соответствующее поле WorkspaceGitMetadata остаётся None; если все три None — is_empty=true"}
+        ],
+        "lifecycle": {
+          "entity": "SRC-0012/entity/turn-metadata-state",
+          "states": ["base_only (enriched_header=None)", "enrichment_running (enrichment_task=Some)", "enriched (enriched_header=Some)", "cancelled (task aborted)"],
+          "transition": {
+            "from": "base_only",
+            "to": "enrichment_running",
+            "guard": "repo_root=Some AND enrichment_task=None",
+            "side_effect": "tokio::spawn создаёт JoinHandle, guard заполняется"
+          }
+        },
+        "ux": null,
+        "result": "Enriched header с секцией workspaces.{repo_root}.{remote_urls, commit_hash, has_changes} доступен через current_header_value; cancel_git_enrichment_task корректно отменяет работу если необходимо"
+      }
+    },
+    {
+      "id": "SRC-0012/uc.sub/merge-responsesapi-client-metadata",
+      "src": "SRC-0012",
+      "composition": "use_case",
+      "level": "sub",
+      "strategic_domain": null,
+      "terms": {
+        "actor": "Turn Metadata State (merge_responsesapi_client_metadata и current_header_value в turn_metadata.rs)",
+        "goal": "Объединить дополнительные key-value от ResponsesAPI клиента с текущим header (enriched или base), не перезаписывая существующие ключи",
+        "steps": [
+          "1. Turn Metadata State читает enriched_header (если Some) или использует base_header",
+          "2. Turn Metadata State читает responsesapi_client_metadata через RwLock (clone HashMap если Some)",
+          "3. merge_responsesapi_client_metadata парсит header как JSON Map<String, Value>",
+          "4. Для каждой (key, value) из client metadata — выполняет metadata.entry(key).or_insert_with(|| Value::String(value)) — вставка только если ключа нет",
+          "5. Turn Metadata State сериализует обновлённый Map в строку через serde_json::to_string"
+        ],
+        "extensions (Cockburn)": [
+          {"step": 2, "condition": "responsesapi_client_metadata = None", "action": "merge_responsesapi_client_metadata возвращает None → current_header_value fallback на or(Some(header)) — возвращается исходный header без merge"},
+          {"step": 3, "condition": "serde_json::from_str header провалился (некорректный JSON)", "action": "merge возвращает None → fallback на исходный header"},
+          {"step": 4, "condition": "ключ уже существует в base/enriched header (например session_id)", "action": "значение из responsesapi_client_metadata игнорируется — существующий не перезаписывается"},
+          {"step": 5, "condition": "serde_json::to_string провалился", "action": "merge возвращает None → fallback на исходный header"}
+        ],
+        "edge_cases": [
+          {"condition": "set_responsesapi_client_metadata вызван повторно", "action": "старые значения полностью заменяются новым HashMap (write lock overwrite)"},
+          {"condition": "RwLock poisoned", "action": "unwrap_or_else(PoisonError::into_inner) — работать с corrupted state"}
+        ],
+        "lifecycle": null,
+        "ux": null,
+        "result": "Option<String> (JSON header) с добавленными client metadata ключами без перезаписи существующих; при любой ошибке парсинга/сериализации — исходный header без изменений"
+      }
+    }
+  ]
+}

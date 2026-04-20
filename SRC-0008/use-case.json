@@ -1,0 +1,557 @@
+{
+  "src": "SRC-0008",
+  "schema_version": "2.0",
+  "lens": "use_case",
+  "compositions": [
+    {
+      "id": "SRC-0008/uc.user/spawn-sub-agent",
+      "src": "SRC-0008",
+      "composition": "use_case",
+      "level": "user",
+      "strategic_domain": "оркестрация мульти-агентных сессий Codex",
+      "terms": {
+        "actor": "Orchestrating agent (parent thread вызывающий multi-agent tool)",
+        "goal": "Запустить новый sub-agent в дереве текущей сессии с выбранной ролью и передать ему начальную задачу",
+        "steps": [
+          "1. Orchestrating agent вызывает AgentControl.spawn_agent с config, initial_operation и session_source (обычно ThreadSpawn{parent_thread_id, depth, agent_path, agent_role})",
+          "2. AgentControl апгрейдит Weak<ThreadManagerState> — если dropped → UnsupportedOperation 'thread manager dropped'",
+          "3. AgentRegistry резервирует слот: при заданном agent_max_threads через try_increment_spawned CAS, иначе инкремент total_count",
+          "4. AgentControl наследует shell snapshot и exec policy от parent thread (только при SubAgent::ThreadSpawn и child_uses_parent_exec_policy)",
+          "5. AgentControl вызывает prepare_thread_spawn →triggers SRC-0008/uc.sub/reserve-agent-identity",
+          "6. ThreadManagerState создаёт новый thread через spawn_new_thread_with_source (передавая AgentControl, session_source, inherited_shell_snapshot, inherited_exec_policy)",
+          "7. AgentControl проставляет agent_metadata.agent_id = new_thread.thread_id и вызывает SpawnReservation.commit(agent_metadata) — регистрирует в AgentRegistry.agent_tree",
+          "8. AgentControl emit-ит subagent_session_started analytics (только при Feature::GeneralAnalytics и заданном parent)",
+          "9. ThreadManagerState.notify_thread_created оповещает подписчиков о новом thread",
+          "10. AgentControl персистит thread-spawn edge (parent_thread_id → child_thread_id, status=Open) в state_db",
+          "11. AgentControl отправляет initial_operation в новый thread через send_input",
+          "12. AgentControl запускает completion watcher (только если Feature::MultiAgentV2 выключен для thread) →triggers SRC-0008/uc.sub/notify-parent-on-completion",
+          "13. AgentControl возвращает LiveAgent{thread_id, metadata, status=get_status(thread_id)}"
+        ],
+        "extensions (Cockburn)": [
+          {"step": 3, "condition": "total_count >= agent_max_threads", "action": "CodexErr::AgentLimitReached{max_threads} — реестр не создаёт SpawnReservation, spawn не происходит"},
+          {"step": 5, "condition": "agent_path уже существует в agent_tree", "action": "CodexErr::UnsupportedOperation 'agent path `{path}` already exists' — reservation.drop освобождает слот"},
+          {"step": 5, "condition": "нет доступных nickname'ов (names пустой)", "action": "CodexErr::UnsupportedOperation 'no available agent nicknames'"},
+          {"step": 5, "condition": "все имена в nickname pool заняты", "action": "used_agent_nicknames.clear, nickname_reset_count+=1, инкремент метрики codex.multi_agent.nickname_pool_reset, имя переформатируется с ordinal suffix (the 2nd / 3rd / 4th ...)"},
+          {"step": 8, "condition": "не удалось загрузить metadata parent thread", "action": "tracing::warn 'skipping subagent thread analytics: failed to load parent thread metadata', client_metadata = пустая (client_name=None, client_version=None), продолжить spawn"},
+          {"step": 11, "condition": "send_input возвращает InternalAgentDied", "action": "state.remove_thread + release_spawned_thread (слот освобождается), ошибка пробрасывается"}
+        ],
+        "edge_cases": [
+          {"condition": "SpawnReservation дропается без commit (ошибка между reserve и commit)", "action": "Drop::drop освобождает reserved_agent_path через release_reserved_agent_path и декрементит total_count — слот не утекает"},
+          {"condition": "session_source=None (root thread spawn без родителя)", "action": "agent_metadata = default, используется spawn_new_thread (без session_source), shell snapshot и exec policy не наследуются"},
+          {"condition": "MultiAgentV2 включен", "action": "completion watcher НЕ запускается (v2 flow использует другой механизм)"}
+        ],
+        "lifecycle": {
+          "entity": "SRC-0008/entity/agent-metadata",
+          "states": ["reserved_not_committed", "committed_live", "released"],
+          "transition": {
+            "from": "reserved_not_committed",
+            "to": "committed_live",
+            "guard": "thread успешно создан + send_input не упал InternalAgentDied",
+            "side_effect": "вставка в agent_tree, персистирование thread_spawn edge, notify_thread_created"
+          }
+        },
+        "ux": null,
+        "result": "В сессии появился новый sub-agent: thread_id зарегистрирован в ThreadManagerState, agent_path (если задан) и nickname зарезервированы в AgentRegistry, spawn edge Open в state_db, caller получает LiveAgent для дальнейшей коммуникации"
+      }
+    },
+    {
+      "id": "SRC-0008/uc.user/fork-agent-thread",
+      "src": "SRC-0008",
+      "composition": "use_case",
+      "level": "user",
+      "strategic_domain": "оркестрация мульти-агентных сессий Codex",
+      "terms": {
+        "actor": "Orchestrating agent (инициирующий форк параллельной копии)",
+        "goal": "Создать форк существующего thread'а с полной или усечённой историей как отдельного sub-agent",
+        "steps": [
+          "1. Orchestrating agent вызывает spawn_agent_with_metadata с SpawnAgentOptions{fork_parent_spawn_call_id=Some(id), fork_mode=Some(FullHistory | LastNTurns(n))}",
+          "2. AgentControl.spawn_agent_internal видит fork_mode=Some и session_source=ThreadSpawn → идёт в spawn_forked_thread",
+          "3. spawn_forked_thread проверяет: fork_parent_spawn_call_id задан, fork_mode задан, session_source — ThreadSpawn",
+          "4. ThreadManagerState получает parent thread, выполняет ensure_rollout_materialized и flush_rollout (чтобы на диске была полная актуальная история) →triggers SRC-0008/uc.sub/ensure-rollout-materialized",
+          "5. spawn_forked_thread получает rollout_path: parent_thread.rollout_path или find_thread_path_by_id_str(codex_home, parent_thread_id)",
+          "6. spawn_forked_thread читает историю: RolloutRecorder::get_rollout_history(rollout_path).get_rollout_items()",
+          "7. При fork_mode=LastNTurns(n): truncate_rollout_to_last_n_fork_turns(items, n)",
+          "8. Items фильтруются через keep_forked_rollout_item (system/developer/user сообщения — оставить; assistant — только FinalAnswer; reasoning/tool_calls/outputs/compaction items — удалить; EventMsg/SessionMeta/TurnContext — оставить)",
+          "9. ThreadManagerState.fork_thread_with_source создаёт новый thread с InitialHistory::Forked(items), тем же AgentControl, унаследованными shell snapshot и exec policy",
+          "10. Дальнейшие шаги как в spawn-sub-agent: commit reservation → persist edge → send_input(initial_operation) → completion watcher"
+        ],
+        "extensions (Cockburn)": [
+          {"step": 3, "condition": "fork_parent_spawn_call_id is None", "action": "CodexErr::Fatal 'spawn_agent fork requires a parent spawn call id'"},
+          {"step": 3, "condition": "fork_mode is None", "action": "CodexErr::Fatal 'spawn_agent fork requires a fork mode'"},
+          {"step": 3, "condition": "session_source не ThreadSpawn", "action": "CodexErr::Fatal 'spawn_agent fork requires a thread-spawn session source'"},
+          {"step": 5, "condition": "rollout path недоступен (ни у live parent, ни на диске)", "action": "CodexErr::Fatal 'parent thread rollout unavailable for fork: {parent_thread_id}'"}
+        ],
+        "edge_cases": [
+          {"condition": "parent thread недоступен в памяти, но rollout файл есть на диске", "action": "поиск через find_thread_path_by_id_str, форк из дискового файла без flush"},
+          {"condition": "fork_mode=FullHistory", "action": "items НЕ обрезаются по turns, но всё равно фильтруются через keep_forked_rollout_item (reasoning/tool calls отсекаются)"}
+        ],
+        "lifecycle": null,
+        "ux": null,
+        "result": "Создан новый sub-agent с начальной историей, собранной из parent rollout'а (полной или последних N turns) — только диалоговые сообщения и финальные ответы ассистента, без внутренних reasoning/tool call items"
+      }
+    },
+    {
+      "id": "SRC-0008/uc.user/resume-agent-tree",
+      "src": "SRC-0008",
+      "composition": "use_case",
+      "level": "user",
+      "strategic_domain": "восстановление мульти-агентных сессий Codex",
+      "terms": {
+        "actor": "Session loader (восстанавливает сессию после рестарта)",
+        "goal": "Возобновить ранее запущенного root-агента и все его живые потомки из сохранённых rollout'ов",
+        "steps": [
+          "1. Loader вызывает AgentControl.resume_agent_from_rollout(config, thread_id, session_source)",
+          "2. AgentControl вычисляет root_depth = thread_spawn_depth(session_source).unwrap_or(0)",
+          "3. AgentControl вызывает resume_single_agent_from_rollout для root_thread_id — возобновляет родителя",
+          "4. AgentControl апгрейдит ThreadManagerState и берёт resumed_thread, извлекает state_db context",
+          "5. BFS через resume_queue (parent_thread_id, parent_depth) начиная с (thread_id, root_depth)",
+          "6. Для каждого parent: state_db.list_thread_spawn_children_with_status(parent, Open) возвращает child_ids",
+          "7. Для каждого child_thread_id: если уже в памяти (state.get_thread успешен) — пропустить resume; иначе вызвать resume_single_agent_from_rollout с SessionSource::SubAgent::ThreadSpawn{parent_thread_id, depth=parent_depth+1, остальные поля=None}",
+          "8. Успешно возобновлённые дети добавляются в resume_queue для обхода их собственных children",
+          "9. Возвращается resumed_thread_id (id возобновлённого root'а)"
+        ],
+        "extensions (Cockburn)": [
+          {"step": 4, "condition": "get_thread(resumed_thread_id) упал", "action": "return Ok(resumed_thread_id) — дерево потомков не обходится, но root возвращён"},
+          {"step": 4, "condition": "resumed_thread.state_db() is None", "action": "return Ok(resumed_thread_id) — без state_db нет persistent spawn edges, обход невозможен"},
+          {"step": 6, "condition": "list_thread_spawn_children_with_status вернул ошибку", "action": "warn 'failed to load persisted thread-spawn children for {parent_thread_id}: {err}', continue (пропускаем этого parent)"},
+          {"step": 7, "condition": "resume_single_agent_from_rollout для child вернул ошибку", "action": "warn 'failed to resume descendant thread {child_thread_id}: {err}', child НЕ добавляется в resume_queue (его потомки не обходятся)"}
+        ],
+        "edge_cases": [
+          {"condition": "depth >= config.agent_max_depth при resume child'а", "action": "в resume_single_agent_from_rollout: disable feature SpawnCsv и feature Collab у resumed config — возобновлённый агент не сможет плодить дальше"},
+          {"condition": "rollout файл для child не найден в активных threads", "action": "find_thread_path_by_id_str → если None, попытка find_archived_thread_path_by_id_str; если тоже None — CodexErr::ThreadNotFound"},
+          {"condition": "Feature::MultiAgentV2 выключен для resumed thread", "action": "запускается completion watcher как при обычном spawn"}
+        ],
+        "lifecycle": {
+          "entity": "SRC-0008/entity/thread-spawn-edge",
+          "states": ["Open", "Closed"],
+          "transition": {
+            "from": "Open",
+            "to": "Open_resumed",
+            "guard": "ребёнок найден в state_db со статусом Open",
+            "side_effect": "resume_single_agent_from_rollout, notify_thread_created, опциональный completion watcher, повторный upsert edge как Open"
+          }
+        },
+        "ux": null,
+        "result": "Root-thread и всё его поддерево живых на момент shutdown sub-agent'ов возобновлены: все поднятые thread'ы зарегистрированы в ThreadManagerState, AgentRegistry, Open spawn edges повторно upsert'нуты, completion watcher перезапущен для v1-потоков"
+      }
+    },
+    {
+      "id": "SRC-0008/uc.user/close-agent",
+      "src": "SRC-0008",
+      "composition": "use_case",
+      "level": "user",
+      "strategic_domain": "оркестрация мульти-агентных сессий Codex",
+      "terms": {
+        "actor": "Orchestrating agent (завершает sub-agent и его поддерево)",
+        "goal": "Явно закрыть sub-agent: зафиксировать closed-статус в state_db и завершить агент вместе со всем его живым поддеревом",
+        "steps": [
+          "1. Caller вызывает AgentControl.close_agent(agent_id)",
+          "2. AgentControl получает thread и, если state_db доступен, set_thread_spawn_edge_status(agent_id, Closed) — запись о том, что закрыт явным ходом (не падением)",
+          "3. AgentControl вызывает shutdown_agent_tree(agent_id)",
+          "4. shutdown_agent_tree строит descendant_ids через live_thread_spawn_descendants (DFS по live_thread_spawn_children)",
+          "5. shutdown_live_agent(agent_id) для корня: flush_rollout, если status != Shutdown → send Op::Shutdown, иначе пустой результат",
+          "6. После shutdown корня: remove_thread, release_spawned_thread (удаление из agent_tree, декремент total_count)",
+          "7. Для каждого descendant_id — shutdown_live_agent в порядке обхода"
+        ],
+        "extensions (Cockburn)": [
+          {"step": 2, "condition": "set_thread_spawn_edge_status вернул ошибку", "action": "warn 'failed to persist thread-spawn edge status for {agent_id}: {err}', shutdown_agent_tree всё равно выполняется"},
+          {"step": 5, "condition": "thread не найден в ThreadManagerState", "action": "fallback: send Op::Shutdown напрямую через state.send_op (без flush)"},
+          {"step": 7, "condition": "shutdown descendant вернул ThreadNotFound или InternalAgentDied", "action": "игнорировать и продолжить остальные descendants"},
+          {"step": 7, "condition": "shutdown descendant вернул иную ошибку", "action": "пробросить ошибку и прервать обход"}
+        ],
+        "edge_cases": [
+          {"condition": "shutdown_live_agent используется вместо close_agent (API для отправки только shutdown-сигнала без отметки closed в state_db)", "action": "state_db edge остаётся Open — используется когда shutdown временный, не финальный"},
+          {"condition": "release_spawned_thread для root агента (agent_path.is_root)", "action": "total_count НЕ декрементится (root не считается в лимите agent_max_threads)"}
+        ],
+        "lifecycle": {
+          "entity": "SRC-0008/entity/thread-spawn-edge",
+          "states": ["Open", "Closed"],
+          "transition": {
+            "from": "Open",
+            "to": "Closed",
+            "guard": "caller вызвал close_agent (не просто shutdown_live_agent)",
+            "side_effect": "state_db.set_thread_spawn_edge_status + shutdown всего поддерева"
+          }
+        },
+        "ux": null,
+        "result": "agent и всё его живое поддерево остановлены, edge в state_db помечен Closed, threads удалены из ThreadManagerState, nicknames и agent_paths освобождены"
+      }
+    },
+    {
+      "id": "SRC-0008/uc.user/list-available-agents",
+      "src": "SRC-0008",
+      "composition": "use_case",
+      "level": "user",
+      "strategic_domain": "наблюдаемость мульти-агентного дерева",
+      "terms": {
+        "actor": "Orchestrating agent (или инструмент, получающий обзор живых агентов)",
+        "goal": "Получить список всех живых агентов в текущем дереве с их статусом и последним сообщением, опционально ограниченный подпрефиксом agent_path",
+        "steps": [
+          "1. Caller вызывает AgentControl.list_agents(current_session_source, path_prefix)",
+          "2. AgentControl апгрейдит ThreadManagerState",
+          "3. Если path_prefix задан: current_agent_path (из session_source или root).resolve(prefix) → resolved_prefix; иначе None",
+          "4. Получить live_agents из AgentRegistry (все метаданные кроме root)",
+          "5. Отсортировать по agent_path (строково), потом по agent_id (строково)",
+          "6. Если фильтр не отсекает root: добавить первым элементом ListedAgent{agent_name=root_path, status=root_thread.agent_status, last_task_message='Main thread'}",
+          "7. Для каждого metadata с agent_id: проверка agent_matches_prefix, get_thread, построение ListedAgent{agent_name=agent_path.to_string() или thread_id.to_string(), status=thread.agent_status, last_task_message=metadata.last_task_message}",
+          "8. Вернуть Vec<ListedAgent>"
+        ],
+        "extensions (Cockburn)": [
+          {"step": 3, "condition": "resolve(prefix) вернул ошибку", "action": "CodexErr::UnsupportedOperation (маппинг из AgentPath::resolve error)"},
+          {"step": 7, "condition": "agent_matches_prefix вернул false", "action": "continue — агент пропускается в результате"},
+          {"step": 7, "condition": "get_thread(thread_id) упал", "action": "continue — агент пропускается"},
+          {"step": 7, "condition": "metadata.agent_id is None (только зарезервирован, не запущен)", "action": "continue — пропустить"}
+        ],
+        "edge_cases": [
+          {"condition": "prefix.is_root()", "action": "agent_matches_prefix возвращает true для всех — фильтр не применяется"},
+          {"condition": "agent_path=None у агента", "action": "agent_name = thread_id.to_string() (fallback)"},
+          {"condition": "root thread не в agent_tree AgentRegistry", "action": "root не добавляется в список"}
+        ],
+        "lifecycle": null,
+        "ux": null,
+        "result": "Caller получает отсортированный Vec<ListedAgent> с именами, статусами и последними сообщениями всех живых агентов, удовлетворяющих path_prefix (или всех, если prefix=None)"
+      }
+    },
+    {
+      "id": "SRC-0008/uc.user/reference-agent-by-name",
+      "src": "SRC-0008",
+      "composition": "use_case",
+      "level": "user",
+      "strategic_domain": "наблюдаемость мульти-агентного дерева",
+      "terms": {
+        "actor": "Tool-calling agent (указывающий целевого агента по имени или thread_id в аргументах tool'а)",
+        "goal": "Разрешить строковый идентификатор агента (относительный путь или thread_id) в ThreadId для дальнейших операций",
+        "steps": [
+          "1. Tool-handler вызывает resolve_agent_target(session, turn, target)",
+          "2. resolve_agent_target регистрирует root текущей сессии: agent_control.register_session_root(session.conversation_id, turn.session_source) — если session_source не ThreadSpawn (парент), root регистрируется в AgentRegistry.agent_tree",
+          "3. Попытка распарсить target как ThreadId::from_string(target) — если успешно, вернуть этот ThreadId",
+          "4. Иначе вызов agent_control.resolve_agent_reference(conversation_id, session_source, target) →triggers SRC-0008/uc.sub/resolve-agent-reference"
+        ],
+        "extensions (Cockburn)": [
+          {"step": 4, "condition": "resolve_agent_reference вернул CodexErr::UnsupportedOperation(message)", "action": "FunctionCallError::RespondToModel(message) — ошибка идёт в ответ модели"},
+          {"step": 4, "condition": "другая CodexErr", "action": "FunctionCallError::RespondToModel(err.to_string())"}
+        ],
+        "edge_cases": [
+          {"condition": "target — валидный ThreadId (хотя не живой агент)", "action": "возвращается как есть без проверки существования — проверит последующий caller"}
+        ],
+        "lifecycle": null,
+        "ux": null,
+        "result": "Возвращён ThreadId — либо напрямую из target, либо через разрешение по AgentPath; при ошибке — структурированная FunctionCallError::RespondToModel для передачи модели"
+      }
+    },
+    {
+      "id": "SRC-0008/uc.sub/resolve-agent-reference",
+      "src": "SRC-0008",
+      "composition": "use_case",
+      "level": "sub",
+      "strategic_domain": null,
+      "terms": {
+        "actor": "AgentControl.resolve_agent_reference",
+        "goal": "Преобразовать строковый agent_reference в ThreadId живого агента относительно текущего агента",
+        "steps": [
+          "1. AgentControl.resolve_agent_reference берёт current_session_source.get_agent_path() или fallback на AgentPath::root()",
+          "2. Вызывает current_agent_path.resolve(agent_reference) для получения абсолютного AgentPath",
+          "3. Ищет ThreadId в AgentRegistry: state.agent_id_for_path(&agent_path) (lookup в agent_tree по строковому ключу)",
+          "4. Если найден — возвращает ThreadId"
+        ],
+        "extensions (Cockburn)": [
+          {"step": 2, "condition": "resolve вернул ошибку", "action": "CodexErr::UnsupportedOperation (маппинг AgentPath::resolve error)"},
+          {"step": 3, "condition": "agent_id_for_path вернул None", "action": "CodexErr::UnsupportedOperation 'live agent path `{path}` not found'"}
+        ],
+        "edge_cases": null,
+        "lifecycle": null,
+        "ux": null,
+        "result": "Возвращён ThreadId живого агента по указанному agent_path; либо UnsupportedOperation если путь невалиден/не живой"
+      }
+    },
+    {
+      "id": "SRC-0008/uc.sub/reserve-agent-identity",
+      "src": "SRC-0008",
+      "composition": "use_case",
+      "level": "sub",
+      "strategic_domain": null,
+      "terms": {
+        "actor": "AgentControl.prepare_thread_spawn + SpawnReservation",
+        "goal": "Атомарно зарезервировать в AgentRegistry agent_path (если задан) и agent_nickname, сформировать SessionSource::ThreadSpawn и AgentMetadata до создания thread'а",
+        "steps": [
+          "1. prepare_thread_spawn: если depth==1 — register_root_thread(parent_thread_id) в AgentRegistry (root встраивается лениво при первом spawn)",
+          "2. Если agent_path задан: reservation.reserve_agent_path(agent_path) — проверка и вставка в agent_tree placeholder (agent_id=None)",
+          "3. Определить candidate_names = agent_nickname_candidates(config, role_name): из resolve_role_config → role.nickname_candidates, иначе default_agent_nickname_list() из AGENT_NAMES",
+          "4. reservation.reserve_agent_nickname_with_preference(candidate_name_refs, preferred_agent_nickname): state.reserve_agent_nickname в AgentRegistry с выбором random из available или применением preferred",
+          "5. Сформировать SessionSource::SubAgent(ThreadSpawn{parent_thread_id, depth, agent_path, agent_nickname, agent_role})",
+          "6. Сформировать AgentMetadata{agent_id=None, agent_path, agent_nickname, agent_role, last_task_message=None}",
+          "7. Вернуть (session_source, agent_metadata)"
+        ],
+        "extensions (Cockburn)": [
+          {"step": 2, "condition": "agent_path уже существует в agent_tree", "action": "CodexErr::UnsupportedOperation 'agent path `{path}` already exists'"},
+          {"step": 4, "condition": "preferred задан", "action": "использовать preferred как есть (без фильтра занятых — предполагается caller гарантирует уникальность)"},
+          {"step": 4, "condition": "names пустой И preferred=None", "action": "reserve_agent_nickname возвращает None → CodexErr::UnsupportedOperation 'no available agent nicknames'"},
+          {"step": 4, "condition": "все имена с текущим reset_count заняты", "action": "used_agent_nicknames.clear(), nickname_reset_count+=1, инкремент метрики codex.multi_agent.nickname_pool_reset (через codex_otel::global), выбрать random из names с новым reset_count и ordinal suffix"}
+        ],
+        "edge_cases": [
+          {"condition": "reservation дропнется до commit (panic/error между reserve и commit)", "action": "Drop::drop освобождает reserved_agent_path через release_reserved_agent_path (удаление placeholder) и декрементит total_count"},
+          {"condition": "ordinal formatting для value=11,12,13", "action": "всегда суффикс 'th' (11th, 12th, 13th — не 11st)"}
+        ],
+        "lifecycle": {
+          "entity": "SRC-0008/entity/spawn-reservation",
+          "states": ["reserved_not_committed", "committed", "released"],
+          "transition": {
+            "from": "reserved_not_committed",
+            "to": "committed",
+            "guard": "caller вызвал commit(agent_metadata) после успешного spawn'а",
+            "side_effect": "register_spawned_thread: вставка в agent_tree, used_agent_nicknames.insert(nickname), active=false (Drop не сработает)"
+          }
+        },
+        "ux": null,
+        "result": "AgentRegistry содержит placeholder-запись с agent_path (если задан), nickname зарезервирован в used_agent_nicknames, SpawnReservation удерживает инкремент total_count до commit или drop"
+      }
+    },
+    {
+      "id": "SRC-0008/uc.sub/apply-role-layer",
+      "src": "SRC-0008",
+      "composition": "use_case",
+      "level": "sub",
+      "strategic_domain": null,
+      "terms": {
+        "actor": "apply_role_to_config (agent role module)",
+        "goal": "Наложить TOML слой выбранной роли на config сессии, сохранив профайл/провайдер caller'а если роль их не задаёт явно",
+        "steps": [
+          "1. apply_role_to_config берёт role_name или DEFAULT_ROLE_NAME ('default') если None",
+          "2. resolve_role_config(config, role_name): сначала config.agent_roles (user-defined), затем built_in::configs() (default/explorer/worker)",
+          "3. Если роль не найдена → вернуть 'unknown agent_type '{role_name}''",
+          "4. apply_role_to_config_inner: is_built_in = !config.agent_roles.contains_key(role_name)",
+          "5. Если role.config_file is None → ничего не делать (роль без слоя, напр. default)",
+          "6. load_role_layer_toml: для built-in — built_in::config_file_contents(path) (include_str! explorer.toml или awaiter.toml); для user-defined — tokio::fs::read_to_string + parse_agent_role_file_contents с base=config_file.parent",
+          "7. Валидация через deserialize_config_toml_with_base + resolve_relative_paths_in_config_toml с role_config_base",
+          "8. Если role_layer_toml пустой table → return без изменений",
+          "9. preservation_policy(config, &role_layer_toml) вычисляет (preserve_current_profile, preserve_current_provider) →triggers SRC-0008/uc.sub/compute-role-preservation-policy",
+          "10. reload::build_next_config: active_profile_name = если preserve_current_profile, config.active_profile; иначе None. build_config_layer_stack: существующие layers + optional resolved_profile_layer + role_layer (все с ConfigLayerSource::SessionFlags)",
+          "11. Инжект layer'ов через partition_point по name → layers.insert(insertion_index, layer)",
+          "12. deserialize_effective_config из нового layer stack → ConfigToml",
+          "13. Если preserve_current_profile: обнулить merged_config.profile (чтобы не переписать active_profile)",
+          "14. Config::load_config_with_layer_stack с reload_overrides(cwd, model_provider если preserve_current_provider, sandbox_exe, execve_wrapper, node_path)",
+          "15. Если preserve_current_profile: next_config.active_profile = config.active_profile (восстановить sticky profile)",
+          "16. *config = next_config (мутирует переданный config)"
+        ],
+        "extensions (Cockburn)": [
+          {"step": 3, "condition": "role_name не найден ни в user, ни в built-in", "action": "вернуть 'unknown agent_type '{role_name}'' (Err)"},
+          {"step": 6, "condition": "built_in::config_file_contents(path) вернул None", "action": "anyhow!('No corresponding config content') → warn 'failed to apply role to config: {err}' → вернуть AGENT_TYPE_UNAVAILABLE_ERROR ('agent type is currently not available')"},
+          {"step": 6, "condition": "tokio::fs::read_to_string или parse_agent_role_file_contents упал для user-defined", "action": "warn + AGENT_TYPE_UNAVAILABLE_ERROR"},
+          {"step": 7, "condition": "deserialize_config_toml_with_base / resolve_relative_paths_in_config_toml упал", "action": "warn + AGENT_TYPE_UNAVAILABLE_ERROR"},
+          {"step": 8, "condition": "role_layer_toml.as_table().is_some_and(is_empty)", "action": "Ok(()) без изменений config — роль с пустым TOML не трогает stack"}
+        ],
+        "edge_cases": [
+          {"condition": "role задаёт model_provider в корне TOML", "action": "role_selects_provider=true → preserve_current_profile=false → active_profile caller'а теряется в пользу роли"},
+          {"condition": "role задаёт profile в корне TOML", "action": "role_selects_profile=true → preserve_current_profile=false"},
+          {"condition": "role переопределяет model_provider внутри активного profile", "action": "role_updates_active_profile_provider=true → preserve_current_provider=false (даже если preserve_current_profile истина)"},
+          {"condition": "role не задаёт ни provider, ни profile, ни не перезаписывает profile.model_provider", "action": "preserve и profile, и provider — caller сохраняет sticky runtime choice"}
+        ],
+        "lifecycle": {
+          "entity": "SRC-0008/entity/config-layer-stack",
+          "states": ["before_role", "role_applied"],
+          "transition": {
+            "from": "before_role",
+            "to": "role_applied",
+            "guard": "role.config_file не None + role_layer_toml не пустой table",
+            "side_effect": "вставка role_layer и опционального resolved_profile_layer в stack, rebuild Config, восстановление active_profile если preservation разрешила"
+          }
+        },
+        "ux": null,
+        "result": "Config обновлён: role layer и (опционально) resolved profile layer добавлены в config_layer_stack с precedence SessionFlags, active_profile и model_provider caller'а сохранены согласно preservation_policy"
+      }
+    },
+    {
+      "id": "SRC-0008/uc.sub/compute-role-preservation-policy",
+      "src": "SRC-0008",
+      "composition": "use_case",
+      "level": "sub",
+      "strategic_domain": null,
+      "terms": {
+        "actor": "preservation_policy (role.rs)",
+        "goal": "Вычислить, можно ли сохранить текущие профайл и провайдер caller'а при наложении role layer",
+        "steps": [
+          "1. role_selects_provider = role_layer_toml.get('model_provider').is_some()",
+          "2. role_selects_profile = role_layer_toml.get('profile').is_some()",
+          "3. role_updates_active_profile_provider = config.active_profile → role_layer_toml.get('profiles').as_table.get(active_profile).as_table.contains_key('model_provider'); если любой шаг None → false",
+          "4. preserve_current_profile = !role_selects_provider && !role_selects_profile",
+          "5. preserve_current_provider = preserve_current_profile && !role_updates_active_profile_provider",
+          "6. Вернуть (preserve_current_profile, preserve_current_provider)"
+        ],
+        "extensions (Cockburn)": [],
+        "edge_cases": [
+          {"condition": "config.active_profile is None", "action": "role_updates_active_profile_provider = false (через unwrap_or(false))"},
+          {"condition": "profiles в TOML есть, но active_profile внутри него отсутствует", "action": "role_updates_active_profile_provider = false"}
+        ],
+        "lifecycle": null,
+        "ux": null,
+        "result": "Пара (bool, bool): можно ли оставить profile caller'а, можно ли оставить model_provider caller'а. Логика гарантирует: роль не сбрасывает spawned agent на default provider, если сама его явно не задаёт"
+      }
+    },
+    {
+      "id": "SRC-0008/uc.sub/notify-parent-on-completion",
+      "src": "SRC-0008",
+      "composition": "use_case",
+      "level": "sub",
+      "strategic_domain": null,
+      "terms": {
+        "actor": "maybe_start_completion_watcher (tokio::spawn task)",
+        "goal": "Дождаться финального статуса child агента и уведомить parent thread о завершении — либо inter-agent сообщением (MultiAgentV2), либо inject user message (legacy)",
+        "steps": [
+          "1. maybe_start_completion_watcher: если session_source не ThreadSpawn → return (не запускать watcher)",
+          "2. tokio::spawn async task: подписаться на статус через subscribe_status(child_thread_id)",
+          "3. В цикле: пока !is_final(status) — ждать status_rx.changed(); при ошибке канала — взять снимок через get_status и выйти",
+          "4. Если статус не финальный (канал закрылся раньше) → return (не уведомляем)",
+          "5. Сформировать message = format_subagent_notification_message(child_reference, &status)",
+          "6. Ветка 1 (MultiAgentV2 с child_agent_path): parent_agent_path = child_agent_path.rsplit_once('/').and_then(AgentPath::try_from(parent)); если None — return",
+          "7. Ветка 1: InterAgentCommunication{author=child_agent_path, recipient=parent_agent_path, content=message, trigger_turn=false}; send_inter_agent_communication(parent_thread_id, communication)",
+          "8. Ветка 2 (legacy, без MultiAgentV2): get_thread(parent_thread_id); если OK → parent_thread.inject_user_message_without_turn(message)"
+        ],
+        "extensions (Cockburn)": [
+          {"step": 2, "condition": "subscribe_status вернул Err (thread недоступен)", "action": "сразу get_status(child_thread_id) и используем его как финальный снимок"},
+          {"step": 4, "condition": "status не финальный (is_final=false после выхода из цикла)", "action": "return без уведомления (ожидаемо при упадке manager'а или преждевременной отписке)"},
+          {"step": 6, "condition": "rsplit_once('/') вернул None или AgentPath::try_from parent упал", "action": "return без уведомления (невалидный path)"},
+          {"step": 8, "condition": "get_thread(parent_thread_id) упал", "action": "return без уведомления (parent уже недоступен)"}
+        ],
+        "edge_cases": [
+          {"condition": "child_agent_path is Some, но child thread.enabled(MultiAgentV2) = false", "action": "unwrap_or(true) при None → true; но если Some и false — идёт legacy ветка (inject_user_message_without_turn)"},
+          {"condition": "upgrade manager упал (state недоступен)", "action": "return без уведомления"}
+        ],
+        "lifecycle": {
+          "entity": "SRC-0008/entity/agent-status",
+          "states": ["PendingInit", "Running", "Interrupted", "Completed", "Errored", "Shutdown"],
+          "transition": {
+            "from": "non-final (PendingInit/Running/Interrupted)",
+            "to": "final (Completed/Errored/Shutdown/NotFound)",
+            "guard": "is_final(status) = !matches(PendingInit|Running|Interrupted)",
+            "side_effect": "отправка notification parent'у одним из двух механизмов"
+          }
+        },
+        "ux": null,
+        "result": "Parent thread получил асинхронное уведомление о завершении child агента с его финальным статусом и reference (agent_path name или thread_id)"
+      }
+    },
+    {
+      "id": "SRC-0008/uc.sub/route-inter-agent-mail",
+      "src": "SRC-0008",
+      "composition": "use_case",
+      "level": "sub",
+      "strategic_domain": null,
+      "terms": {
+        "actor": "Mailbox + MailboxReceiver",
+        "goal": "Передать inter-agent сообщение из отправителя в буфер получателя с монотонной нумерацией и возможностью подписки на sequence",
+        "steps": [
+          "1. Caller создаёт Mailbox::new() → (Mailbox{tx, next_seq=AtomicU64(0), seq_tx=watch::channel(0).0}, MailboxReceiver{rx, pending_mails=VecDeque::new()})",
+          "2. Подписчик: mailbox.subscribe() возвращает watch::Receiver<u64>",
+          "3. Отправитель: mailbox.send(communication) → seq = next_seq.fetch_add(1, Relaxed) + 1 → tx.send(communication) (результат игнорируется через let _) → seq_tx.send_replace(seq) → вернуть seq",
+          "4. Получатель: has_pending → sync_pending_mails (while try_recv → push_back в pending_mails) → !pending_mails.is_empty",
+          "5. Получатель: has_pending_trigger_turn → sync_pending_mails → pending_mails.iter().any(mail.trigger_turn)",
+          "6. Получатель: drain → sync_pending_mails → pending_mails.drain(..).collect() возвращает Vec<InterAgentCommunication> в порядке доставки"
+        ],
+        "extensions (Cockburn)": [
+          {"step": 3, "condition": "tx.send вернул ошибку (receiver dropped)", "action": "ошибка игнорируется через let _ = tx.send — seq всё равно инкрементится и публикуется"},
+          {"step": 4, "condition": "try_recv вернул Err (пусто или disconnected)", "action": "sync_pending_mails завершает цикл — pending_mails содержит только то, что успело прийти"}
+        ],
+        "edge_cases": [
+          {"condition": "несколько параллельных send'ов", "action": "sequence-номера монотонны (fetch_add с Relaxed ordering — каждый send получает уникальный номер, но порядок публикации watch может не совпадать с порядком получения в rx при race)"},
+          {"condition": "pending_mails уже содержит элементы, приходят новые", "action": "push_back добавляет в конец, FIFO порядок сохраняется при drain"}
+        ],
+        "lifecycle": null,
+        "ux": null,
+        "result": "Сообщение доставлено в буфер получателя с уникальным sequence-номером, подписчик watch-канала узнал об обновлении sequence, получатель может проверить наличие pending (с флагом trigger_turn) и забрать всё одним drain"
+      }
+    },
+    {
+      "id": "SRC-0008/uc.sub/derive-agent-status",
+      "src": "SRC-0008",
+      "composition": "use_case",
+      "level": "sub",
+      "strategic_domain": null,
+      "terms": {
+        "actor": "agent_status_from_event (status.rs)",
+        "goal": "Вывести следующий AgentStatus агента из одного события EventMsg для целостного статусного трекинга",
+        "steps": [
+          "1. Входное событие EventMsg сопоставляется с match",
+          "2. EventMsg::TurnStarted → Some(AgentStatus::Running)",
+          "3. EventMsg::TurnComplete(ev) → Some(AgentStatus::Completed(ev.last_agent_message.clone()))",
+          "4. EventMsg::TurnAborted(ev) с reason=Interrupted → Some(AgentStatus::Interrupted)",
+          "5. EventMsg::TurnAborted(ev) с другим reason → Some(AgentStatus::Errored(format!('{:?}', ev.reason)))",
+          "6. EventMsg::Error(ev) → Some(AgentStatus::Errored(ev.message.clone()))",
+          "7. EventMsg::ShutdownComplete → Some(AgentStatus::Shutdown)",
+          "8. Любое другое EventMsg → None (статус не меняется)"
+        ],
+        "extensions (Cockburn)": [],
+        "edge_cases": [
+          {"condition": "reason TurnAborted не Interrupted (другие варианты)", "action": "статус Errored с debug-представлением reason (format с {:?}), а не с человекочитаемым сообщением"},
+          {"condition": "is_final(status)", "action": "Completed/Errored/Shutdown/NotFound = final; PendingInit/Running/Interrupted = не final — used completion watcher для определения когда перестать ждать"}
+        ],
+        "lifecycle": {
+          "entity": "SRC-0008/entity/agent-status",
+          "states": ["PendingInit", "Running", "Interrupted", "Completed", "Errored", "Shutdown", "NotFound"],
+          "transition": {
+            "from": "any non-final",
+            "to": "Running | Completed | Interrupted | Errored | Shutdown",
+            "guard": "событие = TurnStarted/TurnComplete/TurnAborted/Error/ShutdownComplete",
+            "side_effect": "статус публикуется через watch-канал thread.subscribe_status"
+          }
+        },
+        "ux": null,
+        "result": "Следующий AgentStatus или None если событие не влияет на статус-трекинг"
+      }
+    },
+    {
+      "id": "SRC-0008/uc.sub/ensure-rollout-materialized",
+      "src": "SRC-0008",
+      "composition": "use_case",
+      "level": "sub",
+      "strategic_domain": null,
+      "terms": {
+        "actor": "spawn_forked_thread (перед fork'ом)",
+        "goal": "Материализовать и сбросить на диск rollout родителя, чтобы фронт-fork читал из актуальной JSONL истории",
+        "steps": [
+          "1. Получить parent_thread = state.get_thread(parent_thread_id).await.ok()",
+          "2. Если parent_thread.is_some: parent_thread.codex.session.ensure_rollout_materialized()",
+          "3. parent_thread.codex.session.flush_rollout() — дожидается записи на диск (record_conversation_items лишь ставит writes в очередь асинхронно)",
+          "4. Fork читает rollout_path: либо parent_thread.rollout_path, либо find_thread_path_by_id_str(codex_home, parent_thread_id)"
+        ],
+        "extensions (Cockburn)": [
+          {"step": 3, "condition": "flush_rollout вернул ошибку", "action": "пробросить ошибку — fork не продолжается"},
+          {"step": 4, "condition": "parent_thread is None И find_thread_path_by_id_str вернул None", "action": "CodexErr::Fatal 'parent thread rollout unavailable for fork: {parent_thread_id}'"}
+        ],
+        "edge_cases": [
+          {"condition": "parent_thread отсутствует в памяти, но на диске есть rollout", "action": "пропустить ensure_rollout_materialized+flush (ссылка на файл берётся напрямую)"}
+        ],
+        "lifecycle": null,
+        "ux": null,
+        "result": "Rollout файл parent thread содержит все записи на момент fork — гарантия, что child увидит согласованную историю без in-memory only items"
+      }
+    },
+    {
+      "id": "SRC-0008/uc.sub/send-input-to-agent",
+      "src": "SRC-0008",
+      "composition": "use_case",
+      "level": "sub",
+      "strategic_domain": null,
+      "terms": {
+        "actor": "AgentControl (через send_input / send_inter_agent_communication)",
+        "goal": "Передать Op (UserInput или InterAgentCommunication) в целевой thread и сохранить preview/content как last_task_message",
+        "steps": [
+          "1. send_input: last_task_message = render_input_preview(initial_operation) — для UserInput собирает текст каждого item (Text→text; Image→'[image]'; LocalImage→'[local_image:{path}]'; Skill→'[skill:$name](path)'; Mention→'[mention:$name](path)'; прочее→'[input]'), объединяет через '\\n'; для InterAgentCommunication — communication.content; иначе — ''",
+          "2. state.send_op(agent_id, initial_operation) пересылает Op в thread",
+          "3. handle_thread_request_result проверяет результат: если CodexErr::InternalAgentDied → state.remove_thread(&agent_id) + self.state.release_spawned_thread(agent_id); ошибка пробрасывается",
+          "4. Если result.is_ok() → AgentRegistry.update_last_task_message(agent_id, last_task_message) записывает в metadata"
+        ],
+        "extensions (Cockburn)": [
+          {"step": 3, "condition": "result = Err(InternalAgentDied)", "action": "автоматическая уборка: thread удалён из ThreadManagerState, слот в AgentRegistry освобождён (release_spawned_thread)"},
+          {"step": 4, "condition": "result не Ok", "action": "last_task_message НЕ обновляется (остаётся прежнее значение)"}
+        ],
+        "edge_cases": [
+          {"condition": "send_inter_agent_communication — аналогичный flow, но last_task_message = communication.content (не preview)", "action": "update_last_task_message пишет полный content"},
+          {"condition": "Op не UserInput и не InterAgentCommunication (напр. Interrupt)", "action": "render_input_preview возвращает пустую строку — last_task_message = ''"}
+        ],
+        "lifecycle": null,
+        "ux": null,
+        "result": "Op доставлен в thread, last_task_message обновлён в AgentMetadata (для последующего отображения в list_agents); при InternalAgentDied реестр автоматически очищен"
+      }
+    }
+  ]
+}

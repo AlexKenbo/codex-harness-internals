@@ -1,0 +1,473 @@
+{
+  "src": "SRC-0013",
+  "schema_version": "2.0",
+  "lens": "use_case",
+  "compositions": [
+    {
+      "id": "SRC-0013/uc.sub/build-tool-registry-plan",
+      "src": "SRC-0013",
+      "composition": "use_case",
+      "level": "sub",
+      "strategic_domain": null,
+      "terms": {
+        "actor": "Tool Registry Planner (build_tool_registry_plan)",
+        "goal": "Собрать ToolRegistryPlan из ToolsConfig и параметров: упорядоченный список ConfiguredToolSpec + список ToolHandlerSpec с kind-привязкой каждого имени к обработчику",
+        "steps": [
+          "1. Tool Registry Planner создаёт пустой ToolRegistryPlan::new() и читает config.exec_permission_approvals_enabled",
+          "2. При code_mode_enabled: Tool Registry Planner строит карту namespace_descriptions из params.tool_namespaces, рекурсивно вызывает build_tool_registry_plan с nested_config = config.for_code_mode_nested_tools() и discoverable_tools=None → собирает enabled_tools через collect_code_mode_exec_prompt_tool_definitions, сортирует их через compare_code_mode_tools, push_spec code-mode + wait tool (оба supports_parallel_tool_calls=false), регистрирует обработчики CodeModeExecute и CodeModeWait",
+          "3. При has_environment: Tool Registry Planner выбирает shell-инструмент по shell_type — Default→create_shell_tool, Local→create_local_shell_tool, UnifiedExec→create_exec_command_tool + create_write_stdin_tool + handlers exec_command/write_stdin=UnifiedExec, ShellCommand→create_shell_command_tool, Disabled→пропуск",
+          "4. Tool Registry Planner при has_environment && shell_type != Disabled регистрирует handler-фасады: shell/container.exec/local_shell → Shell; shell_command → ShellCommand",
+          "5. При params.mcp_tools.is_some(): Tool Registry Planner добавляет list_mcp_resources, list_mcp_resource_templates, read_mcp_resource (все supports_parallel_tool_calls=true), регистрирует каждому handler McpResource",
+          "6. Tool Registry Planner всегда добавляет update_plan (supports_parallel_tool_calls=false) и регистрирует handler Plan",
+          "7. При has_environment && js_repl_enabled: Tool Registry Planner добавляет js_repl и js_repl_reset, регистрирует handlers JsRepl/JsReplReset",
+          "8. Tool Registry Planner всегда добавляет create_request_user_input_tool(request_user_input_tool_description(default_mode_request_user_input)) и регистрирует handler RequestUserInput",
+          "9. При request_permissions_tool_enabled: Tool Registry Planner добавляет create_request_permissions_tool(request_permissions_tool_description()), регистрирует handler RequestPermissions",
+          "10. При search_tool && deferred_mcp_tools: Tool Registry Planner собирает search_source_infos через collect_tool_search_source_infos, добавляет create_tool_search_tool(&sources, TOOL_SEARCH_DEFAULT_LIMIT=8), регистрирует handler ToolSearch + для каждого deferred MCP tool регистрирует handler Mcp",
+          "11. При tool_suggest && discoverable_tools.filter(!empty): Tool Registry Planner добавляет create_tool_suggest_tool(&collect_tool_suggest_entries(discoverable_tools)) с supports_parallel_tool_calls=true и code_mode_enabled=false (принудительно), регистрирует handler ToolSuggest",
+          "12. При has_environment && apply_patch_tool_type is Some: Tool Registry Planner добавляет freeform или json вариант apply_patch, регистрирует handler ApplyPatch",
+          "13. При has_environment && experimental 'list_dir': Tool Registry Planner добавляет create_list_dir_tool, регистрирует handler ListDir",
+          "14. При experimental 'test_sync_tool': Tool Registry Planner добавляет create_test_sync_tool, регистрирует handler TestSync",
+          "15. Tool Registry Planner пытается создать web_search через create_web_search_tool; при успехе push_spec (supports_parallel_tool_calls=false)",
+          "16. При image_gen_tool: Tool Registry Planner добавляет create_image_generation_tool(\"png\")",
+          "17. При has_environment: Tool Registry Planner добавляет create_view_image_tool с can_request_original_image_detail, регистрирует handler ViewImage",
+          "18. При collab_tools: Tool Registry Planner ветвится по multi_agent_v2 — V2 добавляет spawn_agent_v2/send_message/followup_task/wait_agent_v2/close_agent_v2/list_agents + handlers (SpawnAgentV2, SendMessageV2, FollowupTaskV2, WaitAgentV2, CloseAgentV2, ListAgentsV2); V1 добавляет spawn_agent_v1/send_input_v1/resume_agent/wait_agent_v1/close_agent_v1 + handlers (SpawnAgentV1, SendInputV1, ResumeAgentV1, WaitAgentV1, CloseAgentV1)",
+          "19. При agent_jobs_tools: Tool Registry Planner добавляет create_spawn_agents_on_csv_tool → handler AgentJobs; при agent_jobs_worker_tools дополнительно добавляет create_report_agent_job_result_tool → handler AgentJobs",
+          "20. При params.mcp_tools is Some: Tool Registry Planner сортирует записи по ToolName::display, группирует по namespace; для каждой группы сортирует по tool_name, берёт описание из tool_namespaces (с fallback default_namespace_description), конвертирует каждый инструмент через mcp_tool_to_responses_api_tool, регистрирует handler Mcp; если группа не пустая — push_spec как Namespace",
+          "21. Для каждого dynamic_tool в params.dynamic_tools: Tool Registry Planner конвертирует через dynamic_tool_to_responses_api_tool, push_spec как Function, регистрирует handler DynamicTool",
+          "22. Tool Registry Planner возвращает готовый ToolRegistryPlan"
+        ],
+        "extensions (Cockburn)": [
+          {"step": 2, "condition": "code_mode_enabled=true — рекурсивный вызов должен изолировать вложенные инструменты", "action": "nested_config = config.for_code_mode_nested_tools() (code_mode_enabled=false, code_mode_only_enabled=false); discoverable_tools=None в nested params чтобы избежать дублирования tool_suggest"},
+          {"step": 11, "condition": "tool_suggest активен, но discoverable_tools пуст или None", "action": "tool_suggest не добавляется"},
+          {"step": 15, "condition": "web_search_mode = Disabled или None", "action": "create_web_search_tool возвращает None — инструмент не добавляется"},
+          {"step": 20, "condition": "MCP tool без namespace (tool.name.namespace = None)", "action": "tracing::error! 'Skipping MCP tool `{tool_name}`: MCP tools must be namespaced'; continue"},
+          {"step": 20, "condition": "mcp_tool_to_responses_api_tool возвращает Err", "action": "tracing::error! 'Failed to convert `{tool_name}` MCP tool to OpenAI tool: {error:?}'; tool пропускается, handler не регистрируется"},
+          {"step": 20, "condition": "после всех попыток конвертации группа namespace пуста (tools.is_empty())", "action": "push_spec для Namespace пропускается"},
+          {"step": 21, "condition": "dynamic_tool_to_responses_api_tool возвращает Err", "action": "tracing::error! 'Failed to convert dynamic tool {name:?} to OpenAI tool: {error:?}'; tool пропускается"}
+        ],
+        "edge_cases": [
+          {"condition": "push_spec при code_mode_enabled", "action": "spec автоматически оборачивается через augment_tool_spec_for_code_mode перед добавлением в specs (ToolRegistryPlan::push_spec)"},
+          {"condition": "tool_suggest принудительно обходит code-mode augmentation", "action": "push_spec вызывается с code_mode_enabled=false независимо от config.code_mode_enabled"}
+        ],
+        "lifecycle": null,
+        "ux": null,
+        "result": "ToolRegistryPlan со списком ConfiguredToolSpec (с флагом supports_parallel_tool_calls) и списком ToolHandlerSpec, покрывающих все активные фичи; готов к сериализации в Responses API формат"
+      }
+    },
+    {
+      "id": "SRC-0013/uc.sub/configure-tools",
+      "src": "SRC-0013",
+      "composition": "use_case",
+      "level": "sub",
+      "strategic_domain": null,
+      "terms": {
+        "actor": "ToolsConfig::new (фабрика конфигурации инструментов)",
+        "goal": "Построить ToolsConfig из ToolsConfigParams, раскрывая feature-flags, ModelInfo и окружение в набор булевых/enum-флагов для build_tool_registry_plan",
+        "steps": [
+          "1. ToolsConfig::new деструктурирует params и читает отдельные фичи из features: ApplyPatchFreeform, CodeMode, CodeModeOnly, JsRepl, JsReplToolsOnly, Collab, MultiAgentV2, SpawnCsv, DefaultModeRequestUserInput",
+          "2. ToolsConfig::new вычисляет include_search_tool = model_info.supports_search_tool && features.enabled(ToolSearch)",
+          "3. ToolsConfig::new вычисляет include_tool_suggest = ToolSuggest && Apps && Plugins (все три фичи обязательны)",
+          "4. ToolsConfig::new вычисляет include_original_image_detail через can_request_original_image_detail(model_info)",
+          "5. ToolsConfig::new вычисляет include_image_gen_tool = image_generation_tool_auth_allowed && ImageGeneration && supports_image_generation(model_info)",
+          "6. ToolsConfig::new вычисляет shell_command_backend: ZshFork если ShellTool && ShellZshFork, иначе Classic",
+          "7. ToolsConfig::new вычисляет unified_exec_allowed через unified_exec_allowed_in_environment(is_windows, sandbox_policy, windows_sandbox_level)",
+          "8. ToolsConfig::new определяет shell_type: Disabled если !ShellTool; ShellCommand если ShellZshFork; UnifiedExec если UnifiedExec && unified_exec_allowed && conpty_supported, иначе ShellCommand; fallback ShellCommand если model_info.shell_type=UnifiedExec но !unified_exec_allowed; иначе model_info.shell_type",
+          "9. ToolsConfig::new определяет apply_patch_tool_type: если model_info.apply_patch_tool_type задан — принимает его, иначе Some(Freeform) при include_apply_patch_tool, иначе None",
+          "10. ToolsConfig::new вычисляет agent_jobs_worker_tools = include_agent_jobs && session_source is SubAgent(SubAgentSource::Other(label)) with label starts_with 'agent_job:'",
+          "11. ToolsConfig::new собирает итоговую структуру с unified_exec_shell_mode=Direct, has_environment=true, allow_login_shell=true, spawn_agent_usage_hint=true, hide_spawn_agent_metadata=false, agent_type_description='', experimental_supported_tools копируется из model_info"
+        ],
+        "extensions (Cockburn)": [
+          {"step": 8, "condition": "UnifiedExec фича включена, но conpty_supported() = false", "action": "shell_type понижается до ShellCommand"},
+          {"step": 7, "condition": "is_windows && windows_sandbox_level != Disabled && sandbox_policy не DangerFullAccess и не ExternalSandbox", "action": "unified_exec_allowed = false (блокирует UnifiedExec на Windows под ограниченным sandbox)"},
+          {"step": 10, "condition": "SpawnCsv активен, но session_source не соответствует 'agent_job:' префиксу", "action": "agent_jobs_worker_tools=false — report_agent_job_result не экспортируется"}
+        ],
+        "edge_cases": [
+          {"condition": "model_info.apply_patch_tool_type уже задан (Freeform или Function)", "action": "значение принимается напрямую, ApplyPatchFreeform фича не требуется"}
+        ],
+        "lifecycle": {
+          "entity": "SRC-0013/entity/tools-config",
+          "states": ["constructed-via-new", "customized-via-builder"],
+          "transition": {
+            "from": "constructed-via-new",
+            "to": "customized-via-builder",
+            "guard": "вызов with_agent_type_description / with_spawn_agent_usage_hint / with_spawn_agent_usage_hint_text / with_hide_spawn_agent_metadata / with_allow_login_shell / with_has_environment / with_unified_exec_shell_mode / with_unified_exec_shell_mode_for_session / with_web_search_config",
+            "side_effect": "for_code_mode_nested_tools клонирует конфиг и принудительно выставляет code_mode_enabled=false, code_mode_only_enabled=false"
+          }
+        },
+        "ux": null,
+        "result": "ToolsConfig со всеми булевыми флагами и enum-полями, готовая к передаче в build_tool_registry_plan"
+      }
+    },
+    {
+      "id": "SRC-0013/uc.sub/resolve-unified-exec-shell-mode",
+      "src": "SRC-0013",
+      "composition": "use_case",
+      "level": "sub",
+      "strategic_domain": null,
+      "terms": {
+        "actor": "UnifiedExecShellMode::for_session",
+        "goal": "Определить режим unified exec shell (Direct или ZshFork с абсолютными путями) для конкретной сессии",
+        "steps": [
+          "1. for_session проверяет что cfg!(unix) активен",
+          "2. for_session проверяет shell_command_backend == ShellCommandBackendConfig::ZshFork",
+          "3. for_session проверяет user_shell_type == ToolUserShellType::Zsh",
+          "4. for_session проверяет наличие обоих путей: shell_zsh_path и main_execve_wrapper_exe (Option::Some)",
+          "5. for_session пытается преобразовать оба пути в AbsolutePathBuf через try_from(&PathBuf)",
+          "6. При успехе всех проверок for_session возвращает UnifiedExecShellMode::ZshFork(ZshForkConfig {shell_zsh_path, main_execve_wrapper_exe})",
+          "7. В противном случае for_session возвращает UnifiedExecShellMode::Direct"
+        ],
+        "extensions (Cockburn)": [
+          {"step": 5, "condition": "AbsolutePathBuf::try_from(shell_zsh_path) возвращает Err", "action": "tracing::warn! 'Failed to convert shell_zsh_path `{shell_zsh_path:?}`: {err:?}'; for_session возвращает Direct"},
+          {"step": 5, "condition": "AbsolutePathBuf::try_from(main_execve_wrapper_exe) возвращает Err", "action": "tracing::warn! 'Failed to convert main_execve_wrapper_exe `{main_execve_wrapper_exe:?}`: {err:?}'; for_session возвращает Direct"}
+        ],
+        "edge_cases": [
+          {"condition": "не Unix (Windows)", "action": "возвращается Direct — zsh fork недоступен"},
+          {"condition": "shell_command_backend = Classic", "action": "возвращается Direct"},
+          {"condition": "user_shell_type не Zsh (Bash/PowerShell/Sh/Cmd)", "action": "возвращается Direct"}
+        ],
+        "lifecycle": null,
+        "ux": null,
+        "result": "UnifiedExecShellMode — Direct (default fallback) или ZshFork с провалидированными абсолютными путями"
+      }
+    },
+    {
+      "id": "SRC-0013/uc.sub/parse-dynamic-tool",
+      "src": "SRC-0013",
+      "composition": "use_case",
+      "level": "sub",
+      "strategic_domain": null,
+      "terms": {
+        "actor": "parse_dynamic_tool (дескриптор динамического инструмента)",
+        "goal": "Преобразовать DynamicToolSpec в ToolDefinition с санитизированным input_schema",
+        "steps": [
+          "1. parse_dynamic_tool деструктурирует DynamicToolSpec: name, description, input_schema, defer_loading",
+          "2. parse_dynamic_tool вызывает parse_tool_input_schema(&input_schema) для санитизации и парсинга схемы",
+          "3. parse_dynamic_tool собирает ToolDefinition {name, description, input_schema, output_schema=None, defer_loading: *defer_loading}"
+        ],
+        "extensions (Cockburn)": [
+          {"step": 2, "condition": "parse_tool_input_schema возвращает Err (например singleton null)", "action": "parse_dynamic_tool пробрасывает Err(serde_json::Error) вверх — ToolDefinition не создаётся"}
+        ],
+        "edge_cases": [
+          {"condition": "dynamic_tool_to_responses_api_tool оборачивает parse_dynamic_tool", "action": "при успехе вызывается tool_definition_to_responses_api_tool и получается ResponsesApiTool; defer_loading мапится в Option<bool> (Some(true) если true, None если false)"}
+        ],
+        "lifecycle": null,
+        "ux": null,
+        "result": "ToolDefinition с нормализованным input_schema и output_schema=None"
+      }
+    },
+    {
+      "id": "SRC-0013/uc.sub/parse-mcp-tool",
+      "src": "SRC-0013",
+      "composition": "use_case",
+      "level": "sub",
+      "strategic_domain": null,
+      "terms": {
+        "actor": "parse_mcp_tool (адаптер MCP → Responses API)",
+        "goal": "Преобразовать rmcp::model::Tool в ToolDefinition, соблюдая требование OpenAI к полю properties",
+        "steps": [
+          "1. parse_mcp_tool клонирует tool.input_schema в serde_json::Value::Object",
+          "2. parse_mcp_tool проверяет наличие поля 'properties'; если отсутствует или null — вставляет пустой объект {}",
+          "3. parse_mcp_tool вызывает parse_tool_input_schema(&serialized_input_schema) для санитизации",
+          "4. parse_mcp_tool берёт tool.output_schema (если есть) и оборачивает в mcp_call_tool_result_output_schema; при отсутствии — пустой объект {}",
+          "5. parse_mcp_tool собирает ToolDefinition {name: tool.name.to_string(), description: tool.description.unwrap_or_default(), input_schema, output_schema: Some(mcp_call_tool_result_output_schema(structured_content_schema)), defer_loading: false}"
+        ],
+        "extensions (Cockburn)": [
+          {"step": 2, "condition": "MCP сервер не прислал 'properties' (некоторые серверы опускают его)", "action": "в схему вставляется пустой объект — модели OpenAI требуют это поле (поведение Agents SDK)"},
+          {"step": 3, "condition": "parse_tool_input_schema возвращает Err", "action": "parse_mcp_tool пробрасывает Err вверх"}
+        ],
+        "edge_cases": [
+          {"condition": "mcp_tool_to_responses_api_tool дополнительно переименовывает tool через ToolDefinition::renamed(tool_name.name.clone())", "action": "имя инструмента заменяется на каноническое имя из ToolName"},
+          {"condition": "mcp_tool_to_deferred_responses_api_tool использует into_deferred() после renamed()", "action": "output_schema обнуляется и defer_loading выставляется в true"}
+        ],
+        "lifecycle": null,
+        "ux": null,
+        "result": "ToolDefinition с обязательным properties, санитизированным input_schema и обёрнутым output_schema MCP CallToolResult"
+      }
+    },
+    {
+      "id": "SRC-0013/uc.sub/sanitize-json-schema",
+      "src": "SRC-0013",
+      "composition": "use_case",
+      "level": "sub",
+      "strategic_domain": null,
+      "terms": {
+        "actor": "JSON Schema Sanitizer (sanitize_json_schema + parse_tool_input_schema)",
+        "goal": "Привести произвольную JSON Schema к поддерживаемому подмножеству OpenAI Structured Outputs",
+        "steps": [
+          "1. parse_tool_input_schema клонирует входную JsonValue и передаёт в sanitize_json_schema",
+          "2. sanitize_json_schema: для Bool(_) заменяет значение на {\"type\": \"string\"} (accept-all)",
+          "3. sanitize_json_schema: для Array — рекурсивно санитизирует каждый элемент",
+          "4. sanitize_json_schema: для Object — рекурсивно санитизирует properties[*], items, additionalProperties (если не Bool), prefixItems, anyOf",
+          "5. sanitize_json_schema: если в объекте есть 'const' — удаляет его и вставляет 'enum' с массивом из одного элемента [const_value]",
+          "6. sanitize_json_schema: нормализует 'type' через normalized_schema_types (single или array of strings); если type отсутствует и есть anyOf — ранний выход",
+          "7. sanitize_json_schema: если типов нет, инферит тип по соседним ключам: properties/required/additionalProperties → Object; items/prefixItems → Array; enum/format → String; minimum/maximum/exclusiveMinimum/exclusiveMaximum/multipleOf → Number; fallback → String",
+          "8. sanitize_json_schema: write_schema_types записывает 'type' как string (single) или array of strings (multiple) или удаляет поле при пустом списке",
+          "9. sanitize_json_schema: ensure_default_children_for_schema_types — для Object без properties вставляет пустой {}, для Array без items вставляет {\"type\": \"string\"}",
+          "10. parse_tool_input_schema десериализует санитизированный Value в JsonSchema через serde_json::from_value",
+          "11. parse_tool_input_schema проверяет что schema_type != Single(Null); при несоответствии возвращает singleton_null_schema_error"
+        ],
+        "extensions (Cockburn)": [
+          {"step": 11, "condition": "top-level schema имеет тип singleton 'null'", "action": "возвращается serde_json::Error 'tool input schema must not be a singleton null type' (через std::io::Error InvalidInput)"},
+          {"step": 10, "condition": "serde_json::from_value падает (несовместимая структура)", "action": "Err пробрасывается вверх"}
+        ],
+        "edge_cases": [
+          {"condition": "schema-as-boolean (JSON Schema форма true/false)", "action": "приводится к {\"type\": \"string\"} как accept-all fallback"},
+          {"condition": "type задан как Array строк", "action": "отфильтровываются неизвестные, сохраняется порядок и пишется обратно как массив (или single если один элемент, или удаляется если пусто)"}
+        ],
+        "lifecycle": null,
+        "ux": null,
+        "result": "JsonSchema из поддерживаемого подмножества (string/number/boolean/integer/object/array/null, enum, items, properties, required, additionalProperties, anyOf); готова к сериализации в Responses API"
+      }
+    },
+    {
+      "id": "SRC-0013/uc.sub/augment-tool-spec-for-code-mode",
+      "src": "SRC-0013",
+      "composition": "use_case",
+      "level": "sub",
+      "strategic_domain": null,
+      "terms": {
+        "actor": "Code Mode Augmentor (augment_tool_spec_for_code_mode)",
+        "goal": "Обогатить description инструмента примерами использования в code-mode (exec-режиме)",
+        "steps": [
+          "1. Code Mode Augmentor сопоставляет ToolSpec с вариантом: Function, Freeform, Namespace, либо прочие варианты (LocalShell/ImageGeneration/ToolSearch/WebSearch)",
+          "2. Для Function/Freeform Code Mode Augmentor вызывает augmented_description_for_spec(&spec): строит CodeModeToolDefinition с plain ToolName, затем codex_code_mode::augment_tool_definition",
+          "3. Для Function/Freeform при наличии обогащённого description Code Mode Augmentor перезаписывает tool.description и возвращает обновлённый ToolSpec",
+          "4. Для Namespace Code Mode Augmentor итерирует namespace.tools, для каждой Function создаёт ToolName::namespaced(namespace.name, tool.name), строит CodeModeToolDefinition и заменяет description на результат codex_code_mode::augment_tool_definition(definition)",
+          "5. Для прочих вариантов ToolSpec Code Mode Augmentor возвращает spec без изменений"
+        ],
+        "extensions (Cockburn)": [
+          {"step": 2, "condition": "augmented_description_for_spec возвращает None (инструмент не соответствует is_code_mode_nested_tool через tool_spec_to_code_mode_tool_definition)", "action": "ToolSpec возвращается без изменений"}
+        ],
+        "edge_cases": [
+          {"condition": "ToolSpec варианты LocalShell, ImageGeneration, ToolSearch, WebSearch", "action": "Code Mode Augmentor возвращает spec как есть — для них нет code-mode примеров"}
+        ],
+        "lifecycle": null,
+        "ux": null,
+        "result": "ToolSpec с обогащённой description (или неизменённый если не применимо), пригодный для встраивания в code-mode prompt"
+      }
+    },
+    {
+      "id": "SRC-0013/uc.sub/collect-tool-search-output-tools",
+      "src": "SRC-0013",
+      "composition": "use_case",
+      "level": "sub",
+      "strategic_domain": null,
+      "terms": {
+        "actor": "Tool Search Output Collector (collect_tool_search_output_tools)",
+        "goal": "Сгруппировать найденные MCP инструменты по namespace и превратить в ToolSearchOutputTool::Namespace для возврата модели",
+        "steps": [
+          "1. Tool Search Output Collector итерирует ToolSearchResultSource и группирует по tool_namespace, сохраняя порядок добавления",
+          "2. Для каждой группы Tool Search Output Collector берёт первый tool и определяет description: connector_description (trim, фильтр непустых), иначе connector_name через шаблон 'Tools for working with {connector_name}.', иначе default_namespace_description(tool_namespace)",
+          "3. Tool Search Output Collector для каждого tool в группе строит ToolName::namespaced(tool_namespace, tool_name), конвертирует через mcp_tool_to_deferred_responses_api_tool и оборачивает в ResponsesApiNamespaceTool::Function",
+          "4. Tool Search Output Collector создаёт ToolSearchOutputTool::Namespace {name: tool_namespace, description, tools}"
+        ],
+        "extensions (Cockburn)": [
+          {"step": 3, "condition": "mcp_tool_to_deferred_responses_api_tool возвращает Err", "action": "collect_try_collect возвращает Err(serde_json::Error) — вся операция фейлится"},
+          {"step": 2, "condition": "tools группы пуст (first_tool отсутствует)", "action": "continue — группа пропускается"}
+        ],
+        "edge_cases": [
+          {"condition": "connector_description пустая строка или пробелы", "action": "трактуется как отсутствующая — fallback на connector_name"},
+          {"condition": "connector_name тоже отсутствует или пустой", "action": "fallback на default_namespace_description(tool_namespace) = 'Tools in the {namespace} namespace.'"}
+        ],
+        "lifecycle": null,
+        "ux": null,
+        "result": "Vec<ToolSearchOutputTool::Namespace> с описаниями и deferred Function инструментами, готов для отдачи модели в качестве результата tool_search"
+      }
+    },
+    {
+      "id": "SRC-0013/uc.sub/filter-discoverable-tools-for-client",
+      "src": "SRC-0013",
+      "composition": "use_case",
+      "level": "sub",
+      "strategic_domain": null,
+      "terms": {
+        "actor": "filter_tool_suggest_discoverable_tools_for_client",
+        "goal": "Ограничить список discoverable tools для TUI-клиента — скрыть плагины которые TUI не умеет устанавливать",
+        "steps": [
+          "1. filter_tool_suggest_discoverable_tools_for_client сравнивает app_server_client_name с TUI_CLIENT_NAME ('codex-tui')",
+          "2. Если клиент не TUI — возвращает discoverable_tools без изменений",
+          "3. Если клиент TUI — фильтрует: оставляет только элементы, НЕ являющиеся DiscoverableTool::Plugin",
+          "4. Возвращает отфильтрованный Vec<DiscoverableTool>"
+        ],
+        "extensions (Cockburn)": [
+          {"step": 1, "condition": "app_server_client_name = None", "action": "не TUI — возврат без изменений"}
+        ],
+        "edge_cases": [
+          {"condition": "все элементы — Plugin и клиент TUI", "action": "возвращается пустой список"}
+        ],
+        "lifecycle": null,
+        "ux": null,
+        "result": "Vec<DiscoverableTool> без Plugin-ов для TUI (Connector остаются); для остальных клиентов — полный список"
+      }
+    },
+    {
+      "id": "SRC-0013/uc.sub/build-tool-suggestion-elicitation",
+      "src": "SRC-0013",
+      "composition": "use_case",
+      "level": "sub",
+      "strategic_domain": null,
+      "terms": {
+        "actor": "Tool Suggestion Elicitation Builder (build_tool_suggestion_elicitation_request)",
+        "goal": "Сформировать McpServerElicitationRequestParams для запроса подтверждения пользователя на установку/активацию discoverable tool",
+        "steps": [
+          "1. Builder извлекает tool.name() и tool.install_url() (install_url доступен только у Connector)",
+          "2. Builder копирует suggest_reason в message",
+          "3. Builder вызывает build_tool_suggestion_meta(tool_type, action_type, suggest_reason, tool.id(), tool_name, install_url) для формирования ToolSuggestMeta с codex_approval_kind='tool_suggestion'",
+          "4. Builder оборачивает ToolSuggestMeta в json! для поля meta, строит McpServerElicitationRequest::Form с пустой схемой (McpElicitationSchema { properties: empty, required: None, type_: Object })",
+          "5. Builder возвращает McpServerElicitationRequestParams {thread_id, turn_id: Some(turn_id), server_name, request: Form}"
+        ],
+        "extensions (Cockburn)": [],
+        "edge_cases": [
+          {"condition": "tool — Plugin", "action": "install_url() возвращает None, в ToolSuggestMeta.install_url будет None и поле пропускается при сериализации (skip_serializing_if)"}
+        ],
+        "lifecycle": null,
+        "ux": null,
+        "result": "McpServerElicitationRequestParams готовый к отправке MCP-клиенту; codex_approval_kind='tool_suggestion' идентифицирует тип запроса на стороне приёмника"
+      }
+    },
+    {
+      "id": "SRC-0013/uc.sub/verify-connector-suggestion-completed",
+      "src": "SRC-0013",
+      "composition": "use_case",
+      "level": "sub",
+      "strategic_domain": null,
+      "terms": {
+        "actor": "Suggestion Completion Verifier",
+        "goal": "Подтвердить что ранее предложенные connector-ы уже установлены и доступны",
+        "steps": [
+          "1. all_suggested_connectors_picked_up итерирует expected_connector_ids",
+          "2. Для каждого id Verifier вызывает verified_connector_suggestion_completed(connector_id, accessible_connectors)",
+          "3. verified_connector_suggestion_completed ищет в accessible_connectors AppInfo с совпадающим id",
+          "4. Verifier проверяет connector.is_accessible = true",
+          "5. all_suggested_connectors_picked_up возвращает true только если ВСЕ ожидаемые id прошли проверку"
+        ],
+        "extensions (Cockburn)": [
+          {"step": 3, "condition": "connector_id не найден в accessible_connectors", "action": "is_some_and возвращает false — verifier возвращает false для этого id"},
+          {"step": 4, "condition": "connector найден, но is_accessible = false", "action": "verifier возвращает false"}
+        ],
+        "edge_cases": [
+          {"condition": "expected_connector_ids пуст", "action": "all(..) возвращает true — вакуумная истина"}
+        ],
+        "lifecycle": null,
+        "ux": null,
+        "result": "bool — true если все ожидаемые connector-ы доступны для работы"
+      }
+    },
+    {
+      "id": "SRC-0013/uc.sub/normalize-request-user-input-args",
+      "src": "SRC-0013",
+      "composition": "use_case",
+      "level": "sub",
+      "strategic_domain": null,
+      "terms": {
+        "actor": "RequestUserInput Args Normalizer (normalize_request_user_input_args)",
+        "goal": "Подготовить аргументы инструмента request_user_input: валидировать непустые опции и включить клиентский режим 'Other'",
+        "steps": [
+          "1. Normalizer проверяет что у каждого question.options присутствует и не пустой",
+          "2. Если хотя бы один question имеет отсутствующие или пустые options — Normalizer возвращает Err('request_user_input requires non-empty options for every question')",
+          "3. Normalizer итерирует questions и выставляет question.is_other = true для каждого (клиент добавит свободную опцию 'Other' сам)",
+          "4. Normalizer возвращает Ok(args)"
+        ],
+        "extensions (Cockburn)": [
+          {"step": 2, "condition": "один или несколько questions без options", "action": "возврат Err со строкой сообщения — инструмент не исполняется"}
+        ],
+        "edge_cases": [
+          {"condition": "questions пуст", "action": "missing_options = false (any возвращает false для пустого), is_other проставляется на нулевом итераторе — валидация проходит"}
+        ],
+        "lifecycle": null,
+        "ux": [
+          "клиент автоматически добавляет 'Other' free-form опцию к каждому вопросу",
+          "схема инструмента требует что рекомендованную опцию помечать суффиксом '(Recommended)'",
+          "каждый вопрос: header ≤12 chars, options 1-5 слов, description одно предложение",
+          "рекомендовано 1 вопрос, максимум 3"
+        ],
+        "result": "RequestUserInputArgs с проставленным is_other=true у всех вопросов; либо ошибка о пустых options"
+      }
+    },
+    {
+      "id": "SRC-0013/uc.sub/determine-request-user-input-availability",
+      "src": "SRC-0013",
+      "composition": "use_case",
+      "level": "sub",
+      "strategic_domain": null,
+      "terms": {
+        "actor": "RequestUserInput Availability Check",
+        "goal": "Определить доступен ли инструмент request_user_input в текущем режиме и сформировать сообщение о недоступности/разрешённых режимах",
+        "steps": [
+          "1. request_user_input_is_available(mode, default_flag) возвращает true если mode.allows_request_user_input() ИЛИ (default_flag && mode == ModeKind::Default)",
+          "2. request_user_input_unavailable_message: если доступен — None; иначе Some('request_user_input is unavailable in {mode_name} mode') где mode_name = mode.display_name()",
+          "3. format_allowed_modes итерирует TUI_VISIBLE_COLLABORATION_MODES, фильтрует доступные, отображает display_name",
+          "4. format_allowed_modes форматирует результат: [] → 'no modes'; [m] → '{m} mode'; [a, b] → '{a} or {b} mode'; [..] → 'modes: a,b,...'",
+          "5. request_user_input_tool_description использует format_allowed_modes для построения 'Request user input for one to three short questions and wait for the response. This tool is only available in {allowed_modes}.'"
+        ],
+        "extensions (Cockburn)": [
+          {"step": 1, "condition": "mode = ModeKind::Default и default_mode_request_user_input = true", "action": "режим считается разрешённым несмотря на то что allows_request_user_input() для Default может возвращать false"}
+        ],
+        "edge_cases": [
+          {"condition": "TUI_VISIBLE_COLLABORATION_MODES не содержит ни одного разрешённого", "action": "description инструмента становится 'available in no modes mode' — пользователь увидит явный сигнал"}
+        ],
+        "lifecycle": null,
+        "ux": [
+          "description инструмента адаптируется под активные режимы",
+          "сообщение 'request_user_input is unavailable in {mode_name} mode' возвращается модели при попытке вызова в недопустимом режиме"
+        ],
+        "result": "Option<String> для unavailable сообщения + строка allowed_modes для description"
+      }
+    },
+    {
+      "id": "SRC-0013/uc.sub/sanitize-original-image-detail",
+      "src": "SRC-0013",
+      "composition": "use_case",
+      "level": "sub",
+      "strategic_domain": null,
+      "terms": {
+        "actor": "Image Detail Policy (sanitize_original_image_detail + normalize_output_image_detail)",
+        "goal": "Ограничить использование ImageDetail::Original моделями которые его поддерживают, очищая неподдерживаемые значения",
+        "steps": [
+          "1. sanitize_original_image_detail получает флаг can_request_original_image_detail и &mut [FunctionCallOutputContentItem]",
+          "2. Если can_request_original_image_detail = true — ранний return, items не трогаются",
+          "3. Иначе итерирует items, для каждого InputImage с Some(ImageDetail::Original) выставляет detail = None",
+          "4. normalize_output_image_detail принимает model_info и Option<ImageDetail>",
+          "5. Если detail = Some(Original) и can_request_original_image_detail(model_info) — возвращает Some(Original)",
+          "6. Для всех прочих случаев (Some(Original) без поддержки, Some(other), None) — возвращает None"
+        ],
+        "extensions (Cockburn)": [],
+        "edge_cases": [
+          {"condition": "items содержит FunctionCallOutputContentItem НЕ InputImage", "action": "if let не совпадает — элемент не изменяется"},
+          {"condition": "model_info.supports_image_detail_original = false", "action": "все detail=Original вычищаются до None"}
+        ],
+        "lifecycle": null,
+        "ux": null,
+        "result": "items с очищенным detail для моделей без поддержки; normalized output detail = Original только при поддержке"
+      }
+    },
+    {
+      "id": "SRC-0013/uc.sub/create-web-search-tool",
+      "src": "SRC-0013",
+      "composition": "use_case",
+      "level": "sub",
+      "strategic_domain": null,
+      "terms": {
+        "actor": "WebSearch Tool Factory (create_web_search_tool)",
+        "goal": "Создать ToolSpec::WebSearch с корректными флагами из WebSearchToolOptions или вернуть None если web search отключён",
+        "steps": [
+          "1. Factory определяет external_web_access по web_search_mode: Cached→Some(false), Live→Some(true), Disabled/None→None (ранний return None)",
+          "2. Factory определяет search_content_types: Text→None; TextAndImage→Some(['text','image'])",
+          "3. Factory копирует filters из web_search_config.filters через ResponsesApiWebSearchFilters::from(ConfigWebSearchFilters) — allowed_domains",
+          "4. Factory копирует user_location из web_search_config.user_location через ResponsesApiWebSearchUserLocation::from — type, country, region, city, timezone",
+          "5. Factory копирует search_context_size из web_search_config",
+          "6. Factory возвращает Some(ToolSpec::WebSearch {external_web_access, filters, user_location, search_context_size, search_content_types})"
+        ],
+        "extensions (Cockburn)": [
+          {"step": 1, "condition": "web_search_mode = WebSearchMode::Disabled или None", "action": "Factory возвращает None — инструмент не создаётся"}
+        ],
+        "edge_cases": [
+          {"condition": "web_search_config отсутствует", "action": "filters/user_location/search_context_size = None, но external_web_access всё равно определён → инструмент создаётся"}
+        ],
+        "lifecycle": null,
+        "ux": null,
+        "result": "Option<ToolSpec::WebSearch>: Some с полностью заполненными полями когда mode активен; None когда Disabled/отсутствует"
+      }
+    }
+  ]
+}

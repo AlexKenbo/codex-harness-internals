@@ -1,0 +1,592 @@
+{
+  "src": "SRC-0011",
+  "schema_version": "2.0",
+  "lens": "use_case",
+  "compositions": [
+    {
+      "id": "SRC-0011/uc.user/manual-compact-thread",
+      "src": "SRC-0011",
+      "composition": "use_case",
+      "level": "user",
+      "strategic_domain": "управление контекстом треда",
+      "terms": {
+        "actor": "Пользователь Codex CLI",
+        "goal": "Вручную скомпактить текущий тред, чтобы продолжить разговор в уменьшенном контексте",
+        "steps": [
+          "1. Пользователь инициирует компакцию (вводит команду на стороне TUI, передавая UserInput::Text)",
+          "2. Session отправляет TurnStarted с turn_id, started_at, model_context_window, collaboration_mode_kind",
+          "3. Система выбирает реализацию: если provider.supports_remote_compaction() → remote, иначе inline (compact.rs/compact_remote.rs) →triggers SRC-0011/uc.sub/run-inline-compact или SRC-0011/uc.sub/run-remote-compact",
+          "4. Compaction Analytics Attempt фиксирует начало (trigger=Manual, reason=UserRequested, phase=StandaloneTurn, active_context_tokens_before)",
+          "5. История заменяется: build_compacted_history для inline или process_compacted_history для remote, далее sess.replace_compacted_history(new_history, reference_context_item=None, compacted_item)",
+          "6. Система пересчитывает token usage (sess.recompute_token_usage)",
+          "7. Система эмитит TurnItemCompleted для ContextCompaction",
+          "8. (inline only) Система отправляет Warning: 'Heads up: Long threads and multiple compactions can cause the model to be less accurate. Start a new thread when possible to keep threads small and targeted.'"
+        ],
+        "extensions (Cockburn)": [
+          {"step": 5, "condition": "inline compaction: stream returns ContextWindowExceeded и turn_input_len > 1", "action": "удалить самый старый item (history.remove_first_item), увеличить truncated_count, сбросить retries, повторить итерацию"},
+          {"step": 5, "condition": "inline compaction: ContextWindowExceeded но turn_input_len <= 1", "action": "sess.set_total_tokens_full(turn_context), отправить Error event, вернуть ошибку"},
+          {"step": 5, "condition": "inline compaction: прочая ошибка и retries < max_retries", "action": "retries++, вычислить delay через backoff(retries), notify_stream_error('Reconnecting... retries/max_retries'), sleep(delay), повторить"},
+          {"step": 5, "condition": "inline compaction: retries исчерпаны", "action": "отправить Error event, вернуть ошибку"},
+          {"step": 5, "condition": "inline: по завершении truncated_count > 0", "action": "notify_background_event: 'Trimmed {N} older thread item(s) before compacting so the prompt fits the model context window.'"},
+          {"step": 5, "condition": "CodexErr::Interrupted", "action": "немедленно вернуть Interrupted без retry и без отправки Error event"},
+          {"step": 5, "condition": "remote compaction: client.compact_conversation_history вернул ошибку", "action": "построить CompactRequestLogData, записать tracing::error с total_usage_breakdown, turn_id, model_context_window, failing_compaction_request_model_visible_bytes, compact_error; отправить Error event с префиксом 'Error running remote compact task'"}
+        ],
+        "edge_cases": [
+          {"condition": "manual compaction", "action": "reference_context_item устанавливается в None (InitialContextInjection::DoNotInject) — следующий обычный turn делает полную реинжекцию initial context"},
+          {"condition": "inline: during retry — websocket sticky state", "action": "одна ModelClientSession переиспользуется между retries чтобы сохранить turn-scoped state (sticky routing, websocket incremental request tracking)"},
+          {"condition": "inline success", "action": "client_session.reset_websocket_session() вызывается после замены истории"}
+        ],
+        "lifecycle": {
+          "entity": "SRC-0011/entity/context-manager",
+          "states": ["pre-compact", "compacting", "post-compact"],
+          "transition": {
+            "from": "pre-compact",
+            "to": "post-compact",
+            "guard": "compaction status = Completed",
+            "side_effect": "history_version = bumped, token_info recomputed, ContextCompaction turn item emitted, reference_context_item cleared"
+          }
+        },
+        "ux": [
+          "TurnStarted event с turn_id/collaboration_mode передаётся TUI",
+          "ContextCompaction TurnItem started/completed события",
+          "Warning toast (inline): 'Heads up: Long threads and multiple compactions can cause the model to be less accurate. Start a new thread when possible to keep threads small and targeted.'",
+          "Background notification при inline с trimmed count когда потребовался pre-trim"
+        ],
+        "result": "История треда заменена на replacement_history (user messages до COMPACT_USER_MESSAGE_MAX_TOKENS + summary), reference_context_item=None, новый TurnItem::ContextCompaction сохранён, token usage пересчитан"
+      }
+    },
+    {
+      "id": "SRC-0011/uc.user/rollback-user-turns",
+      "src": "SRC-0011",
+      "composition": "use_case",
+      "level": "user",
+      "strategic_domain": "управление историей треда",
+      "terms": {
+        "actor": "Пользователь Codex CLI",
+        "goal": "Откатить последние N пользовательских ходов, продолжив работу с более ранней точки треда",
+        "steps": [
+          "1. Пользователь запрашивает rollback с числом ходов num_turns",
+          "2. ContextManager.drop_last_n_user_turns(num_turns) вычисляет user_positions (все user turn boundaries) через user_message_positions",
+          "3. Система определяет cut_idx: если num_turns >= user_positions.len() → срез до первого user turn (сохраняя pre-first-user items), иначе берётся позиция user_positions[len - n_from_end]",
+          "4. Система вызывает trim_pre_turn_context_updates →triggers SRC-0011/uc.sub/trim-pre-turn-context",
+          "5. Система заменяет items снимком snapshot[..cut_idx] через replace(), увеличивая history_version"
+        ],
+        "extensions (Cockburn)": [
+          {"step": 1, "condition": "num_turns == 0", "action": "no-op, выйти без изменений"},
+          {"step": 2, "condition": "user_positions.first() == None (нет user turns вообще)", "action": "replace(snapshot) — no-op, выйти"},
+          {"step": 4, "condition": "обрезаемое developer сообщение смешивает contextual фрагменты с non-contextual текстом (build_initial_context bundle)", "action": "reference_context_item устанавливается в None — следующий turn делает полную реинжекцию initial context вместо diff"}
+        ],
+        "edge_cases": [
+          {"condition": "items_before_first_user_message существуют", "action": "сохранить их (trim walk не пересекает first_instruction_turn_idx)"},
+          {"condition": "user turn boundary = user Message с non-contextual content ИЛИ assistant Message с InterAgentCommunication содержимым", "action": "оба типа считаются за instruction turn (is_user_turn_boundary)"},
+          {"condition": "contextual_user_message (environment_context/agents.md/skill и т.п.) или contextual_dev_message непосредственно над cut_idx", "action": "они обрезаются дополнительно — walk назад пока condition держится"}
+        ],
+        "lifecycle": {
+          "entity": "SRC-0011/entity/context-manager",
+          "states": ["before-rollback", "after-rollback"],
+          "transition": {
+            "from": "before-rollback",
+            "to": "after-rollback",
+            "guard": "num_turns > 0 AND user_positions not empty",
+            "side_effect": "items заменены усечённым снимком, history_version++, опционально reference_context_item=None"
+          }
+        },
+        "ux": null,
+        "result": "ContextManager.items усечён до cut_idx (последние N user turns + их pre-turn contextual fragments удалены), history_version увеличен на 1, сохранены pre-first-user items"
+      }
+    },
+    {
+      "id": "SRC-0011/uc.user/persist-history-entry",
+      "src": "SRC-0011",
+      "composition": "use_case",
+      "level": "user",
+      "strategic_domain": "межсессионная история сообщений",
+      "terms": {
+        "actor": "Пользователь Codex CLI (через TUI)",
+        "goal": "Сохранить отправленное пользователем сообщение в глобальную межпроцессную историю ~/.codex/history.jsonl для последующего поиска",
+        "steps": [
+          "1. TUI вызывает append_entry(text, thread_id, config) после отправки сообщения",
+          "2. Система проверяет config.history.persistence: если None → выйти без записи; если SaveAll → продолжить",
+          "3. Система резолвит путь codex_home/history.jsonl и создаёт родительскую директорию если отсутствует",
+          "4. Система вычисляет timestamp ts = секунды с Unix epoch",
+          "5. Система сериализует HistoryEntry {session_id=thread_id.to_string(), ts, text} в JSON-строку и добавляет \\n",
+          "6. Система открывает файл с правами 0o600 (unix: с флагом append)",
+          "7. Система обеспечивает permissions 0o600 через ensure_owner_only_permissions",
+          "8. Система захватывает advisory exclusive lock (try_lock) с до MAX_RETRIES (10) попытками, между попытками RETRY_SLEEP (100ms) →triggers SRC-0011/uc.sub/acquire-history-lock",
+          "9. Под локом: seek(End) (для Windows без append-флага), write_all(line) одним syscall, flush",
+          "10. Система вызывает enforce_history_limit(file, config.history.max_bytes) →triggers SRC-0011/uc.sub/enforce-history-limit"
+        ],
+        "extensions (Cockburn)": [
+          {"step": 2, "condition": "config.history.persistence = None", "action": "тихо выйти с Ok(()), запись не производится"},
+          {"step": 4, "condition": "system clock before Unix epoch (duration_since ошибка)", "action": "вернуть std::io::Error::other('system clock before Unix epoch: {e}')"},
+          {"step": 5, "condition": "serde_json::to_string fail", "action": "вернуть std::io::Error::other('failed to serialise history entry: {e}')"},
+          {"step": 8, "condition": "try_lock вернул WouldBlock", "action": "std::thread::sleep(100ms) и повторить, до MAX_RETRIES итераций"},
+          {"step": 8, "condition": "MAX_RETRIES исчерпаны", "action": "вернуть std::io::Error с kind=WouldBlock и сообщением 'could not acquire exclusive lock on history file after multiple attempts'"},
+          {"step": 8, "condition": "try_lock вернул прочую ошибку", "action": "пробросить ошибку"}
+        ],
+        "edge_cases": [
+          {"condition": "concurrent TUI processes appending", "action": "POSIX атомарность write(2) ≤ PIPE_BUF байт при O_APPEND + advisory lock гарантируют отсутствие interleaving"},
+          {"condition": "Windows без append-флага", "action": "seek(End) перед write_all чтобы курсор был в конце"},
+          {"condition": "permissions файла не 0o600 (unix)", "action": "ensure_owner_only_permissions устанавливает set_mode(0o600) через spawn_blocking"}
+        ],
+        "lifecycle": null,
+        "ux": null,
+        "result": "Одна JSONL-строка {session_id, ts, text} добавлена в history.jsonl атомарно без interleaving; права файла 0o600 на unix"
+      }
+    },
+    {
+      "id": "SRC-0011/uc.user/lookup-history-entry",
+      "src": "SRC-0011",
+      "composition": "use_case",
+      "level": "user",
+      "strategic_domain": "межсессионная история сообщений",
+      "terms": {
+        "actor": "Пользователь Codex CLI (через TUI)",
+        "goal": "Извлечь ранее отправленное сообщение из глобальной истории по (log_id, offset) для повторного использования",
+        "steps": [
+          "1. TUI вызывает lookup(log_id, offset, config) — синхронный блокирующий вызов; async рантайму оборачивать в spawn_blocking",
+          "2. Система резолвит путь к history.jsonl",
+          "3. Система открывает файл в режиме read",
+          "4. Система получает metadata и вычисляет current_log_id (inode на unix, creation_time на windows)",
+          "5. Система сравнивает log_id: если запрошенный log_id != 0 и не равен current_log_id → вернуть None (файл был пересоздан)",
+          "6. Система захватывает shared advisory lock (try_lock_shared) с до MAX_RETRIES попытками",
+          "7. Под локом система построчно читает файл до индекса offset, парсит строку как HistoryEntry, возвращает Some(entry)"
+        ],
+        "extensions (Cockburn)": [
+          {"step": 3, "condition": "open файл failed", "action": "warn-лог 'failed to open history file' и вернуть None"},
+          {"step": 4, "condition": "stat failed", "action": "warn-лог 'failed to stat history file' и вернуть None"},
+          {"step": 5, "condition": "log_id не совпадает", "action": "вернуть None (файл пересоздан, id устарел)"},
+          {"step": 6, "condition": "try_lock_shared = WouldBlock", "action": "sleep(RETRY_SLEEP), повторить, до MAX_RETRIES итераций; затем вернуть None"},
+          {"step": 6, "condition": "try_lock_shared прочая ошибка", "action": "warn-лог и вернуть None"},
+          {"step": 7, "condition": "чтение строки failed", "action": "warn-лог 'failed to read line from history file' и вернуть None"},
+          {"step": 7, "condition": "offset за пределами файла", "action": "вернуть None (not found at requested offset)"},
+          {"step": 7, "condition": "serde_json::from_str ошибка", "action": "warn-лог 'failed to parse history entry' и вернуть None"}
+        ],
+        "edge_cases": [
+          {"condition": "log_id == 0", "action": "проверка идентичности файла пропускается (matching disabled)"},
+          {"condition": "параллельная запись append_entry", "action": "shared lock совместим с другими shared, но эксклюзивный write-lock заблокирует до retry"}
+        ],
+        "lifecycle": null,
+        "ux": null,
+        "result": "Some(HistoryEntry{session_id, ts, text}) при успешной идентификации и парсинге; None при mismatch log_id, offset out-of-range, parse error, или lock-timeout"
+      }
+    },
+    {
+      "id": "SRC-0011/uc.sub/record-items-to-history",
+      "src": "SRC-0011",
+      "composition": "use_case",
+      "level": "sub",
+      "strategic_domain": null,
+      "terms": {
+        "actor": "ContextManager",
+        "goal": "Записать пришедшие ResponseItem в транскрипт истории с труnication больших tool-output payloads",
+        "steps": [
+          "1. ContextManager итерирует входящие items (упорядочено oldest → newest)",
+          "2. Для каждого item: проверить is_api_message(item) OR is_ghost_snapshot; если оба false → пропустить item (continue)",
+          "3. Применить process_item(item, policy) — если FunctionCallOutput/CustomToolCallOutput → truncate_function_output_payload с policy * 1.2 (serialization budget), иначе склонировать",
+          "4. Записать обработанный item в self.items.push"
+        ],
+        "extensions (Cockburn)": [
+          {"step": 2, "condition": "item это system Message или Other или non-GhostSnapshot non-api", "action": "пропустить (не сохранять в транскрипт)"}
+        ],
+        "edge_cases": [
+          {"condition": "FunctionCallOutputBody::Text", "action": "truncate_text с policy*1.2"},
+          {"condition": "FunctionCallOutputBody::ContentItems", "action": "truncate_function_output_items_with_policy с policy*1.2"}
+        ],
+        "lifecycle": null,
+        "ux": null,
+        "result": "self.items пополнен api-сообщениями и GhostSnapshot'ами в порядке приёма, с усечёнными outputs"
+      }
+    },
+    {
+      "id": "SRC-0011/uc.sub/normalize-history-for-prompt",
+      "src": "SRC-0011",
+      "composition": "use_case",
+      "level": "sub",
+      "strategic_domain": null,
+      "terms": {
+        "actor": "ContextManager.for_prompt",
+        "goal": "Подготовить историю для отправки модели: гарантировать целостность call/output пар и снять неподдерживаемые модальности",
+        "steps": [
+          "1. Модуль нормализации вызывает ensure_call_outputs_present: для каждой FunctionCall/ToolSearchCall/CustomToolCall/LocalShellCall проверить наличие соответствующего output по call_id →triggers SRC-0011/uc.sub/ensure-call-outputs",
+          "2. Модуль нормализации вызывает remove_orphan_outputs: удалить FunctionCallOutput/CustomToolCallOutput/ToolSearchOutput у которых нет соответствующего call (кроме server-execution ToolSearchOutput и ToolSearchOutput с call_id=None) →triggers SRC-0011/uc.sub/remove-orphan-outputs",
+          "3. Модуль нормализации вызывает strip_images_when_unsupported: если input_modalities не содержит Image → заменить InputImage в Message-content и FunctionCallOutputContentItem на InputText с placeholder 'image content omitted because you do not support image input'; очистить result у ImageGenerationCall",
+          "4. ContextManager удаляет все GhostSnapshot из items (они не отправляются модели)",
+          "5. Возвращает Vec<ResponseItem> готовых для Prompt.input"
+        ],
+        "extensions (Cockburn)": [
+          {"step": 1, "condition": "FunctionCall без output", "action": "info!('Function call output is missing'); синтезировать FunctionCallOutput с FunctionCallOutputPayload::from_text('aborted')"},
+          {"step": 1, "condition": "ToolSearchCall (с Some call_id) без ToolSearchOutput", "action": "info!; синтезировать ToolSearchOutput{call_id, status='completed', execution='client', tools=[]}"},
+          {"step": 1, "condition": "CustomToolCall без CustomToolCallOutput", "action": "error_or_panic('Custom tool call output is missing'); синтезировать CustomToolCallOutput с payload 'aborted' name=None"},
+          {"step": 1, "condition": "LocalShellCall (c Some call_id) без FunctionCallOutput", "action": "error_or_panic('Local shell call output is missing'); синтезировать FunctionCallOutput с payload 'aborted'"},
+          {"step": 2, "condition": "FunctionCallOutput без соответствующего FunctionCall И без LocalShellCall с тем же call_id", "action": "error_or_panic('Orphan function call output') + удалить item"},
+          {"step": 2, "condition": "CustomToolCallOutput без соответствующего CustomToolCall", "action": "error_or_panic('Orphan custom tool call output') + удалить item"},
+          {"step": 2, "condition": "ToolSearchOutput с execution='server'", "action": "сохранить безусловно (серверный вывод не имеет локального парного вызова)"},
+          {"step": 2, "condition": "ToolSearchOutput(Some call_id) без соответствующего ToolSearchCall", "action": "error_or_panic('Orphan tool search output') + удалить"},
+          {"step": 3, "condition": "input_modalities содержит Image", "action": "skip — никакой замены, изображения проходят как есть"}
+        ],
+        "edge_cases": [
+          {"condition": "синтетические outputs вставляются в reverse index order", "action": "чтобы избежать сдвига индексов во время вставки"},
+          {"condition": "ImageGenerationCall с result", "action": "result.clear() при unsupported images"}
+        ],
+        "lifecycle": null,
+        "ux": null,
+        "result": "Vec<ResponseItem> где каждый tool call имеет пару output, нет orphan outputs, изображения заменены placeholder при unsupported modality, GhostSnapshot'ы исключены"
+      }
+    },
+    {
+      "id": "SRC-0011/uc.sub/auto-compact-inline",
+      "src": "SRC-0011",
+      "composition": "use_case",
+      "level": "sub",
+      "strategic_domain": null,
+      "terms": {
+        "actor": "Inline Compaction Task (run_inline_auto_compact_task)",
+        "goal": "Автоматически скомпактить историю локальной summarization pass когда auto-trigger сработал",
+        "steps": [
+          "1. Задача синтезирует UserInput::Text из turn_context.compact_prompt() (SUMMARIZATION_PROMPT)",
+          "2. Вызывает run_compact_task_inner с trigger=Auto, reason и phase из параметров (например BeforeLastUserMessage для mid-turn)",
+          "3. Начинает CompactionAnalyticsAttempt с implementation=Responses",
+          "4. Клонирует историю, записывает синтетический compact prompt как ResponseInputItem",
+          "5. В цикле: клонирует историю, строит Prompt{input=for_prompt, base_instructions, personality}, вызывает drain_to_completed через ModelClientSession",
+          "6. При успехе: строит summary_text = '{SUMMARY_PREFIX}\\n{last_assistant_message_from_turn}' (или empty если нет assistant), собирает user_messages (исключая summary messages), вызывает build_compacted_history",
+          "7. Если initial_context_injection = BeforeLastUserMessage → insert_initial_context_before_last_real_user_or_summary →triggers SRC-0011/uc.sub/insert-initial-context",
+          "8. Добавляет сохранённые GhostSnapshot items в конец new_history",
+          "9. Устанавливает reference_context_item: BeforeLastUserMessage → Some(turn_context.to_turn_context_item()), DoNotInject → None",
+          "10. Вызывает sess.replace_compacted_history(new_history, reference_context_item, CompactedItem{message=summary_text, replacement_history=Some(new_history)})",
+          "11. Сбрасывает websocket session (client_session.reset_websocket_session)",
+          "12. Пересчитывает token usage и эмитит TurnItemCompleted + Warning (текст см. UC manual-compact step 8)"
+        ],
+        "extensions (Cockburn)": [
+          {"step": 5, "condition": "CodexErr::Interrupted", "action": "немедленно вернуть Interrupted"},
+          {"step": 5, "condition": "CodexErr::ContextWindowExceeded и turn_input_len > 1", "action": "history.remove_first_item() для сохранения префиксного кэша и сохранения последних сообщений, truncated_count++, retries=0, continue"},
+          {"step": 5, "condition": "ContextWindowExceeded и turn_input_len <= 1", "action": "sess.set_total_tokens_full, Error event, вернуть ошибку"},
+          {"step": 5, "condition": "прочая ошибка, retries < max_retries (provider.stream_max_retries())", "action": "retries++, backoff(retries), notify_stream_error, sleep, retry"},
+          {"step": 5, "condition": "retries исчерпаны", "action": "Error event, вернуть ошибку"}
+        ],
+        "edge_cases": [
+          {"condition": "last assistant message отсутствует", "action": "summary_suffix = '' → summary_text = SUMMARY_PREFIX + '\\n' → is_summary_message совпадает на '{SUMMARY_PREFIX}\\n'"},
+          {"condition": "summary_text пустой при сборке history", "action": "заменён на '(no summary available)'"}
+        ],
+        "lifecycle": null,
+        "ux": [
+          "Background notification если pre-trim потребовался: 'Trimmed N older thread item(s) before compacting...'",
+          "Warning toast по завершении: 'Heads up: Long threads and multiple compactions can cause the model to be less accurate...'"
+        ],
+        "result": "История замещена на (optional initial context) + recent user messages до 20 000 токенов + summary-user-message; CompactionAnalyticsAttempt::track отправлен с status"
+      }
+    },
+    {
+      "id": "SRC-0011/uc.sub/auto-compact-remote",
+      "src": "SRC-0011",
+      "composition": "use_case",
+      "level": "sub",
+      "strategic_domain": null,
+      "terms": {
+        "actor": "Remote Compaction Task (run_inline_remote_auto_compact_task / run_remote_compact_task)",
+        "goal": "Скомпактить историю через серверный compact endpoint провайдера (supports_remote_compaction=true) вместо локальной summarization",
+        "steps": [
+          "1. Задача начинает CompactionAnalyticsAttempt с implementation=ResponsesCompact",
+          "2. Клонирует историю и получает base_instructions",
+          "3. Триммит function_call_history чтобы уложиться в context_window через trim_function_call_history_to_fit_context_window →triggers SRC-0011/uc.sub/trim-function-call-history",
+          "4. Собирает ghost_snapshots (для сохранности /undo после компакции)",
+          "5. Готовит prompt_input = for_prompt(model_info.input_modalities), строит tool_router (built_tools) и собирает Prompt с tools=model_visible_specs(), parallel_tool_calls, base_instructions, personality",
+          "6. Вызывает services.model_client.compact_conversation_history(prompt, model_info, reasoning_effort, reasoning_summary, session_telemetry)",
+          "7. Фильтрует полученный new_history через should_keep_compacted_history_item",
+          "8. Если initial_context_injection=BeforeLastUserMessage → insert_initial_context_before_last_real_user_or_summary →triggers SRC-0011/uc.sub/insert-initial-context",
+          "9. Добавляет ghost_snapshots в конец new_history",
+          "10. Устанавливает reference_context_item аналогично inline-варианту",
+          "11. Вызывает sess.replace_compacted_history(new_history, reference_context_item, CompactedItem{message='', replacement_history=Some(new_history)}) — message пуст для remote",
+          "12. Пересчитывает token usage, эмитит TurnItemCompleted"
+        ],
+        "extensions (Cockburn)": [
+          {"step": 3, "condition": "deleted_items > 0", "action": "info!('trimmed history items before remote compaction', turn_id, deleted_items)"},
+          {"step": 6, "condition": "compact_conversation_history вернул Err", "action": "построить CompactRequestLogData (failing_compaction_request_model_visible_bytes = sum estimate bytes по items + base_instructions.len), получить get_total_token_usage_breakdown, log_remote_compact_failure (tracing::error), пробросить err"},
+          {"step": 6, "condition": "err проброшен из inner_impl", "action": "run_remote_compact_task_inner отправляет Error event с префиксом 'Error running remote compact task' и возвращает Err"}
+        ],
+        "edge_cases": [
+          {"condition": "trim_function_call_history цикл: последний item не codex_generated", "action": "break (не триммить дальше, чтобы сохранить user/assistant boundary)"},
+          {"condition": "provider не поддерживает remote compaction", "action": "should_use_remote_compact_task(provider) возвращает false, выбирается inline путь"},
+          {"condition": "should_keep_compacted_history_item отбрасывает: developer messages (stale/duplicated instructions), user-role messages которые не являются UserMessage/HookPrompt (session-prefix/instruction wrappers), Reasoning, FunctionCall/Output, ToolSearchCall/Output, CustomToolCall/Output, LocalShellCall, WebSearchCall, ImageGenerationCall, GhostSnapshot, Other", "action": "выкинуть из compacted history"},
+          {"condition": "should_keep_compacted_history_item сохраняет: assistant messages (future remote compaction models may emit them), Compaction items, user-role warnings и summary messages (парсятся как TurnItem::UserMessage)", "action": "оставить"}
+        ],
+        "lifecycle": null,
+        "ux": null,
+        "result": "История заменена отфильтрованным remote-generated new_history с injected initial context (если mid-turn) и восстановленными ghost_snapshots; CompactionAnalyticsAttempt::track отправлен"
+      }
+    },
+    {
+      "id": "SRC-0011/uc.sub/trim-function-call-history",
+      "src": "SRC-0011",
+      "composition": "use_case",
+      "level": "sub",
+      "strategic_domain": null,
+      "terms": {
+        "actor": "Remote compaction pre-trim (trim_function_call_history_to_fit_context_window)",
+        "goal": "Усечь историю перед отправкой на remote compaction так чтобы токен-оценка уложилась в context_window",
+        "steps": [
+          "1. Получить turn_context.model_context_window(); если None → вернуть 0 deleted_items (нет cap)",
+          "2. В цикле: оценить estimate_token_count_with_base_instructions(base_instructions); пока estimated > context_window:",
+          "3. Взять last item в history.raw_items(); если list пуст → break",
+          "4. Если is_codex_generated_item(last) = false (не FunctionCallOutput/ToolSearchOutput/CustomToolCallOutput/developer Message) → break (нельзя триммить user/assistant)",
+          "5. Вызвать history.remove_last_item(); если вернул false → break; иначе deleted_items++"
+        ],
+        "extensions (Cockburn)": [
+          {"step": 2, "condition": "estimated <= context_window", "action": "выйти из цикла, deleted_items возвращается"}
+        ],
+        "edge_cases": [
+          {"condition": "удаление last item через ContextManager.remove_last_item()", "action": "также удаляет парный call через normalize::remove_corresponding_for чтобы сохранить инвариант call/output, и увеличивает history_version"}
+        ],
+        "lifecycle": null,
+        "ux": null,
+        "result": "deleted_items (usize) возвращается; history усечена так что estimated_tokens_with_base_instructions <= context_window, либо итерация остановилась на границе codex-generated tail"
+      }
+    },
+    {
+      "id": "SRC-0011/uc.sub/insert-initial-context",
+      "src": "SRC-0011",
+      "composition": "use_case",
+      "level": "sub",
+      "strategic_domain": null,
+      "terms": {
+        "actor": "insert_initial_context_before_last_real_user_or_summary",
+        "goal": "Инжектировать канонический initial context в compacted replacement history в позиции ожидаемой моделью",
+        "steps": [
+          "1. Итерировать compacted_history в reverse, находить: last_real_user_index = позиция последнего реального user message (НЕ summary), last_user_or_summary_index = последний user-message-like item (включая summary)",
+          "2. Найти last_compaction_index = позиция последнего Compaction item (reverse)",
+          "3. Определить insertion_index = last_real_user_index || last_user_or_summary_index || last_compaction_index",
+          "4. Если insertion_index найден → splice initial_context на позицию insertion_index",
+          "5. Иначе → extend compacted_history с initial_context (append в конец)"
+        ],
+        "extensions (Cockburn)": [
+          {"step": 3, "condition": "нет реальных user messages остались", "action": "вставить перед summary (last_user_or_summary_index) так чтобы summary остался последним"},
+          {"step": 3, "condition": "нет user messages вообще (remote compaction может вернуть только compaction items)", "action": "вставить перед последним Compaction item чтобы он остался последним"},
+          {"step": 3, "condition": "нет ни user messages ни compaction items", "action": "append initial_context в конец истории"}
+        ],
+        "edge_cases": [
+          {"condition": "compaction summaries закодированы как user messages", "action": "различать через is_summary_message: starts_with '{SUMMARY_PREFIX}\\n'"}
+        ],
+        "lifecycle": null,
+        "ux": null,
+        "result": "compacted_history возвращается с initial_context вставленным на правильную boundary (перед последним real user / перед summary / перед compaction / в конец)"
+      }
+    },
+    {
+      "id": "SRC-0011/uc.sub/build-compacted-history",
+      "src": "SRC-0011",
+      "composition": "use_case",
+      "level": "sub",
+      "strategic_domain": null,
+      "terms": {
+        "actor": "build_compacted_history_with_limit",
+        "goal": "Сформировать replacement history для inline компакции: недавние user messages в пределах токен-бюджета + summary",
+        "steps": [
+          "1. Принять initial_context (Vec, обычно пустой для inline), user_messages (все кроме summary-сообщений), summary_text, max_tokens (COMPACT_USER_MESSAGE_MAX_TOKENS = 20 000)",
+          "2. Инициализировать selected_messages = [], remaining = max_tokens",
+          "3. Итерировать user_messages в reverse: для каждого message tokens = approx_token_count(message)",
+          "4. Если tokens <= remaining → push в selected, remaining -= tokens",
+          "5. Иначе → truncate_text(message, TruncationPolicy::Tokens(remaining)), push, break цикла",
+          "6. selected_messages.reverse() чтобы восстановить хронологию",
+          "7. Для каждого selected_message добавить ResponseItem::Message{role='user', content=[InputText{text}]} в history",
+          "8. Добавить summary как user message; если summary_text пуст → '(no summary available)'"
+        ],
+        "extensions (Cockburn)": [
+          {"step": 2, "condition": "max_tokens == 0", "action": "selected_messages пуст — история получит только summary"},
+          {"step": 4, "condition": "remaining == 0 в начале итерации", "action": "break — больше ни одного user message не сохранено"}
+        ],
+        "edge_cases": [
+          {"condition": "summary_text пустая строка", "action": "заменить на '(no summary available)'"}
+        ],
+        "lifecycle": null,
+        "ux": null,
+        "result": "Vec<ResponseItem>: initial_context (если был) + самые недавние user messages суммарно <= 20 000 токенов + summary message (всегда последний)"
+      }
+    },
+    {
+      "id": "SRC-0011/uc.sub/build-settings-update-bundle",
+      "src": "SRC-0011",
+      "composition": "use_case",
+      "level": "sub",
+      "strategic_domain": null,
+      "terms": {
+        "actor": "build_settings_update_items",
+        "goal": "Собрать per-turn дельту настроек treating previous vs next TurnContext как developer message + optional contextual user message",
+        "steps": [
+          "1. Построить contextual_user_message через build_environment_update_item (изменения cwd/current_date/timezone/network с сохранением shell)",
+          "2. Собрать developer_update_sections в фиксированном порядке: model_instructions_update (первым — чтобы model-specific guidance читался до остальных diffs), permissions_update, collaboration_mode_update, realtime_update, personality_update",
+          "3. Flatten sections (отбросить None), map через DeveloperInstructions::into_text",
+          "4. Если sections не пусты → build_developer_update_item({role=developer, content=[InputText(text) для каждой section]})",
+          "5. В results push developer_message если есть, push contextual_user_message если есть; возвращает Vec до 2 items"
+        ],
+        "extensions (Cockburn)": [
+          {"step": 1, "condition": "next.config.include_environment_context = false", "action": "build_environment_update_item вернёт None"},
+          {"step": 1, "condition": "previous None ИЛИ prev_context.equals_except_shell(next_context)", "action": "None — environment update не эмитится"},
+          {"step": 2, "condition": "previous_turn_settings.model == next.model_info.slug", "action": "build_model_instructions_update_item=None"},
+          {"step": 2, "condition": "model_instructions пустой", "action": "None"},
+          {"step": 2, "condition": "next.config.include_permissions_instructions=false", "action": "permissions_update = None"},
+          {"step": 2, "condition": "prev.sandbox_policy == next.sandbox_policy.get() AND prev.approval_policy == next.approval_policy.value()", "action": "permissions_update = None"},
+          {"step": 2, "condition": "prev.collaboration_mode == next.collaboration_mode", "action": "collaboration_mode_update = None"},
+          {"step": 2, "condition": "build_realtime_update_item: previously (Some(true), false)", "action": "DeveloperInstructions::realtime_end_message('inactive')"},
+          {"step": 2, "condition": "build_realtime_update_item: (Some(false), true) или (None, true)", "action": "realtime_start_message_with_instructions(custom) если config.experimental_realtime_start_instructions Some, иначе realtime_start_message()"},
+          {"step": 2, "condition": "build_realtime_update_item: (Some(true), true) или (Some(false), false)", "action": "None"},
+          {"step": 2, "condition": "build_realtime_update_item: (None, false) и previous_turn_settings.realtime_active = Some(true)", "action": "realtime_end_message('inactive')"},
+          {"step": 2, "condition": "personality_feature_enabled=false или previous None или модель слак сменилась или personality не изменилась", "action": "personality_update = None"}
+        ],
+        "edge_cases": [
+          {"condition": "текущая коллаборационная модель имеет пустые developer instructions", "action": "from_collaboration_mode возвращает None и апдейт не эмитится — прежние collaboration instructions остаются в prompt history"},
+          {"condition": "personality_message_for возвращает None или пустую строку", "action": "filter отсекает, update=None"}
+        ],
+        "lifecycle": null,
+        "ux": null,
+        "result": "Vec<ResponseItem> длиной 0-2: опциональный developer message с секциями в порядке model→permissions→collab→realtime→personality + опциональный contextual user message с environment diff"
+      }
+    },
+    {
+      "id": "SRC-0011/uc.sub/trim-pre-turn-context",
+      "src": "SRC-0011",
+      "composition": "use_case",
+      "level": "sub",
+      "strategic_domain": null,
+      "terms": {
+        "actor": "ContextManager.trim_pre_turn_context_updates",
+        "goal": "После rollback очистить contextual developer/user items непосредственно над новой границей, чтобы следующий turn не начинался с stale pre-turn фрагментов",
+        "steps": [
+          "1. Пока cut_idx > first_instruction_turn_idx:",
+          "2. Посмотреть на snapshot[cut_idx-1]:",
+          "3. Если это developer Message с is_contextual_dev_message_content → cut_idx -= 1; дополнительно если has_non_contextual_dev_message_content (mixed bundle) → self.reference_context_item = None",
+          "4. Если это user Message с is_contextual_user_message_content → cut_idx -= 1",
+          "5. Иначе → break"
+        ],
+        "extensions (Cockburn)": [
+          {"step": 3, "condition": "mixed build_initial_context bundle (contextual + non-contextual developer text)", "action": "clear reference_context_item — next real turn сделает полную реинжекцию контекста вместо diff (steady-state diffs не могут восстановить bundle после trim)"}
+        ],
+        "edge_cases": [
+          {"condition": "cut_idx достиг first_instruction_turn_idx", "action": "stop — trim walk никогда не пересекает первый instruction turn, поэтому session-prefix items сохраняются"}
+        ],
+        "lifecycle": null,
+        "ux": null,
+        "result": "Adjusted cut_idx возвращается; reference_context_item опционально обнулён если был trimmed mixed bundle"
+      }
+    },
+    {
+      "id": "SRC-0011/uc.sub/classify-contextual-user-message",
+      "src": "SRC-0011",
+      "composition": "use_case",
+      "level": "sub",
+      "strategic_domain": null,
+      "terms": {
+        "actor": "contextual_user_message module",
+        "goal": "Определить является ли user-role Message контекстуальным scaffolding (prompt injection) или реальным сообщением пользователя",
+        "steps": [
+          "1. Для каждого ContentItem в сообщении: если не InputText → вернуть None (не контекстуальное)",
+          "2. Проверить parse_hook_prompt_fragment(text) — если Some → добавить как hook fragment",
+          "3. Иначе если is_standard_contextual_user_text(text) — текст matches одно из: AGENTS_MD_FRAGMENT, ENVIRONMENT_CONTEXT_FRAGMENT, SKILL_FRAGMENT, USER_SHELL_COMMAND_FRAGMENT, TURN_ABORTED_FRAGMENT, SUBAGENT_NOTIFICATION_FRAGMENT → continue",
+          "4. Иначе → return None (встречен реальный non-контекстуальный текст)",
+          "5. Если fragments собраны → HookPromptItem::from_fragments(id, fragments), иначе None"
+        ],
+        "extensions (Cockburn)": [
+          {"step": 2, "condition": "is_memory_excluded_contextual_user_fragment: AGENTS_MD_FRAGMENT или SKILL_FRAGMENT", "action": "фрагмент исключается из memory stage-1 inputs (prompt scaffolding а не conversation content)"},
+          {"step": 2, "condition": "ENVIRONMENT_CONTEXT или SUBAGENT_NOTIFICATION фрагмент", "action": "сохраняется в memory inputs — несёт useful execution context или subtask outcomes"}
+        ],
+        "edge_cases": [
+          {"condition": "fragments пустой после сборки", "action": "return None"},
+          {"condition": "user turn boundary = user Message с НЕ-контекстуальным content ИЛИ assistant Message с InterAgentCommunication", "action": "is_user_turn_boundary = true (используется для rollback и token counting)"}
+        ],
+        "lifecycle": null,
+        "ux": null,
+        "result": "Option<HookPromptItem>: Some при полностью контекстуальном сообщении с хотя бы одним hook fragment, None в прочих случаях"
+      }
+    },
+    {
+      "id": "SRC-0011/uc.sub/enforce-history-limit",
+      "src": "SRC-0011",
+      "composition": "use_case",
+      "level": "sub",
+      "strategic_domain": null,
+      "terms": {
+        "actor": "enforce_history_limit (message_history)",
+        "goal": "Удерживать history.jsonl в рамках max_bytes, сбрасывая старые строки до soft cap, сохраняя самую свежую запись",
+        "steps": [
+          "1. Если max_bytes None или 0 или не приводится к u64 → выйти без изменений",
+          "2. Получить current_len = file.metadata.len(); если <= max_bytes → выйти",
+          "3. Клонировать file handle, seek(0), BufReader собирает длины всех строк",
+          "4. trim_target = max(soft_cap_bytes = floor(max_bytes * HISTORY_SOFT_CAP_RATIO (0.8)), последняя строка newest_entry_len) — clamped на [1, max_bytes]",
+          "5. Итерировать идексы от 0 до last_index: пока current_len > trim_target — current_len -= line_lengths[idx], drop_bytes += line_lengths[idx], idx++",
+          "6. Если drop_bytes == 0 → выйти",
+          "7. reader.seek(drop_bytes), read_to_end в tail",
+          "8. file.set_len(0), seek(Start 0), write_all(tail), flush"
+        ],
+        "extensions (Cockburn)": [
+          {"step": 1, "condition": "max_bytes = None", "action": "нет enforcement, размер файла не ограничен"},
+          {"step": 1, "condition": "max_bytes = 0", "action": "нет enforcement (trivial skip)"}
+        ],
+        "edge_cases": [
+          {"condition": "last_index это единственная строка", "action": "цикл drop не итерирует (idx < last_index false), drop_bytes=0, выход без переписывания"},
+          {"condition": "newest_entry_len > soft_cap_bytes", "action": "trim_target = newest_entry_len — гарантия сохранности последней записи"}
+        ],
+        "lifecycle": null,
+        "ux": null,
+        "result": "history.jsonl усечён до <= trim_target байт, самая свежая строка всегда сохранена"
+      }
+    },
+    {
+      "id": "SRC-0011/uc.sub/acquire-history-lock",
+      "src": "SRC-0011",
+      "composition": "use_case",
+      "level": "sub",
+      "strategic_domain": null,
+      "terms": {
+        "actor": "file-lock helper внутри append_entry/lookup",
+        "goal": "Надёжно захватить advisory lock на history.jsonl для межпроцессной синхронизации",
+        "steps": [
+          "1. Повторить до MAX_RETRIES (10) раз:",
+          "2. Вызвать file.try_lock() (exclusive в append_entry) или file.try_lock_shared() (shared в lookup)",
+          "3. Если Ok → вернуть управление caller под локом",
+          "4. Если Err(WouldBlock) → std::thread::sleep(RETRY_SLEEP = 100ms), повторить",
+          "5. Если прочая ошибка → вернуть (append) или warn-лог + вернуть None (lookup)"
+        ],
+        "extensions (Cockburn)": [
+          {"step": 4, "condition": "все MAX_RETRIES попытки WouldBlock", "action": "append: вернуть std::io::Error kind=WouldBlock 'could not acquire exclusive lock on history file after multiple attempts'; lookup: вернуть None"}
+        ],
+        "edge_cases": [
+          {"condition": "много конкурентных TUI-процессов держат эксклюзивный лок", "action": "shared lock caller (lookup) ждёт через retry; когда приобретёт lock — читает файл консистентно"}
+        ],
+        "lifecycle": null,
+        "ux": null,
+        "result": "Под локом вызывающий выполняет атомарную операцию (write для append, read строки для lookup); либо timeout через 10*100ms=1s"
+      }
+    },
+    {
+      "id": "SRC-0011/uc.sub/serialize-environment-context",
+      "src": "SRC-0011",
+      "composition": "use_case",
+      "level": "sub",
+      "strategic_domain": null,
+      "terms": {
+        "actor": "EnvironmentContext.serialize_to_xml / From<EnvironmentContext> for ResponseItem",
+        "goal": "Преобразовать EnvironmentContext в ResponseItem (role=user) содержащий XML-подобный тег с текущими значениями cwd/shell/date/timezone/network/subagents",
+        "steps": [
+          "1. Если cwd Some → добавить '  <cwd>{path}</cwd>'",
+          "2. Всегда добавить '  <shell>{shell.name()}</shell>'",
+          "3. Если current_date Some → '  <current_date>{date}</current_date>'",
+          "4. Если timezone Some → '  <timezone>{timezone}</timezone>'",
+          "5. Если network Some → '  <network enabled=\"true\">', потом '    <allowed>{domain}</allowed>' для каждого allowed, '    <denied>{domain}</denied>' для каждого denied, затем '  </network>'",
+          "6. Если subagents Some → '  <subagents>', затем каждая line префиксуется '    ', затем '  </subagents>'",
+          "7. Объединить lines через '\\n', обернуть ENVIRONMENT_CONTEXT_FRAGMENT (<environment_context>...</environment_context>)",
+          "8. From<EnvironmentContext> for ResponseItem обёртывает результат в ResponseItem::Message (role=user, InputText content)"
+        ],
+        "extensions (Cockburn)": [
+          {"step": 5, "condition": "network None", "action": "никаких network-строк в XML — в комментарии TODO: возможно добавить '<network enabled=\"false\" />' если поможет модели"}
+        ],
+        "edge_cases": [
+          {"condition": "with_subagents вызван с пустой строкой", "action": "subagents не устанавливается (condition !subagents.is_empty)"},
+          {"condition": "diff_from_turn_context_item: cwd не изменился", "action": "cwd = None в diff (не сериализуется)"},
+          {"condition": "diff_from_turn_context_item: network не изменился", "action": "network = before_network (не выявляет изменение)"}
+        ],
+        "lifecycle": null,
+        "ux": null,
+        "result": "ResponseItem::Message с ролью user содержащий XML-документ окружённый <environment_context> тегами, готовый к вставке в prompt как contextual user message"
+      }
+    }
+  ]
+}

@@ -1,0 +1,1053 @@
+{
+  "src": "SRC-0017",
+  "schema_version": "2.0",
+  "lens": "rule",
+  "compositions": [
+    {
+      "id": "SRC-0017/rule/wait-timeout-clamp",
+      "src": "SRC-0017",
+      "composition": "rule",
+      "terms": {
+        "condition": "IF timeout_ms <= 0 THEN reject with 'timeout_ms must be greater than zero'; ELSE clamp timeout_ms в диапазон [MIN_WAIT_TIMEOUT_MS, MAX_WAIT_TIMEOUT_MS] перед стартом ожидания. Default = DEFAULT_WAIT_TIMEOUT_MS когда параметр не задан.",
+        "numbers": [
+          {"value": 10000, "kind": "threshold", "name": "MIN_WAIT_TIMEOUT_MS (ms)"},
+          {"value": 30000, "kind": "default", "name": "DEFAULT_WAIT_TIMEOUT_MS (ms)"},
+          {"value": 3600000, "kind": "threshold", "name": "MAX_WAIT_TIMEOUT_MS (ms, = 3600*1000)"}
+        ],
+        "formula": "effective_timeout_ms = clamp(args.timeout_ms.unwrap_or(30000), 10000, 3600000); reject if args.timeout_ms <= 0",
+        "gwt": {
+          "given": "args.timeout_ms = 5000",
+          "when": "wait_agent (v1 или v2) запускается",
+          "then": "effective = clamp(5000, 10000, 3600000) = 10000 ms; deadline = now + 10s"
+        }
+      }
+    },
+    {
+      "id": "SRC-0017/rule/wait-timeout-reject-nonpositive",
+      "src": "SRC-0017",
+      "composition": "rule",
+      "terms": {
+        "condition": "IF timeout_ms <= 0 THEN FunctionCallError::RespondToModel('timeout_ms must be greater than zero'). Применяется и в v1 wait, и в v2 wait.",
+        "numbers": [
+          {"value": 0, "kind": "boundary", "name": "timeout_ms lower bound (inclusive reject)"}
+        ],
+        "formula": null,
+        "gwt": {
+          "given": "args.timeout_ms = 0",
+          "when": "wait_agent вызывается",
+          "then": "возврат ошибки 'timeout_ms must be greater than zero'; запрос отклонён до подписки на статусы/mailbox"
+        }
+      }
+    },
+    {
+      "id": "SRC-0017/rule/wait-targets-non-empty-v1",
+      "src": "SRC-0017",
+      "composition": "rule",
+      "terms": {
+        "condition": "IF targets пуст THEN отклонить с 'agent ids must be non-empty' (v1 wait). Targets должен содержать >=1 ThreadId-строку.",
+        "numbers": [
+          {"value": 1, "kind": "threshold", "name": "минимальное число targets"}
+        ],
+        "formula": null,
+        "gwt": {
+          "given": "args.targets = []",
+          "when": "wait_agent v1 вызывается",
+          "then": "parse_agent_id_targets возвращает ошибку 'agent ids must be non-empty'"
+        }
+      }
+    },
+    {
+      "id": "SRC-0017/rule/agent-id-must-parse",
+      "src": "SRC-0017",
+      "composition": "rule",
+      "terms": {
+        "condition": "IF ThreadId::from_string(target) Err THEN 'invalid agent id {target}: {err:?}'. Применяется к close_agent v1, send_input v1, resume_agent v1, wait v1 (для каждого targets[i]).",
+        "numbers": null,
+        "formula": null,
+        "gwt": {
+          "given": "target = 'not-a-uuid'",
+          "when": "parse_agent_id_target('not-a-uuid')",
+          "then": "FunctionCallError::RespondToModel('invalid agent id not-a-uuid: {err:?}')"
+        }
+      }
+    },
+    {
+      "id": "SRC-0017/rule/message-xor-items",
+      "src": "SRC-0017",
+      "composition": "rule",
+      "terms": {
+        "condition": "ВХОД должен содержать РОВНО одно из (message, items). (Some, Some) → 'Provide either message or items, but not both'; (None, None) → 'Provide one of: message or items'. Применяется к spawn v1 и send_input v1 через parse_collab_input.",
+        "numbers": null,
+        "formula": null,
+        "gwt": {
+          "given": "args = { message: Some('hi'), items: Some([UserInput::Text{...}]) }",
+          "when": "parse_collab_input(message, items)",
+          "then": "ошибка 'Provide either message or items, but not both'"
+        }
+      }
+    },
+    {
+      "id": "SRC-0017/rule/message-non-empty",
+      "src": "SRC-0017",
+      "composition": "rule",
+      "terms": {
+        "condition": "IF message.trim().is_empty() THEN 'Empty message can't be sent to an agent'. Применяется в parse_collab_input (v1 spawn/send_input) и в message_content (v2 send_message/followup_task).",
+        "numbers": null,
+        "formula": null,
+        "gwt": {
+          "given": "args.message = '   \\n  '",
+          "when": "parse_collab_input или message_content вызывается",
+          "then": "ошибка 'Empty message can't be sent to an agent'"
+        }
+      }
+    },
+    {
+      "id": "SRC-0017/rule/items-non-empty-v1",
+      "src": "SRC-0017",
+      "composition": "rule",
+      "terms": {
+        "condition": "IF items.is_empty() (в v1 spawn/send_input) THEN 'Items can't be empty'",
+        "numbers": null,
+        "formula": null,
+        "gwt": {
+          "given": "args.items = Some(vec![])",
+          "when": "parse_collab_input",
+          "then": "ошибка 'Items can't be empty'"
+        }
+      }
+    },
+    {
+      "id": "SRC-0017/rule/spawn-depth-limit",
+      "src": "SRC-0017",
+      "composition": "rule",
+      "terms": {
+        "condition": "IF exceeds_thread_spawn_depth_limit(child_depth, turn.config.agent_max_depth) THEN reject. В spawn v1/v2, resume v1: 'Agent depth limit reached. Solve the task yourself.'. В agent_jobs (build_runner_options): 'agent depth limit reached; this session cannot spawn more subagents'.",
+        "numbers": null,
+        "formula": "child_depth = next_thread_spawn_depth(parent.session_source); reject_if child_depth > agent_max_depth (в терминах exceeds_thread_spawn_depth_limit — точный предикат вне SRC, но используется во всех трёх проверках)",
+        "gwt": {
+          "given": "parent на depth=N, agent_max_depth=N (условно) → child_depth = N+1",
+          "when": "spawn/resume/batch-job пытается создать ещё одного сабагента",
+          "then": "exceeds_thread_spawn_depth_limit=true → возврат функциональной ошибки о лимите глубины"
+        }
+      }
+    },
+    {
+      "id": "SRC-0017/rule/full-fork-no-overrides",
+      "src": "SRC-0017",
+      "composition": "rule",
+      "terms": {
+        "condition": "Full-history форк (v1 fork_context=true ИЛИ v2 fork_mode=FullHistory) НЕ допускает переопределений agent_type/model/reasoning_effort. Если любой из них задан — 'Full-history forked agents inherit the parent agent type, model, and reasoning effort; omit agent_type, model, and reasoning_effort, or spawn without fork_context/fork_turns=all.'",
+        "numbers": null,
+        "formula": null,
+        "gwt": {
+          "given": "v2 args = { fork_turns: 'all', agent_type: 'reviewer' }",
+          "when": "handler v2 handle() после SpawnAgentArgs.fork_mode() → FullHistory",
+          "then": "reject_full_fork_spawn_overrides возвращает ошибку с указанной формулировкой"
+        }
+      }
+    },
+    {
+      "id": "SRC-0017/rule/v2-fork-context-rejected",
+      "src": "SRC-0017",
+      "composition": "rule",
+      "terms": {
+        "condition": "V2 spawn отклоняет fork_context всегда: IF fork_context.is_some() THEN 'fork_context is not supported in MultiAgentV2; use fork_turns instead'",
+        "numbers": null,
+        "formula": null,
+        "gwt": {
+          "given": "v2 spawn args = { fork_context: Some(true) или Some(false) }",
+          "when": "SpawnAgentArgs.fork_mode() вызывается",
+          "then": "ошибка 'fork_context is not supported in MultiAgentV2; use fork_turns instead'"
+        }
+      }
+    },
+    {
+      "id": "SRC-0017/rule/fork-turns-values",
+      "src": "SRC-0017",
+      "composition": "rule",
+      "terms": {
+        "condition": "V2 fork_turns принимает ТОЛЬКО: trim пустая/None → None; 'none' (case-insensitive) → None; 'all' (case-insensitive) → FullHistory; положительное целое (usize parse > 0) → LastNTurns(n). Иное — 'fork_turns must be `none`, `all`, or a positive integer string'. 0 — та же ошибка.",
+        "numbers": [
+          {"value": 0, "kind": "boundary", "name": "fork_turns lower bound reject"}
+        ],
+        "formula": "fork_mode = match fork_turns: None|empty|'none' → None; 'all' → FullHistory; n (parse usize > 0) → LastNTurns(n); else → reject",
+        "gwt": {
+          "given": "fork_turns = '3'",
+          "when": "SpawnAgentArgs.fork_mode()",
+          "then": "Ok(Some(LastNTurns(3)))"
+        }
+      }
+    },
+    {
+      "id": "SRC-0017/rule/spawn-model-must-be-known",
+      "src": "SRC-0017",
+      "composition": "rule",
+      "terms": {
+        "condition": "IF requested_model задан и не найден среди session.services.models_manager.list_models(Offline) THEN 'Unknown model `{requested_model}` for spawn_agent. Available models: {comma-separated list}'",
+        "numbers": null,
+        "formula": null,
+        "gwt": {
+          "given": "requested_model = 'gpt-99', available = ['gpt-5-codex', 'gpt-4.1']",
+          "when": "find_spawn_agent_model_name(available, 'gpt-99')",
+          "then": "ошибка 'Unknown model `gpt-99` for spawn_agent. Available models: gpt-5-codex, gpt-4.1'"
+        }
+      }
+    },
+    {
+      "id": "SRC-0017/rule/reasoning-effort-must-be-supported",
+      "src": "SRC-0017",
+      "composition": "rule",
+      "terms": {
+        "condition": "IF requested_reasoning_effort не присутствует в supported_reasoning_levels целевой модели THEN 'Reasoning effort `{requested}` is not supported for model `{model}`. Supported reasoning efforts: {comma-separated list}'",
+        "numbers": null,
+        "formula": null,
+        "gwt": {
+          "given": "requested = high, supported = [low, medium]",
+          "when": "validate_spawn_agent_reasoning_effort",
+          "then": "ошибка 'Reasoning effort `high` is not supported for model `{m}`. Supported reasoning efforts: low, medium'"
+        }
+      }
+    },
+    {
+      "id": "SRC-0017/rule/spawn-feature-flags-at-depth",
+      "src": "SRC-0017",
+      "composition": "rule",
+      "terms": {
+        "condition": "В spawn-конфиге сабагента: IF child_depth >= config.agent_max_depth AND !config.features.enabled(Feature::MultiAgentV2) THEN выключить Feature::SpawnCsv и Feature::Collab. При включённом MultiAgentV2 эти feature flags НЕ отключаются, даже если глубина достигнута.",
+        "numbers": null,
+        "formula": "apply_spawn_agent_overrides(config, child_depth): if child_depth >= config.agent_max_depth && !MultiAgentV2 → disable(SpawnCsv), disable(Collab)",
+        "gwt": {
+          "given": "child_depth=3, agent_max_depth=3, MultiAgentV2 выключен",
+          "when": "apply_spawn_agent_overrides",
+          "then": "features.SpawnCsv = disabled; features.Collab = disabled у child config"
+        }
+      }
+    },
+    {
+      "id": "SRC-0017/rule/resume-requires-depth-budget",
+      "src": "SRC-0017",
+      "composition": "rule",
+      "terms": {
+        "condition": "Resume закрытого агента требует, чтобы новая глубина укладывалась в лимит: IF exceeds_thread_spawn_depth_limit(child_depth, turn.config.agent_max_depth) THEN 'Agent depth limit reached. Solve the task yourself.' (v1 resume_agent)",
+        "numbers": null,
+        "formula": null,
+        "gwt": {
+          "given": "resume запрашивается у агента, при этом next_thread_spawn_depth даёт child_depth > agent_max_depth",
+          "when": "resume_agent handler",
+          "then": "ошибка лимита глубины — resume не выполняется"
+        }
+      }
+    },
+    {
+      "id": "SRC-0017/rule/v2-close-root-forbidden",
+      "src": "SRC-0017",
+      "composition": "rule",
+      "terms": {
+        "condition": "V2 close_agent запрещает закрывать root agent: IF receiver.agent_path.is_some_and(AgentPath::is_root) THEN 'root is not a spawned agent'",
+        "numbers": null,
+        "formula": null,
+        "gwt": {
+          "given": "target разрешается в agent с path = root",
+          "when": "close_agent v2 handler после resolve_agent_target",
+          "then": "ошибка 'root is not a spawned agent'"
+        }
+      }
+    },
+    {
+      "id": "SRC-0017/rule/v2-followup-root-forbidden",
+      "src": "SRC-0017",
+      "composition": "rule",
+      "terms": {
+        "condition": "V2 TriggerTurn-доставка (followup_task) не разрешена для root agent: IF mode == TriggerTurn AND receiver.agent_path.is_some_and(AgentPath::is_root) THEN 'Tasks can't be assigned to the root agent'. send_message (QueueOnly) не выполняет эту проверку.",
+        "numbers": null,
+        "formula": null,
+        "gwt": {
+          "given": "receiver = root agent, вызов followup_task (TriggerTurn)",
+          "when": "handle_message_submission",
+          "then": "ошибка 'Tasks can't be assigned to the root agent'"
+        }
+      }
+    },
+    {
+      "id": "SRC-0017/rule/v2-message-receiver-path-required",
+      "src": "SRC-0017",
+      "composition": "rule",
+      "terms": {
+        "condition": "V2 handle_message_submission требует, чтобы у receiver был agent_path. IF receiver_agent.agent_path None THEN 'target agent is missing an agent_path'",
+        "numbers": null,
+        "formula": null,
+        "gwt": {
+          "given": "resolve_agent_target вернул ThreadId для агента без agent_path",
+          "when": "handle_message_submission пытается построить InterAgentCommunication",
+          "then": "ошибка 'target agent is missing an agent_path'"
+        }
+      }
+    },
+    {
+      "id": "SRC-0017/rule/v2-sender-path-root-fallback",
+      "src": "SRC-0017",
+      "composition": "rule",
+      "terms": {
+        "condition": "Sender agent_path в v2 сообщениях и в v2 spawn (если initial Op конвертируется в InterAgentCommunication) = turn.session_source.get_agent_path().unwrap_or(AgentPath::root). Root используется как fallback только для отправителя.",
+        "numbers": null,
+        "formula": null,
+        "gwt": {
+          "given": "родительский turn.session_source без agent_path (root-контекст)",
+          "when": "InterAgentCommunication::new строится",
+          "then": "sender = AgentPath::root; receiver = полученный path"
+        }
+      }
+    },
+    {
+      "id": "SRC-0017/rule/message-delivery-mode-trigger",
+      "src": "SRC-0017",
+      "composition": "rule",
+      "terms": {
+        "condition": "MessageDeliveryMode.apply(communication) принудительно выставляет InterAgentCommunication.trigger_turn: QueueOnly → false, TriggerTurn → true. Исходный trigger_turn всегда переопределяется. send_message использует QueueOnly, followup_task использует TriggerTurn.",
+        "numbers": null,
+        "formula": "out_communication.trigger_turn = (mode == TriggerTurn)",
+        "gwt": {
+          "given": "mode = QueueOnly, communication.trigger_turn = true (из InterAgentCommunication::new)",
+          "when": "mode.apply(communication)",
+          "then": "возвращённая коммуникация trigger_turn = false"
+        }
+      }
+    },
+    {
+      "id": "SRC-0017/rule/v2-spawn-op-upgrade-to-inter-agent",
+      "src": "SRC-0017",
+      "composition": "rule",
+      "terms": {
+        "condition": "V2 spawn: IF spawn_source.get_agent_path = Some(recipient) AND initial_operation = Op::UserInput с items где все match UserInput::Text THEN Op заменяется на Op::InterAgentCommunication с sender = parent_path||root, recipient, empty attachments, prompt, trigger_turn=true. Иначе Op остаётся UserInput.",
+          "numbers": null,
+        "formula": null,
+        "gwt": {
+          "given": "v2 spawn, task_name задан, message='run the test', recipient_path существует",
+          "when": "handler формирует вход для spawn_agent_with_metadata",
+          "then": "Op::InterAgentCommunication с sender=parent_path.or(root), recipient=<new_path>, prompt='run the test', trigger_turn=true"
+        }
+      }
+    },
+    {
+      "id": "SRC-0017/rule/v2-spawn-dev-instructions-append",
+      "src": "SRC-0017",
+      "composition": "rule",
+      "terms": {
+        "condition": "В v2 spawn перед запуском нового сабагента developer_instructions дополняются SPAWN_AGENT_DEVELOPER_INSTRUCTIONS (<spawned_agent_context> блок). Если existing_instructions уже есть — concat через DeveloperInstructions::concat; иначе — только новый блок.",
+        "numbers": null,
+        "formula": null,
+        "gwt": {
+          "given": "config.developer_instructions = Some('rules A'); SPAWN_AGENT_DEVELOPER_INSTRUCTIONS = '<spawned_agent_context>...</spawned_agent_context>'",
+          "when": "v2 spawn handler перед вызовом spawn_agent_with_metadata",
+          "then": "config.developer_instructions = DeveloperInstructions('rules A').concat(DeveloperInstructions('<spawned_agent_context>...')).into_text() — оба блока присутствуют"
+        }
+      }
+    },
+    {
+      "id": "SRC-0017/rule/v2-spawn-requires-task-name",
+      "src": "SRC-0017",
+      "composition": "rule",
+      "terms": {
+        "condition": "V2 spawn: после успешного spawn new_agent_path обязан существовать. IF agent_path None THEN 'spawned agent is missing a canonical task name'",
+        "numbers": null,
+        "formula": null,
+        "gwt": {
+          "given": "spawn_agent_with_metadata вернул агента без agent_path (snapshot и metadata без path)",
+          "when": "v2 handler формирует SpawnAgentResult",
+          "then": "ошибка 'spawned agent is missing a canonical task name'"
+        }
+      }
+    },
+    {
+      "id": "SRC-0017/rule/v2-hide-agent-metadata-flag",
+      "src": "SRC-0017",
+      "composition": "rule",
+      "terms": {
+        "condition": "V2 spawn результат: IF turn.config.multi_agent_v2.hide_spawn_agent_metadata THEN возвращать SpawnAgentResult::HiddenMetadata { task_name } (без nickname); ELSE SpawnAgentResult::WithNickname { task_name, nickname }.",
+        "numbers": null,
+        "formula": null,
+        "gwt": {
+          "given": "config.multi_agent_v2.hide_spawn_agent_metadata = true; nickname = Some('Alice')",
+          "when": "v2 spawn handler finalize",
+          "then": "SpawnAgentResult::HiddenMetadata { task_name = '<computed path>' } — nickname не возвращается"
+        }
+      }
+    },
+    {
+      "id": "SRC-0017/rule/instruction-template-render",
+      "src": "SRC-0017",
+      "composition": "rule",
+      "terms": {
+        "condition": "render_instruction_template(instruction, row_json): literal '{{' и '}}' в instruction сохраняются как '{' и '}' (через sentinel). Плейсхолдеры '{column}' заменяются значением row[column]: если row_json[column] — строка, то подставляется raw string; иначе value.to_string() (JSON-репрезентация). Если row_json не object — возвращается исходная строка с восстановленными скобками без подстановок.",
+        "numbers": null,
+        "formula": "render = instruction.replace('{{', S1).replace('}}', S2); for (k,v) in row: render = render.replace('{'+k+'}', v.as_str() ?? v.to_string()); render.replace(S1, '{').replace(S2, '}')",
+        "gwt": {
+          "given": "instruction = 'Hello {name}! Schema: {{metadata}}', row_json = {'name': 'Ada', 'age': 36}",
+          "when": "render_instruction_template",
+          "then": "'Hello Ada! Schema: {metadata}'"
+        }
+      }
+    },
+    {
+      "id": "SRC-0017/rule/csv-headers-unique",
+      "src": "SRC-0017",
+      "composition": "rule",
+      "terms": {
+        "condition": "Все headers в CSV должны быть уникальны. Дубликат → 'csv header {header} is duplicated'",
+        "numbers": null,
+        "formula": null,
+        "gwt": {
+          "given": "headers = ['id', 'name', 'id']",
+          "when": "ensure_unique_headers(headers)",
+          "then": "FunctionCallError::RespondToModel('csv header id is duplicated')"
+        }
+      }
+    },
+    {
+      "id": "SRC-0017/rule/csv-headers-non-empty",
+      "src": "SRC-0017",
+      "composition": "rule",
+      "terms": {
+        "condition": "CSV input должен включать header row: IF headers.is_empty() THEN 'csv input must include a header row'",
+        "numbers": null,
+        "formula": null,
+        "gwt": {
+          "given": "пустой CSV файл (нет хедера)",
+          "when": "spawn_agents_on_csv после parse_csv",
+          "then": "ошибка 'csv input must include a header row'"
+        }
+      }
+    },
+    {
+      "id": "SRC-0017/rule/csv-row-width-match",
+      "src": "SRC-0017",
+      "composition": "rule",
+      "terms": {
+        "condition": "Каждая строка CSV должна содержать ровно столько полей, сколько хедеров. IF row.len() != headers.len() THEN 'csv row {row_index+2} has {row_len} fields but header has {header_len}'. Row index в ошибке включает header-ряд (idx+2).",
+        "numbers": [
+          {"value": 2, "kind": "offset", "name": "row_index displayed = idx + 2 (учитывает header как строку 1)"}
+        ],
+        "formula": "displayed_row_index = idx + 2; reject_if row.len() != headers.len()",
+        "gwt": {
+          "given": "headers = ['id', 'name', 'email'] (len=3); вторая data-строка (idx=1) = ['42', 'John']",
+          "when": "spawn_agents_on_csv строит items",
+          "then": "ошибка 'csv row 3 has 2 fields but header has 3'"
+        }
+      }
+    },
+    {
+      "id": "SRC-0017/rule/csv-id-column-exists",
+      "src": "SRC-0017",
+      "composition": "rule",
+      "terms": {
+        "condition": "IF args.id_column задан и не найден в headers THEN 'id_column {column_name} was not found in csv headers'",
+        "numbers": null,
+        "formula": null,
+        "gwt": {
+          "given": "args.id_column = 'ticket_id'; headers = ['id', 'title']",
+          "when": "spawn_agents_on_csv резолвит id_column_index",
+          "then": "ошибка 'id_column ticket_id was not found in csv headers'"
+        }
+      }
+    },
+    {
+      "id": "SRC-0017/rule/csv-item-id-uniqueness-suffix",
+      "src": "SRC-0017",
+      "composition": "rule",
+      "terms": {
+        "condition": "Item_id уникален внутри job. Base_item_id = source_id (если id_column задан и ячейка непуста после trim) или 'row-{row_index+1}'. При дубликате base_item_id в строках — к повторам прибавляется '-2', '-3', ... (saturating_add) до уникальности (проверка через HashSet).",
+        "numbers": [
+          {"value": 2, "kind": "start", "name": "suffix стартует с 2"},
+          {"value": 1, "kind": "offset", "name": "row_index displayed = idx + 1 в base_item_id"}
+        ],
+        "formula": "base_item_id = source_id.filter(|s| !s.trim().is_empty()).unwrap_or_else(|| 'row-{idx+1}'); item_id = base; suffix = 2; while seen.contains(item_id): item_id = '{base}-{suffix}'; suffix = saturating_add(1)",
+        "gwt": {
+          "given": "id_column='id', rows = [{id:'A'},{id:'B'},{id:'A'},{id:'  '}]",
+          "when": "spawn_agents_on_csv генерирует item_id",
+          "then": "item_ids = ['A', 'B', 'A-2', 'row-4']"
+        }
+      }
+    },
+    {
+      "id": "SRC-0017/rule/instruction-non-empty",
+      "src": "SRC-0017",
+      "composition": "rule",
+      "terms": {
+        "condition": "IF args.instruction.trim().is_empty() THEN 'instruction must be non-empty' (spawn_agents_on_csv)",
+        "numbers": null,
+        "formula": null,
+        "gwt": {
+          "given": "args.instruction = '   '",
+          "when": "spawn_agents_on_csv.handle",
+          "then": "ошибка 'instruction must be non-empty'"
+        }
+      }
+    },
+    {
+      "id": "SRC-0017/rule/max-runtime-seconds-ge-1",
+      "src": "SRC-0017",
+      "composition": "rule",
+      "terms": {
+        "condition": "IF args.max_runtime_seconds = Some(0) THEN 'max_runtime_seconds must be >= 1'. None пропускается без ошибки и приводит к fallback DEFAULT_AGENT_JOB_ITEM_TIMEOUT (1800 секунд).",
+        "numbers": [
+          {"value": 0, "kind": "boundary", "name": "max_runtime_seconds reject threshold"},
+          {"value": 1, "kind": "minimum", "name": "минимально допустимое значение"},
+          {"value": 1800, "kind": "default", "name": "fallback DEFAULT_AGENT_JOB_ITEM_TIMEOUT (сек) = 30 * 60"}
+        ],
+        "formula": "normalized = match requested: None → None; Some(0) → reject; Some(n) → Some(n) where n >= 1. При использовании в цикле: runtime_timeout = job.max_runtime_seconds.map(Duration::from_secs).unwrap_or(1800s)",
+        "gwt": {
+          "given": "args.max_runtime_seconds = 0",
+          "when": "normalize_max_runtime_seconds",
+          "then": "ошибка 'max_runtime_seconds must be >= 1'"
+        }
+      }
+    },
+    {
+      "id": "SRC-0017/rule/job-runtime-timeout-default",
+      "src": "SRC-0017",
+      "composition": "rule",
+      "terms": {
+        "condition": "Per-item runtime timeout = job.max_runtime_seconds (секунды) если задан; иначе DEFAULT_AGENT_JOB_ITEM_TIMEOUT = 1800 секунд (30 минут). Этот таймаут применяется и в is_item_stale (recover), и в reap_stale_active_items (live).",
+        "numbers": [
+          {"value": 1800, "kind": "default", "name": "DEFAULT_AGENT_JOB_ITEM_TIMEOUT (сек) = 60*30"}
+        ],
+        "formula": "runtime_timeout = job.max_runtime_seconds.map(Duration::from_secs).unwrap_or(Duration::from_secs(1800))",
+        "gwt": {
+          "given": "AgentJob с max_runtime_seconds = None",
+          "when": "job_runtime_timeout(job)",
+          "then": "Duration::from_secs(1800) = 30 минут"
+        }
+      }
+    },
+    {
+      "id": "SRC-0017/rule/is-item-stale",
+      "src": "SRC-0017",
+      "composition": "rule",
+      "terms": {
+        "condition": "AgentJobItem считается stale если (chrono::Utc::now() - item.updated_at).to_std() Ok и age >= runtime_timeout. Если duration Err (updated_at в будущем) — не stale.",
+        "numbers": null,
+        "formula": "is_stale = match (now - item.updated_at).to_std(): Ok(age) → age >= runtime_timeout; Err(_) → false",
+        "gwt": {
+          "given": "item.updated_at = now - 31 мин, runtime_timeout = 30 мин (1800s)",
+          "when": "is_item_stale(item, runtime_timeout)",
+          "then": "true — item будет помечен Failed в recover_running_items"
+        }
+      }
+    },
+    {
+      "id": "SRC-0017/rule/reap-stale-active-items",
+      "src": "SRC-0017",
+      "composition": "rule",
+      "terms": {
+        "condition": "В run-loop: для каждого ActiveJobItem если item.started_at.elapsed() >= runtime_timeout — пометить item Failed с 'worker exceeded max runtime of {runtime_timeout:?}', shutdown_live_agent и удалить из active_items.",
+        "numbers": null,
+        "formula": "stale_iff elapsed_since_started >= runtime_timeout",
+        "gwt": {
+          "given": "ActiveJobItem.started_at = 35 мин назад, runtime_timeout = 1800s (30 мин)",
+          "when": "reap_stale_active_items",
+          "then": "item помечен Failed с 'worker exceeded max runtime of 1800s'; worker shutdown; запись удалена из active_items"
+        }
+      }
+    },
+    {
+      "id": "SRC-0017/rule/concurrency-normalization",
+      "src": "SRC-0017",
+      "composition": "rule",
+      "terms": {
+        "condition": "max_concurrency для AgentJob loop: min(max(requested.unwrap_or(16), 1), 64, max(agent_max_threads, 1) если задан). Default=16 (DEFAULT_AGENT_JOB_CONCURRENCY), cap=64 (MAX_AGENT_JOB_CONCURRENCY).",
+        "numbers": [
+          {"value": 16, "kind": "default", "name": "DEFAULT_AGENT_JOB_CONCURRENCY"},
+          {"value": 64, "kind": "cap", "name": "MAX_AGENT_JOB_CONCURRENCY"},
+          {"value": 1, "kind": "floor", "name": "минимальная concurrency"}
+        ],
+        "formula": "req1 = requested.unwrap_or(16).max(1); req2 = req1.min(64); result = match agent_max_threads: Some(t) → req2.min(t.max(1)); None → req2",
+        "gwt": {
+          "given": "requested=None, agent_max_threads=Some(8)",
+          "when": "normalize_concurrency(None, Some(8))",
+          "then": "req1 = max(16, 1) = 16; req2 = min(16, 64) = 16; result = min(16, max(8,1)) = 8"
+        }
+      }
+    },
+    {
+      "id": "SRC-0017/rule/concurrency-parameter-aliasing",
+      "src": "SRC-0017",
+      "composition": "rule",
+      "terms": {
+        "condition": "В spawn_agents_on_csv requested concurrency берётся как args.max_concurrency.or(args.max_workers). Т.е. max_workers работает как alias, но только если max_concurrency отсутствует.",
+        "numbers": null,
+        "formula": "requested = args.max_concurrency.or(args.max_workers)",
+        "gwt": {
+          "given": "args = { max_concurrency: None, max_workers: Some(20) }",
+          "when": "spawn_agents_on_csv определяет requested_concurrency",
+          "then": "requested = Some(20)"
+        }
+      }
+    },
+    {
+      "id": "SRC-0017/rule/result-must-be-json-object",
+      "src": "SRC-0017",
+      "composition": "rule",
+      "terms": {
+        "condition": "report_agent_job_result: IF !args.result.is_object() THEN 'result must be a JSON object'",
+        "numbers": null,
+        "formula": null,
+        "gwt": {
+          "given": "args.result = JSON Array [1,2,3]",
+          "when": "report_agent_job_result handler",
+          "then": "ошибка 'result must be a JSON object'"
+        }
+      }
+    },
+    {
+      "id": "SRC-0017/rule/report-cancels-job-on-stop",
+      "src": "SRC-0017",
+      "composition": "rule",
+      "terms": {
+        "condition": "report_agent_job_result: IF db.report_agent_job_item_result вернул accepted=true AND args.stop.unwrap_or(false)=true THEN db.mark_agent_job_cancelled(job_id, 'cancelled by worker request'). Если accepted=false — cancel НЕ выполняется даже при stop=true.",
+        "numbers": null,
+        "formula": null,
+        "gwt": {
+          "given": "args = { job_id: 'J1', item_id: 'I1', result: {...}, stop: Some(true) }; accepted = true",
+          "when": "report_agent_job_result handler",
+          "then": "mark_agent_job_cancelled('J1', 'cancelled by worker request'); ошибка из cancel игнорируется (let _ =); accepted:true возвращается"
+        }
+      }
+    },
+    {
+      "id": "SRC-0017/rule/state-db-required",
+      "src": "SRC-0017",
+      "composition": "rule",
+      "terms": {
+        "condition": "Оба CSV-job tool (spawn_agents_on_csv, report_agent_job_result) требуют session.state_db(). IF None THEN Fatal 'sqlite state db is unavailable for this session'. Это Fatal (не RespondToModel) — сессия не может продолжить.",
+        "numbers": null,
+        "formula": null,
+        "gwt": {
+          "given": "Session без state_db",
+          "when": "BatchJobHandler.handle → required_state_db(session)",
+          "then": "FunctionCallError::Fatal('sqlite state db is unavailable for this session')"
+        }
+      }
+    },
+    {
+      "id": "SRC-0017/rule/progress-emit-gating",
+      "src": "SRC-0017",
+      "composition": "rule",
+      "terms": {
+        "condition": "JobProgressEmitter.maybe_emit публикует событие ТОЛЬКО ЕСЛИ: force=true ИЛИ processed (=completed+failed) изменилось ИЛИ failed_items изменилось ИЛИ с прошлого emit прошло >= PROGRESS_EMIT_INTERVAL (1s). Иначе — no-op.",
+        "numbers": [
+          {"value": 1, "kind": "threshold", "name": "PROGRESS_EMIT_INTERVAL (секунд)"}
+        ],
+        "formula": "should_emit = force || processed != last_processed || failed_items != last_failed || last_emit_at.elapsed() >= 1s",
+        "gwt": {
+          "given": "force=false, processed=last_processed, failed=last_failed, с прошлого emit прошло 500ms",
+          "when": "maybe_emit",
+          "then": "should_emit=false → no-op, last_emit_at не меняется"
+        }
+      }
+    },
+    {
+      "id": "SRC-0017/rule/eta-formula",
+      "src": "SRC-0017",
+      "composition": "rule",
+      "terms": {
+        "condition": "eta_seconds вычисляется ТОЛЬКО если processed>0 и elapsed>0: rate = processed/elapsed; если rate>0 → Some((remaining/rate).round() as u64); иначе None. remaining = saturating_sub(total_items, processed).",
+        "numbers": null,
+        "formula": "eta_seconds = if processed>0 && elapsed>0: let rate = processed/elapsed; if rate>0 Some((remaining/rate).round() as u64) else None; else None; where remaining = total_items.saturating_sub(processed), elapsed = started_at.elapsed().as_secs_f64()",
+        "gwt": {
+          "given": "total_items=100, processed=20, elapsed=60.0s",
+          "when": "maybe_emit вычисляет eta",
+          "then": "rate = 20/60 ≈ 0.333; remaining=80; eta = round(80/0.333) = round(240.24) = 240 сек"
+        }
+      }
+    },
+    {
+      "id": "SRC-0017/rule/status-poll-interval",
+      "src": "SRC-0017",
+      "composition": "rule",
+      "terms": {
+        "condition": "В v1 agent_jobs run-loop: если нет status subscriptions — sleep STATUS_POLL_INTERVAL; иначе timeout(STATUS_POLL_INTERVAL, waiters.next()). STATUS_POLL_INTERVAL = 250 миллисекунд.",
+        "numbers": [
+          {"value": 250, "kind": "interval", "name": "STATUS_POLL_INTERVAL (миллисекунд)"}
+        ],
+        "formula": null,
+        "gwt": {
+          "given": "active_items = 0 waiters (все без status_rx), нет finished",
+          "when": "wait_for_status_change",
+          "then": "tokio::time::sleep(Duration::from_millis(250))"
+        }
+      }
+    },
+    {
+      "id": "SRC-0017/rule/finalize-completion-vs-missing-result",
+      "src": "SRC-0017",
+      "composition": "rule",
+      "terms": {
+        "condition": "finalize_finished_item: если item.status == Running — IF item.result_json.is_some() THEN mark_agent_job_item_completed; ELSE mark_agent_job_item_failed('worker finished without calling report_agent_job_result'). После — всегда shutdown_live_agent(thread_id).",
+        "numbers": null,
+        "formula": null,
+        "gwt": {
+          "given": "worker-сабагент достиг финального статуса, но result_json=None (никогда не вызвал report_agent_job_result)",
+          "when": "finalize_finished_item",
+          "then": "item помечен Failed с 'worker finished without calling report_agent_job_result'; shutdown_live_agent"
+        }
+      }
+    },
+    {
+      "id": "SRC-0017/rule/recover-running-items-rescue",
+      "src": "SRC-0017",
+      "composition": "rule",
+      "terms": {
+        "condition": "recover_running_items: IF item stale → Failed + shutdown if assigned_thread_id парсится; IF assigned_thread_id None → Failed('running item is missing assigned_thread_id'); IF parse Err → Failed('invalid assigned_thread_id: {err:?}'); IF get_status.is_final → finalize_finished_item; ELSE вставить в active_items с subscribe_status.ok().",
+        "numbers": null,
+        "formula": null,
+        "gwt": {
+          "given": "Running item с assigned_thread_id = Some('abc-invalid')",
+          "when": "recover_running_items и ThreadId::from_string('abc-invalid') Err",
+          "then": "mark_agent_job_item_failed('invalid assigned_thread_id: ...') — повторного спавна не произойдёт"
+        }
+      }
+    },
+    {
+      "id": "SRC-0017/rule/spawn-worker-agent-limit-retry",
+      "src": "SRC-0017",
+      "composition": "rule",
+      "terms": {
+        "condition": "В run-loop при спавне воркера: IF spawn_agent → CodexErr::AgentLimitReached → db.mark_agent_job_item_pending(job_id, item_id, error_message=None) и прекратить spawn цикла текущей итерации (break); IF иная ошибка → mark_agent_job_item_failed('failed to spawn worker: {err}'); IF Ok но mark_agent_job_item_running_with_thread вернул !assigned → shutdown_live_agent(thread_id) и continue (race).",
+        "numbers": null,
+        "formula": null,
+        "gwt": {
+          "given": "Pending item, spawn_agent вернул CodexErr::AgentLimitReached",
+          "when": "run-loop spawn блок",
+          "then": "item возвращается в Pending без error; break — слоты на этой итерации больше не заполняются"
+        }
+      }
+    },
+    {
+      "id": "SRC-0017/rule/worker-spawn-session-source",
+      "src": "SRC-0017",
+      "composition": "rule",
+      "terms": {
+        "condition": "CSV worker-сабагент спавнится с SessionSource::SubAgent(SubAgentSource::Other(format!('agent_job:{job_id}'))). Т.е. CSV-воркеры отличаются от обычных v1/v2 спавнов, у которых источник — ThreadSpawn { parent_thread_id, depth, agent_path, ... }.",
+        "numbers": null,
+        "formula": null,
+        "gwt": {
+          "given": "job_id = 'abcd1234-...'",
+          "when": "run-loop spawn для Pending item",
+          "then": "agent_control.spawn_agent(..., Some(SessionSource::SubAgent(SubAgentSource::Other('agent_job:abcd1234-...'))))"
+        }
+      }
+    },
+    {
+      "id": "SRC-0017/rule/default-output-csv-path",
+      "src": "SRC-0017",
+      "composition": "rule",
+      "terms": {
+        "condition": "Если args.output_csv_path не задан — default = <input_dir>/<input_stem>.agent-job-<first 8 chars of job_id>.csv. Если file_stem отсутствует — stem='agent_job_output'. Если parent отсутствует — использовать сам input как parent.",
+        "numbers": [
+          {"value": 8, "kind": "length", "name": "job_suffix — первые 8 символов job_id (UUID)"}
+        ],
+        "formula": "stem = input.file_stem().to_str().unwrap_or('agent_job_output'); parent = input.parent().unwrap_or(input); default_path = parent.join('{stem}.agent-job-{first 8 of job_id}.csv')",
+        "gwt": {
+          "given": "input = '/data/tasks.csv', job_id = 'abcd1234-ef56-...'",
+          "when": "default_output_csv_path(input, job_id)",
+          "then": "'/data/tasks.agent-job-abcd1234.csv'"
+        }
+      }
+    },
+    {
+      "id": "SRC-0017/rule/job-name-from-id",
+      "src": "SRC-0017",
+      "composition": "rule",
+      "terms": {
+        "condition": "AgentJob.name = 'agent-job-<first 8 chars of job_id>'. Job_id генерируется через Uuid::new_v4().to_string().",
+        "numbers": [
+          {"value": 8, "kind": "length", "name": "суффикс job_id"}
+        ],
+        "formula": "job_name = format!('agent-job-{}', &job_id[..8])",
+        "gwt": {
+          "given": "job_id = '3b9d4a8e-5c2f-4a1b-9c0d-7e6b5a4f3c2d'",
+          "when": "spawn_agents_on_csv перед create_agent_job",
+          "then": "job_name = 'agent-job-3b9d4a8e'"
+        }
+      }
+    },
+    {
+      "id": "SRC-0017/rule/csv-export-columns",
+      "src": "SRC-0017",
+      "composition": "rule",
+      "terms": {
+        "condition": "Output CSV содержит input_headers в исходном порядке + фиксированную последовательность из 10 служебных колонок: ['job_id','item_id','row_index','source_id','status','attempt_count','last_error','result_json','reported_at','completed_at']. Значения NULL/None сериализуются в пустую ячейку. datetime значения — в RFC3339.",
+        "numbers": [
+          {"value": 10, "kind": "count", "name": "число служебных колонок после input_headers"}
+        ],
+        "formula": "output_headers = input_headers ++ ['job_id','item_id','row_index','source_id','status','attempt_count','last_error','result_json','reported_at','completed_at']",
+        "gwt": {
+          "given": "input_headers = ['id','text']; item = { item_id='A', job_id='J', row_index=0, source_id=Some('A'), status=Completed, attempt_count=1, last_error=None, result_json=Some({ok:true}), reported_at=Some(2026-04-16T10:00:00Z), completed_at=Some(2026-04-16T10:00:05Z), row_json={id:'A', text:'hi'} }",
+          "when": "render_job_csv",
+          "then": "header row = 'id,text,job_id,item_id,row_index,source_id,status,attempt_count,last_error,result_json,reported_at,completed_at'\\n; data row = 'A,hi,J,A,0,A,Completed,1,,{\"ok\":true},2026-04-16T10:00:00+00:00,2026-04-16T10:00:05+00:00'"
+        }
+      }
+    },
+    {
+      "id": "SRC-0017/rule/csv-escape",
+      "src": "SRC-0017",
+      "composition": "rule",
+      "terms": {
+        "condition": "csv_escape(value): IF value содержит ',' OR '\\n' OR '\\r' OR '\"' THEN заменить '\"' на '\"\"' и обернуть строку в '\"'; ELSE вернуть как есть.",
+        "numbers": null,
+        "formula": "escape = if value ∋ {',', '\\n', '\\r', '\"'}: '\"' + value.replace('\"', '\"\"') + '\"'; else value",
+        "gwt": {
+          "given": "value = 'hello, \"world\"'",
+          "when": "csv_escape",
+          "then": "'\"hello, \"\"world\"\"\"'"
+        }
+      }
+    },
+    {
+      "id": "SRC-0017/rule/value-to-csv-string",
+      "src": "SRC-0017",
+      "composition": "rule",
+      "terms": {
+        "condition": "value_to_csv_string(Value): Null → ''; String(s) → s (raw); Bool → 'true'/'false'; Number → to_string; Array/Object → serde_json сериализация (value.to_string()). Применяется при экспорте row_json в CSV.",
+        "numbers": null,
+        "formula": "match Value: Null → ''; String(s) → s; Bool(b) → b.to_string(); Number(n) → n.to_string(); Array|Object → Value.to_string() (JSON)",
+        "gwt": {
+          "given": "value = Value::Object({'k':'v'})",
+          "when": "value_to_csv_string(value)",
+          "then": "'{\"k\":\"v\"}'"
+        }
+      }
+    },
+    {
+      "id": "SRC-0017/rule/bom-trim-first-header",
+      "src": "SRC-0017",
+      "composition": "rule",
+      "terms": {
+        "condition": "parse_csv: первый header из CSV-reader очищается от BOM — trim_start_matches('\\u{feff}'). Остальные headers не модифицируются.",
+        "numbers": null,
+        "formula": "headers[0] = headers[0].trim_start_matches('\\u{feff}').to_string()",
+        "gwt": {
+          "given": "CSV начинается с BOM: '\\u{feff}id,name\\n1,Alice'",
+          "when": "parse_csv",
+          "then": "headers = ['id', 'name'] — BOM удалён"
+        }
+      }
+    },
+    {
+      "id": "SRC-0017/rule/parse-csv-skip-empty-rows",
+      "src": "SRC-0017",
+      "composition": "rule",
+      "terms": {
+        "condition": "parse_csv пропускает записи, у которых ВСЕ ячейки пустые (row.iter().all(|s| s.is_empty())).",
+        "numbers": null,
+        "formula": null,
+        "gwt": {
+          "given": "CSV = 'id,name\\n1,A\\n,\\n2,B'",
+          "when": "parse_csv",
+          "then": "rows = [['1','A'], ['2','B']] — вторая (полностью пустая) пропущена"
+        }
+      }
+    },
+    {
+      "id": "SRC-0017/rule/failed-summary-limit",
+      "src": "SRC-0017",
+      "composition": "rule",
+      "terms": {
+        "condition": "В итоговом SpawnAgentsOnCsvResult.failed_item_errors — максимум 5 записей (db.list_agent_job_items(..., Failed, Some(5))). Пустые last_error фильтруются. Если failed_items>0 но все last_error пустые — job_error получает fallback 'agent job has failed items but no error details were recorded' (если job_error всё ещё None).",
+        "numbers": [
+          {"value": 5, "kind": "limit", "name": "лимит failed_item_errors в ответе"}
+        ],
+        "formula": null,
+        "gwt": {
+          "given": "progress.failed_items = 7; list_agent_job_items(Failed, Some(5)) = 5 items, все с last_error = ''",
+          "when": "финализация SpawnAgentsOnCsvResult",
+          "then": "failed_item_errors = None; job_error = Some('agent job has failed items but no error details were recorded') если не было job.last_error"
+        }
+      }
+    },
+    {
+      "id": "SRC-0017/rule/build-wait-statuses-ordering",
+      "src": "SRC-0017",
+      "composition": "rule",
+      "terms": {
+        "condition": "build_wait_agent_statuses (v1 wait): 1) для каждого receiver_agent в порядке входного списка — если его thread_id есть в statuses map, добавить CollabAgentStatusEntry с nickname/role из receiver_agent; 2) extras = ids из statuses не в seen; сортировать по thread_id.to_string(); добавить с nickname=None, role=None.",
+        "numbers": null,
+        "formula": "entries = receiver_agents.filter(|a| statuses.contains_key(&a.thread_id)).map_with_metadata(statuses); extras = statuses.keys().filter(!seen).sort_by(thread_id.to_string()); output = entries ++ extras",
+        "gwt": {
+          "given": "receiver_agents = [A(thread='t2'), B(thread='t1')], statuses = {t1: X, t2: Y, t3: Z}",
+          "when": "build_wait_agent_statuses",
+          "then": "output = [Entry{t2,A,Y}, Entry{t1,B,X}, Entry{t3, None, None, Z}] — входной порядок receiver_agents сохранён, extras добавлены в конце с сортировкой по string"
+        }
+      }
+    },
+    {
+      "id": "SRC-0017/rule/wait-v1-first-final-then-drain",
+      "src": "SRC-0017",
+      "composition": "rule",
+      "terms": {
+        "condition": "v1 wait: если нет initial_final_statuses — стартуем FuturesUnordered wait_for_final_status. Ждём первый финальный через timeout_at(deadline, futures.next()). После получения первого — собираем оставшиеся уже готовые через futures.next().now_or_never() (без блокировки). Таймаут или пустой stream завершают сбор.",
+        "numbers": null,
+        "formula": null,
+        "gwt": {
+          "given": "3 агентов, deadline через 30s; агент A становится final на 5s, B — на 6s; C не становится final",
+          "when": "v1 wait loop",
+          "then": "results содержит A (5s timeout_at), затем B (now_or_never сразу после), C пропущен (not finalized). timed_out=false, status map = {A: status, B: status}"
+        }
+      }
+    },
+    {
+      "id": "SRC-0017/rule/wait-target-display",
+      "src": "SRC-0017",
+      "composition": "rule",
+      "terms": {
+        "condition": "В v1 wait результат: ключ в status map = agent_metadata.agent_path (если есть, конвертированный в String) ИЛИ receiver_thread_id.to_string() (fallback).",
+        "numbers": null,
+        "formula": "target_display = metadata.agent_path.as_ref().map(ToString::to_string).unwrap_or_else(|| receiver_thread_id.to_string())",
+        "gwt": {
+          "given": "receiver_thread_id='t1', metadata.agent_path = Some('tasks/review')",
+          "when": "v1 wait собирает result",
+          "then": "status key = 'tasks/review', не 't1'"
+        }
+      }
+    },
+    {
+      "id": "SRC-0017/rule/wait-v1-threadnotfound-soft",
+      "src": "SRC-0017",
+      "composition": "rule",
+      "terms": {
+        "condition": "v1 wait: IF subscribe_status вернул CodexErr::ThreadNotFound(_) THEN добавить (id, AgentStatus::NotFound) в initial_final_statuses (не fatal). Другие CodexErr — fatal: эмитить CollabWaitingEndEvent и вернуть collab_agent_error.",
+        "numbers": null,
+        "formula": null,
+        "gwt": {
+          "given": "targets=[t1,t2], subscribe_status(t1) Err(ThreadNotFound(t1))",
+          "when": "v1 wait инициализация rxs",
+          "then": "initial_final_statuses += (t1, NotFound); продолжаем с t2"
+        }
+      }
+    },
+    {
+      "id": "SRC-0017/rule/send-input-interrupt-then-send",
+      "src": "SRC-0017",
+      "composition": "rule",
+      "terms": {
+        "condition": "send_input v1: если args.interrupt=true — agent_control.interrupt_agent выполняется ДО emit Interaction Begin и до send_input. Если interrupt_agent Err — ранний возврат с collab_agent_error (Interaction End НЕ эмитится). send_input потом возвращает submission_id.",
+        "numbers": null,
+        "formula": null,
+        "gwt": {
+          "given": "interrupt=true, interrupt_agent Err",
+          "when": "send_input v1 handler",
+          "then": "возврат ошибки без CollabAgentInteractionEndEvent"
+        }
+      }
+    },
+    {
+      "id": "SRC-0017/rule/collab-error-classification",
+      "src": "SRC-0017",
+      "composition": "rule",
+      "terms": {
+        "condition": "collab_agent_error(agent_id, err) маппит ошибки: CodexErr::ThreadNotFound(id) → 'agent with id {id} not found'; CodexErr::InternalAgentDied → 'agent with id {agent_id} is closed'; CodexErr::UnsupportedOperation(_) → 'collab manager unavailable'; иное → 'collab tool failed: {err}'. collab_spawn_error(err): CodexErr::UnsupportedOperation('thread manager dropped') → 'collab manager unavailable'; CodexErr::UnsupportedOperation(msg) → msg; иное → 'collab spawn failed: {err}'.",
+        "numbers": null,
+        "formula": null,
+        "gwt": {
+          "given": "err = CodexErr::InternalAgentDied, agent_id = 't42'",
+          "when": "collab_agent_error(t42, err)",
+          "then": "FunctionCallError::RespondToModel('agent with id t42 is closed')"
+        }
+      }
+    },
+    {
+      "id": "SRC-0017/rule/telemetry-spawn-counter",
+      "src": "SRC-0017",
+      "composition": "rule",
+      "terms": {
+        "condition": "Успешный spawn (v1 и v2) инкрементит session_telemetry counter 'codex.multi_agent.spawn' на 1 с тегом 'role' = role_name или DEFAULT_ROLE_NAME (если роль не задана).",
+        "numbers": [
+          {"value": 1, "kind": "increment", "name": "прирост счётчика на один spawn"}
+        ],
+        "formula": null,
+        "gwt": {
+          "given": "v1 spawn успешен, role_name = None",
+          "when": "конец handle",
+          "then": "counter('codex.multi_agent.spawn', 1, [('role', DEFAULT_ROLE_NAME)])"
+        }
+      }
+    },
+    {
+      "id": "SRC-0017/rule/telemetry-resume-counter",
+      "src": "SRC-0017",
+      "composition": "rule",
+      "terms": {
+        "condition": "Успешный resume_agent v1 инкрементит session_telemetry counter 'codex.multi_agent.resume' на 1 (без тегов).",
+        "numbers": [
+          {"value": 1, "kind": "increment", "name": "прирост счётчика на один resume"}
+        ],
+        "formula": null,
+        "gwt": {
+          "given": "resume_agent успешно завершился",
+          "when": "конец handle",
+          "then": "counter('codex.multi_agent.resume', 1, [])"
+        }
+      }
+    },
+    {
+      "id": "SRC-0017/rule/runtime-overrides-policy",
+      "src": "SRC-0017",
+      "composition": "rule",
+      "terms": {
+        "condition": "apply_spawn_agent_runtime_overrides копирует в child Config: approval_policy (через .set), shell_environment_policy, codex_linux_sandbox_exe, cwd, sandbox_policy (через .set), file_system_sandbox_policy, network_sandbox_policy — из живого turn. set вернул Err → 'approval_policy is invalid: {err}' / 'sandbox_policy is invalid: {err}'. Эти значения НЕЛЬЗЯ оставлять stale из родительского Config.",
+        "numbers": null,
+        "formula": null,
+        "gwt": {
+          "given": "turn.approval_policy = 'new_strict', child.config.approval_policy.set отклонил значение",
+          "when": "apply_spawn_agent_runtime_overrides",
+          "then": "ошибка 'approval_policy is invalid: {err}'"
+        }
+      }
+    },
+    {
+      "id": "SRC-0017/rule/resume-config-base-instructions-none",
+      "src": "SRC-0017",
+      "composition": "rule",
+      "terms": {
+        "condition": "build_agent_resume_config: base_instructions = None (в отличие от build_agent_spawn_config, где base_instructions = session.get_base_instructions().text). Для resume base_instructions берутся из rollout/session metadata.",
+        "numbers": null,
+        "formula": null,
+        "gwt": {
+          "given": "try_resume_closed_agent готовит Config",
+          "when": "build_agent_resume_config",
+          "then": "config.base_instructions = None; apply_spawn_agent_overrides применён"
+        }
+      }
+    },
+    {
+      "id": "SRC-0017/rule/spawn-config-effective-values",
+      "src": "SRC-0017",
+      "composition": "rule",
+      "terms": {
+        "condition": "build_agent_shared_config (база для spawn и resume): config.model = turn.model_info.slug; config.model_provider = turn.provider; config.model_reasoning_effort = turn.reasoning_effort ?? turn.model_info.default_reasoning_level; config.model_reasoning_summary = Some(turn.reasoning_summary); developer_instructions и compact_prompt копируются из turn. Затем apply_spawn_agent_runtime_overrides.",
+        "numbers": null,
+        "formula": "reasoning_effort = turn.reasoning_effort.or(turn.model_info.default_reasoning_level)",
+        "gwt": {
+          "given": "turn.reasoning_effort=None, turn.model_info.default_reasoning_level=Some(medium)",
+          "when": "build_agent_shared_config",
+          "then": "config.model_reasoning_effort = Some(medium)"
+        }
+      }
+    },
+    {
+      "id": "SRC-0017/rule/model-override-reasoning-default",
+      "src": "SRC-0017",
+      "composition": "rule",
+      "terms": {
+        "condition": "Если указан новый model (requested_model), но НЕ указан reasoning_effort — config.model_reasoning_effort становится selected_model_info.default_reasoning_level (даже если раньше было значение). Если указан только reasoning_effort (без model) — валидируется против текущей turn.model_info.supported_reasoning_levels и применяется к config.",
+        "numbers": null,
+        "formula": null,
+        "gwt": {
+          "given": "requested_model='gpt-4.1', requested_reasoning_effort=None, selected_model_info.default_reasoning_level=Some(low)",
+          "when": "apply_requested_spawn_agent_model_overrides",
+          "then": "config.model = Some('gpt-4.1'); config.model_reasoning_effort = Some(low)"
+        }
+      }
+    }
+  ]
+}

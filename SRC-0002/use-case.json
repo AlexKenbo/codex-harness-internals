@@ -1,0 +1,512 @@
+{
+  "src": "SRC-0002",
+  "schema_version": "2.0",
+  "lens": "use_case",
+  "compositions": [
+    {
+      "id": "SRC-0002/uc.sub/build-default-available-decisions",
+      "src": "SRC-0002",
+      "composition": "use_case",
+      "level": "sub",
+      "strategic_domain": null,
+      "terms": {
+        "actor": "Подсистема ExecApprovalRequestEvent (default_available_decisions)",
+        "goal": "Сформировать упорядоченный список ReviewDecision, доступных клиенту, исходя из контекста запроса аппрува",
+        "steps": [
+          "1. Подсистема проверяет наличие network_approval_context",
+          "2. При наличии network_approval_context подсистема формирует список [Approved, ApprovedForSession]",
+          "3. Подсистема проверяет proposed_network_policy_amendments на наличие записи с action == Allow",
+          "4. При наличии такой записи подсистема добавляет ReviewDecision::NetworkPolicyAmendment с клонированной amendment",
+          "5. Подсистема добавляет ReviewDecision::Abort и возвращает список",
+          "6. Если network_approval_context отсутствует, подсистема проверяет additional_permissions",
+          "7. При наличии additional_permissions подсистема возвращает [Approved, Abort]",
+          "8. Иначе подсистема формирует список [Approved] и проверяет proposed_execpolicy_amendment",
+          "9. При наличии proposed_execpolicy_amendment подсистема добавляет ReviewDecision::ApprovedExecpolicyAmendment с клонированным префиксом",
+          "10. Подсистема добавляет ReviewDecision::Abort и возвращает список"
+        ],
+        "extensions (Cockburn)": [
+          {"step": 3, "condition": "proposed_network_policy_amendments отсутствует или среди них нет записи с action == Allow", "action": "пропустить добавление NetworkPolicyAmendment-решения"},
+          {"step": 9, "condition": "proposed_execpolicy_amendment отсутствует", "action": "пропустить добавление ApprovedExecpolicyAmendment-решения"}
+        ],
+        "edge_cases": [
+          {"condition": "одновременно присутствуют network_approval_context и additional_permissions/exec amendments", "action": "ветка network имеет приоритет — ветки additional/execpolicy не выполняются (early return после Abort)"}
+        ],
+        "lifecycle": null,
+        "ux": null,
+        "result": "Возвращён Vec<ReviewDecision> в порядке: для network — [Approved, ApprovedForSession, (NetworkPolicyAmendment?), Abort]; для additional_permissions — [Approved, Abort]; иначе — [Approved, (ApprovedExecpolicyAmendment?), Abort]"
+      }
+    },
+    {
+      "id": "SRC-0002/uc.sub/effective-available-decisions",
+      "src": "SRC-0002",
+      "composition": "use_case",
+      "level": "sub",
+      "strategic_domain": null,
+      "terms": {
+        "actor": "Подсистема ExecApprovalRequestEvent (effective_available_decisions)",
+        "goal": "Получить список доступных решений с фолбэком на legacy-логику для старых отправителей",
+        "steps": [
+          "1. Подсистема проверяет наличие available_decisions в событии",
+          "2. При наличии — подсистема клонирует и возвращает available_decisions",
+          "3. При отсутствии — подсистема вызывает default_available_decisions с network_approval_context, proposed_execpolicy_amendment, proposed_network_policy_amendments, additional_permissions"
+        ],
+        "extensions (Cockburn)": [
+          {"step": 1, "condition": "available_decisions = None (старый отправитель не заполнил поле)", "action": "fallback на legacy-вычисление через default_available_decisions"}
+        ],
+        "edge_cases": null,
+        "lifecycle": null,
+        "ux": null,
+        "result": "Vec<ReviewDecision> — либо явный список от отправителя, либо вычисленный из контекста запроса"
+      }
+    },
+    {
+      "id": "SRC-0002/uc.sub/effective-approval-id",
+      "src": "SRC-0002",
+      "composition": "use_case",
+      "level": "sub",
+      "strategic_domain": null,
+      "terms": {
+        "actor": "Подсистема ExecApprovalRequestEvent (effective_approval_id)",
+        "goal": "Определить эффективный идентификатор аппрува для конкретного callback",
+        "steps": [
+          "1. Подсистема проверяет наличие approval_id у события",
+          "2. При наличии — подсистема возвращает клон approval_id",
+          "3. При отсутствии — подсистема возвращает клон call_id (аппрув относится к самому command item)"
+        ],
+        "extensions (Cockburn)": [
+          {"step": 1, "condition": "approval_id = None", "action": "использовать call_id как идентификатор аппрува (это аппрув для command item, а не subcommand)"}
+        ],
+        "edge_cases": null,
+        "lifecycle": null,
+        "ux": null,
+        "result": "String — approval_id (для subcommand-аппрувов через execve intercept) или call_id (для command-уровня)"
+      }
+    },
+    {
+      "id": "SRC-0002/uc.sub/resolve-filesystem-access",
+      "src": "SRC-0002",
+      "composition": "use_case",
+      "level": "sub",
+      "strategic_domain": null,
+      "terms": {
+        "actor": "Подсистема FileSystemSandboxPolicy (resolve_access_with_cwd)",
+        "goal": "Определить эффективный режим доступа (Read/Write/None) к конкретному пути с учётом cwd и precedence",
+        "steps": [
+          "1. Подсистема проверяет kind политики",
+          "2. При kind = Unrestricted или ExternalSandbox подсистема возвращает Write без дальнейших проверок",
+          "3. При kind = Restricted подсистема резолвит входной путь относительно cwd через resolve_candidate_path",
+          "4. Подсистема собирает resolved_entries_with_cwd и фильтрует записи, чей путь является префиксом резолвленного пути",
+          "5. Подсистема выбирает максимальную запись по precedence (specificity, access)",
+          "6. Подсистема возвращает access выбранной записи"
+        ],
+        "extensions (Cockburn)": [
+          {"step": 3, "condition": "путь не удалось резолвить (resolve_candidate_path вернул None)", "action": "вернуть FileSystemAccessMode::None"},
+          {"step": 5, "condition": "ни одна запись не покрывает путь", "action": "вернуть FileSystemAccessMode::None (unwrap_or)"}
+        ],
+        "edge_cases": [
+          {"condition": "две записи равной специфичности на тот же путь", "action": "побеждает запись с большим access по Ord (None > Write > Read) — conflict precedence, не capability breadth"}
+        ],
+        "lifecycle": null,
+        "ux": null,
+        "result": "FileSystemAccessMode (Read/Write/None) — режим доступа агента к указанному пути"
+      }
+    },
+    {
+      "id": "SRC-0002/uc.sub/project-from-legacy-sandbox-policy",
+      "src": "SRC-0002",
+      "composition": "use_case",
+      "level": "sub",
+      "strategic_domain": null,
+      "terms": {
+        "actor": "Подсистема FileSystemSandboxPolicy (from_legacy_sandbox_policy)",
+        "goal": "Сконвертировать legacy SandboxPolicy в split-форму FileSystemSandboxPolicy для конкретного cwd, не плодя redundant read-only carveouts",
+        "steps": [
+          "1. Подсистема преобразует sandbox_policy через From<&SandboxPolicy> для FileSystemSandboxPolicy",
+          "2. При WorkspaceWrite подсистема получает legacy_writable_roots через get_writable_roots_with_cwd(cwd)",
+          "3. Подсистема удаляет из entries все Path-Read записи, чей путь уже покрыт каким-либо writable_root (is_path_writable)",
+          "4. При Ok(cwd_root) подсистема добавляет default read-only subpaths для cwd_root с protect_missing_dot_codex=true (через append_default_read_only_path_if_no_explicit_rule)",
+          "5. Для каждого writable_root подсистема добавляет default read-only subpaths с protect_missing_dot_codex=false",
+          "6. Подсистема возвращает финальную FileSystemSandboxPolicy"
+        ],
+        "extensions (Cockburn)": [
+          {"step": 4, "condition": "cwd не удалось привести к AbsolutePathBuf", "action": "пропустить добавление защитных subpath'ов для cwd_root"}
+        ],
+        "edge_cases": [
+          {"condition": "Special-Read запись (например Minimal/CWD)", "action": "сохраняется без удаления — фильтрация удаляет только Path-Read под writable root"},
+          {"condition": "запись c access != Read", "action": "сохраняется без проверки на shadowing"}
+        ],
+        "lifecycle": null,
+        "ux": null,
+        "result": "FileSystemSandboxPolicy без redundant read-only carveouts под writable_roots, с защищёнными .git/.agents/.codex поверх workspace_root и каждого writable_root"
+      }
+    },
+    {
+      "id": "SRC-0002/uc.sub/project-to-legacy-sandbox-policy",
+      "src": "SRC-0002",
+      "composition": "use_case",
+      "level": "sub",
+      "strategic_domain": null,
+      "terms": {
+        "actor": "Подсистема FileSystemSandboxPolicy (to_legacy_sandbox_policy)",
+        "goal": "Сконвертировать split FileSystemSandboxPolicy + NetworkSandboxPolicy в legacy SandboxPolicy для конкретного cwd",
+        "steps": [
+          "1. Подсистема ветвится по kind: ExternalSandbox → SandboxPolicy::ExternalSandbox с network_access из NetworkSandboxPolicy",
+          "2. Unrestricted → если network Enabled → DangerFullAccess; иначе ExternalSandbox с network_access=Restricted",
+          "3. Restricted → подсистема итерирует entries и классифицирует по path/access (workspace_root_writable, writable_roots, readable_roots, has_full_disk_*, tmpdir/slash_tmp/include_platform_defaults)",
+          "4. Для FileSystemPath::Path подсистема добавляет в writable_roots или readable_roots; если путь == cwd_absolute и можно писать → workspace_root_writable=true",
+          "5. Для Special::Root подсистема выставляет has_full_disk_read_access/has_full_disk_write_access по access",
+          "6. Для Special::Minimal с can_read подсистема ставит include_platform_defaults=true",
+          "7. Для Special::CurrentWorkingDirectory: write → workspace_root_writable; read → readable_roots после resolve",
+          "8. Для Special::ProjectRoots без subpath с write → workspace_root_writable; иначе резолвит и кладёт в writable/readable",
+          "9. Для Tmpdir/SlashTmp подсистема выставляет соответствующие флаги writable",
+          "10. После цикла: при has_full_disk_write_access — вернуть DangerFullAccess или ExternalSandbox(restricted) в зависимости от network",
+          "11. При workspace_root_writable собрать SandboxPolicy::WorkspaceWrite (writable_roots dedup, read_only_access, network_access, exclude_tmpdir_env_var, exclude_slash_tmp)",
+          "12. Если writable_roots/tmpdir/slash_tmp заданы, но workspace_root не writable — вернуть Err(InvalidInput, \"permissions profile requests filesystem writes outside the workspace root, which is not supported until the runtime enforces FileSystemSandboxPolicy directly\")",
+          "13. Иначе вернуть SandboxPolicy::ReadOnly с access=read_only_access, network_access"
+        ],
+        "extensions (Cockburn)": [
+          {"step": 12, "condition": "запрошен write вне workspace_root и без workspace_root_writable", "action": "io::Error InvalidInput с человекочитаемым сообщением; конверсия проваливается"},
+          {"step": 6, "condition": "Special::Unknown в entries", "action": "игнорируется (forward compatibility — старый рантайм сохраняет токены, но не интерпретирует)"}
+        ],
+        "edge_cases": [
+          {"condition": "has_full_disk_read_access = false", "action": "read_only_access = Restricted{include_platform_defaults, readable_roots} (с dedup)"},
+          {"condition": "has_full_disk_read_access = true", "action": "read_only_access = FullAccess"}
+        ],
+        "lifecycle": null,
+        "ux": null,
+        "result": "io::Result<SandboxPolicy> — legacy политика, эквивалентная split FileSystemSandboxPolicy в данном cwd при заданной NetworkSandboxPolicy, либо ошибка InvalidInput"
+      }
+    },
+    {
+      "id": "SRC-0002/uc.sub/check-direct-runtime-enforcement",
+      "src": "SRC-0002",
+      "composition": "use_case",
+      "level": "sub",
+      "strategic_domain": null,
+      "terms": {
+        "actor": "Подсистема FileSystemSandboxPolicy (needs_direct_runtime_enforcement)",
+        "goal": "Определить, требуется ли прямое рантайм-обеспечение filesystem-политики (legacy roundtrip теряет семантику)",
+        "steps": [
+          "1. Подсистема проверяет kind: при не-Restricted сразу возвращает false",
+          "2. Подсистема пробует to_legacy_sandbox_policy(network_policy, cwd)",
+          "3. При ошибке конверсии подсистема возвращает true (legacy не может выразить политику)",
+          "4. Подсистема вычисляет semantic_signature(cwd) для исходной политики",
+          "5. Подсистема строит политику обратно из legacy через from_legacy_sandbox_policy и вычисляет её semantic_signature",
+          "6. Подсистема сравнивает signatures: при неравенстве возвращает true, иначе false"
+        ],
+        "extensions (Cockburn)": [
+          {"step": 2, "condition": "to_legacy_sandbox_policy возвращает Err", "action": "сразу true — политика не roundtripит через legacy"}
+        ],
+        "edge_cases": [
+          {"condition": "сплит-политика с nested carveouts (например cwd=Write + docs=Read)", "action": "signatures расходятся → true"},
+          {"condition": "политика, эквивалентная legacy WorkspaceWrite", "action": "signatures совпадают → false"}
+        ],
+        "lifecycle": null,
+        "ux": null,
+        "result": "bool — true, если рантайм должен напрямую применять FileSystemSandboxPolicy (legacy несовместим), false — если legacy roundtrip сохраняет семантику"
+      }
+    },
+    {
+      "id": "SRC-0002/uc.sub/derive-default-readonly-subpaths",
+      "src": "SRC-0002",
+      "composition": "use_case",
+      "level": "sub",
+      "strategic_domain": null,
+      "terms": {
+        "actor": "Подсистема permissions (default_read_only_subpaths_for_writable_root)",
+        "goal": "Сформировать список путей внутри writable_root, которые должны остаться read-only по умолчанию (защита git-окружения и проектных метаданных)",
+        "steps": [
+          "1. Подсистема проверяет writable_root.join(\".git\") на is_file/is_dir",
+          "2. При наличии .git как dir или file подсистема, если это git pointer file, резолвит gitdir и добавляет в subpaths",
+          "3. Подсистема добавляет сам top_level_git в subpaths",
+          "4. Подсистема проверяет writable_root.join(\".agents\") на is_dir; при наличии добавляет в subpaths",
+          "5. Подсистема проверяет writable_root.join(\".codex\") на is_dir; добавляет в subpaths если protect_missing_dot_codex=true ИЛИ каталог уже существует",
+          "6. Подсистема дедуплицирует список через dedup_absolute_paths(normalize_effective_paths=false) и возвращает"
+        ],
+        "extensions (Cockburn)": [
+          {"step": 2, "condition": ".git — pointer file, но resolve_gitdir_from_file вернул None (отсутствие/невалидный формат/несуществующий путь)", "action": "пропустить добавление gitdir в subpaths; ошибка логируется через tracing::error в resolve_gitdir_from_file"},
+          {"step": 5, "condition": ".codex отсутствует и protect_missing_dot_codex=false", "action": "не защищать .codex (применяется для writable_roots, отличных от workspace cwd)"}
+        ],
+        "edge_cases": [
+          {"condition": ".git отсутствует ни как dir, ни как file", "action": "не добавлять ни .git, ни gitdir-from-pointer"},
+          {"condition": "writable_root = workspace cwd, .codex ещё не создан", "action": "защитить .codex даже до создания, чтобы первое создание прошло через protected-path approval flow"}
+        ],
+        "lifecycle": null,
+        "ux": null,
+        "result": "Vec<AbsolutePathBuf> read-only carveouts: .git (+ gitdir для worktree/submodule), .agents, .codex; защищены типичные repo, worktrees/submodules, bare repos"
+      }
+    },
+    {
+      "id": "SRC-0002/uc.sub/resolve-gitdir-from-pointer-file",
+      "src": "SRC-0002",
+      "composition": "use_case",
+      "level": "sub",
+      "strategic_domain": null,
+      "terms": {
+        "actor": "Подсистема permissions (resolve_gitdir_from_file)",
+        "goal": "Извлечь и резолвить путь gitdir из git pointer-файла .git",
+        "steps": [
+          "1. Подсистема читает содержимое .git как строку через std::fs::read_to_string",
+          "2. Подсистема обрезает пробелы и разбивает по первому ':' через split_once(':')",
+          "3. Подсистема обрезает gitdir-часть и проверяет, что она не пустая",
+          "4. Подсистема получает parent .git как базу для резолва",
+          "5. Подсистема резолвит gitdir-путь относительно base через AbsolutePathBuf::resolve_path_against_base",
+          "6. Подсистема проверяет существование резолвленного пути; при существовании возвращает Some(path)"
+        ],
+        "extensions (Cockburn)": [
+          {"step": 1, "condition": "чтение файла провалилось", "action": "залогировать через tracing::error \"Failed to read {path} for gitdir pointer: {err}\" и вернуть None"},
+          {"step": 2, "condition": "содержимое не содержит ':'", "action": "залогировать через tracing::error \"Expected {path} to contain a gitdir pointer, but it did not match `gitdir: <path>`.\" и вернуть None"},
+          {"step": 3, "condition": "gitdir-часть пустая", "action": "залогировать \"Expected {path} to contain a gitdir pointer, but it was empty.\" и вернуть None"},
+          {"step": 4, "condition": "у .git нет parent-директории", "action": "залогировать \"Unable to resolve parent directory for {path}.\" и вернуть None"},
+          {"step": 6, "condition": "резолвленный gitdir не существует", "action": "залогировать \"Resolved gitdir path {path} does not exist.\" и вернуть None"}
+        ],
+        "edge_cases": null,
+        "lifecycle": null,
+        "ux": null,
+        "result": "Option<AbsolutePathBuf> — путь gitdir для защиты как read-only carveout, либо None при любой проблеме (с логированием)"
+      }
+    },
+    {
+      "id": "SRC-0002/uc.sub/get-writable-roots-with-carveouts",
+      "src": "SRC-0002",
+      "composition": "use_case",
+      "level": "sub",
+      "strategic_domain": null,
+      "terms": {
+        "actor": "Подсистема FileSystemSandboxPolicy (get_writable_roots_with_cwd)",
+        "goal": "Получить writable-корни вместе с read-only carveouts, сохранив сырые symlink-пути для downstream sandbox masking",
+        "steps": [
+          "1. Подсистема проверяет has_full_disk_write_access; при true возвращает пустой Vec",
+          "2. Подсистема собирает resolved_entries_with_cwd и выделяет writable_entries (can_write + can_write_path_with_cwd)",
+          "3. Подсистема дедуплицирует writable_entries через dedup_absolute_paths(normalize_effective_paths=true)",
+          "4. Для каждого корня: подсистема определяет preserve_raw_carveout_paths по наличию parent у root",
+          "5. Подсистема собирает raw_writable_roots (writable_entries, чьи нормализованные пути == root)",
+          "6. Подсистема определяет protect_missing_dot_codex: cwd резолвится в abs и нормализованный совпадает с root",
+          "7. Подсистема вызывает default_read_only_subpaths_for_writable_root и фильтрует пути, для которых уже есть explicit resolved entry",
+          "8. Подсистема расширяет read_only_subpaths сырыми carveout-путями: для каждой не-write записи, недоступной для write — выбрать raw_carveout_path (если carveout под root) или effective_path (если нормализованный путь под root)",
+          "9. Подсистема дедуплицирует read_only_subpaths без normalize, чтобы сохранить литеральные .git/.codex для маскирования symlink inode",
+          "10. Подсистема возвращает Vec<WritableRoot>"
+        ],
+        "extensions (Cockburn)": [
+          {"step": 4, "condition": "у root нет parent (root — корень файловой системы)", "action": "preserve_raw_carveout_paths = false; raw carveout-путь не вычисляется"},
+          {"step": 8, "condition": "carveout-путь не лежит ни под одним raw_writable_root и нормализованный путь == root или вне него", "action": "пропустить (None) — не добавлять"}
+        ],
+        "edge_cases": [
+          {"condition": "<root>/.codex -> <root>/decoy (симлинк)", "action": "сохранить литеральный <root>/.codex в read_only_subpaths, чтобы bwrap маскировал инод симлинка, а не только резолвленную цель"},
+          {"condition": "<root>/linked-private -> /tmp/outside-private (симлинк наружу)", "action": "сохранить литеральный <root>/linked-private как carveout"},
+          {"condition": "<root>/alias-root -> <root> (симлинк на сам root)", "action": "сохранить литеральный <root>/alias-root как carveout"}
+        ],
+        "lifecycle": null,
+        "ux": null,
+        "result": "Vec<WritableRoot> с writable-корнями и литеральными read-only carveouts (.git, .codex, .agents, явные deny-записи), пригодными для downstream sandbox masking"
+      }
+    },
+    {
+      "id": "SRC-0002/uc.sub/extend-with-additional-readable-roots",
+      "src": "SRC-0002",
+      "composition": "use_case",
+      "level": "sub",
+      "strategic_domain": null,
+      "terms": {
+        "actor": "Подсистема FileSystemSandboxPolicy (with_additional_readable_roots)",
+        "goal": "Добавить дополнительные readable-корни в политику, не дублируя уже эффективно доступные",
+        "steps": [
+          "1. Подсистема проверяет has_full_disk_read_access; при true возвращает self без изменений",
+          "2. Для каждого пути из additional_readable_roots: проверить can_read_path_with_cwd",
+          "3. Если путь уже эффективно доступен на чтение — пропустить",
+          "4. Иначе подсистема добавляет FileSystemSandboxEntry { path: Path{path}, access: Read } в entries",
+          "5. Подсистема возвращает обновлённую self"
+        ],
+        "extensions (Cockburn)": [
+          {"step": 1, "condition": "уже есть full-disk read access", "action": "не добавлять ничего, вернуть self как есть"},
+          {"step": 3, "condition": "путь уже доступен на чтение по существующим записям", "action": "skip — избегать дублирования"}
+        ],
+        "edge_cases": null,
+        "lifecycle": null,
+        "ux": null,
+        "result": "FileSystemSandboxPolicy с дополнительными readable-записями только для тех путей, что не были покрыты ранее"
+      }
+    },
+    {
+      "id": "SRC-0002/uc.sub/extend-with-additional-writable-roots",
+      "src": "SRC-0002",
+      "composition": "use_case",
+      "level": "sub",
+      "strategic_domain": null,
+      "terms": {
+        "actor": "Подсистема FileSystemSandboxPolicy (with_additional_writable_roots)",
+        "goal": "Добавить дополнительные writable-корни в политику, не дублируя уже эффективно доступные",
+        "steps": [
+          "1. Для каждого пути из additional_writable_roots: проверить can_write_path_with_cwd",
+          "2. Если путь уже эффективно доступен на запись — пропустить",
+          "3. Иначе подсистема добавляет FileSystemSandboxEntry { path: Path{path}, access: Write } в entries",
+          "4. Подсистема возвращает обновлённую self"
+        ],
+        "extensions (Cockburn)": [
+          {"step": 2, "condition": "путь уже доступен на запись", "action": "skip — избегать дублирования"}
+        ],
+        "edge_cases": null,
+        "lifecycle": null,
+        "ux": null,
+        "result": "FileSystemSandboxPolicy с дополнительными writable-записями только для тех путей, что не были покрыты ранее"
+      }
+    },
+    {
+      "id": "SRC-0002/uc.sub/get-unreadable-roots",
+      "src": "SRC-0002",
+      "composition": "use_case",
+      "level": "sub",
+      "strategic_domain": null,
+      "terms": {
+        "actor": "Подсистема FileSystemSandboxPolicy (get_unreadable_roots_with_cwd)",
+        "goal": "Получить список явно unreadable корней, без материализации root-уровневого deny",
+        "steps": [
+          "1. Подсистема проверяет kind = Restricted; иначе возвращает пустой Vec",
+          "2. Подсистема резолвит cwd в AbsolutePathBuf и вычисляет absolute_root_path_for_cwd",
+          "3. Подсистема собирает resolved_entries_with_cwd и фильтрует записи с access == None",
+          "4. Подсистема отбрасывает пути, доступные на чтение по эффективным правилам (can_read_path_with_cwd)",
+          "5. Подсистема отбрасывает запись, чей путь равен root — restricted уже запрещает чтения вне явных allow-корней, материализация root затёрла бы более узкие readable carveouts",
+          "6. Подсистема дедуплицирует через dedup_absolute_paths(normalize_effective_paths=true) и возвращает"
+        ],
+        "extensions (Cockburn)": [
+          {"step": 5, "condition": "deny-запись на Special::Root", "action": "не материализовать как unreadable root — иначе downstream sandbox затрёт narrower readable carveouts"}
+        ],
+        "edge_cases": [
+          {"condition": "duplicate root deny (две записи Special::Root: Write и None)", "action": "has_full_disk_write_access становится false; resolve_access_with_cwd возвращает None для root (ord precedence)"}
+        ],
+        "lifecycle": null,
+        "ux": null,
+        "result": "Vec<AbsolutePathBuf> явно недоступных для чтения корней, без избыточной материализации root-deny"
+      }
+    },
+    {
+      "id": "SRC-0002/uc.sub/derive-network-sandbox-from-legacy",
+      "src": "SRC-0002",
+      "composition": "use_case",
+      "level": "sub",
+      "strategic_domain": null,
+      "terms": {
+        "actor": "Подсистема NetworkSandboxPolicy (From<&SandboxPolicy>)",
+        "goal": "Сконвертировать legacy SandboxPolicy в NetworkSandboxPolicy",
+        "steps": [
+          "1. Подсистема вызывает sandbox_policy.has_full_network_access()",
+          "2. При true подсистема возвращает NetworkSandboxPolicy::Enabled",
+          "3. При false подсистема возвращает NetworkSandboxPolicy::Restricted"
+        ],
+        "extensions (Cockburn)": [],
+        "edge_cases": null,
+        "lifecycle": null,
+        "ux": null,
+        "result": "NetworkSandboxPolicy: Enabled, если legacy политика даёт полный сетевой доступ; иначе Restricted"
+      }
+    },
+    {
+      "id": "SRC-0002/uc.sub/derive-filesystem-policy-from-legacy",
+      "src": "SRC-0002",
+      "composition": "use_case",
+      "level": "sub",
+      "strategic_domain": null,
+      "terms": {
+        "actor": "Подсистема FileSystemSandboxPolicy (From<&SandboxPolicy>)",
+        "goal": "Сконвертировать legacy SandboxPolicy в split FileSystemSandboxPolicy с правильным набором entries",
+        "steps": [
+          "1. Подсистема ветвится по варианту SandboxPolicy",
+          "2. DangerFullAccess → FileSystemSandboxPolicy::unrestricted()",
+          "3. ExternalSandbox{..} → FileSystemSandboxPolicy::external_sandbox()",
+          "4. ReadOnly{access,..}: для FullAccess добавить (Special::Root, Read); для Restricted{include_platform_defaults, readable_roots} — добавить (Special::CWD, Read), при include_platform_defaults — (Special::Minimal, Read), затем все readable_roots как Path-Read; обернуть в restricted(entries)",
+          "5. WorkspaceWrite{writable_roots, read_only_access, exclude_tmpdir_env_var, exclude_slash_tmp,..}: применить read_only_access (FullAccess → Special::Root Read; Restricted{include_platform_defaults, readable_roots} → опц. Special::Minimal Read и readable_roots Path-Read)",
+          "6. Добавить (Special::CWD, Write)",
+          "7. Если !exclude_slash_tmp — добавить (Special::SlashTmp, Write)",
+          "8. Если !exclude_tmpdir_env_var — добавить (Special::Tmpdir, Write)",
+          "9. Добавить writable_roots как Path-Write",
+          "10. Обернуть в restricted(entries)"
+        ],
+        "extensions (Cockburn)": [],
+        "edge_cases": [
+          {"condition": "ReadOnly с include_platform_defaults=false и пустыми readable_roots", "action": "entries = только (Special::CWD, Read)"},
+          {"condition": "WorkspaceWrite с exclude_slash_tmp=true и exclude_tmpdir_env_var=true", "action": "не добавлять SlashTmp/Tmpdir Write записи"}
+        ],
+        "lifecycle": null,
+        "ux": null,
+        "result": "FileSystemSandboxPolicy с kind в зависимости от legacy варианта (unrestricted/external_sandbox/restricted) и entries, эквивалентными legacy политике"
+      }
+    },
+    {
+      "id": "SRC-0002/uc.sub/dedup-and-normalize-paths",
+      "src": "SRC-0002",
+      "composition": "use_case",
+      "level": "sub",
+      "strategic_domain": null,
+      "terms": {
+        "actor": "Подсистема permissions (dedup_absolute_paths)",
+        "goal": "Удалить дубликаты путей с опциональной нормализацией по эффективному канону",
+        "steps": [
+          "1. Подсистема создаёт пустой deduped Vec и HashSet для seen",
+          "2. Для каждого пути: если normalize_effective_paths=true — нормализовать через normalize_effective_absolute_path (canonicalize_preserving_symlinks по самому глубокому существующему ancestor + suffix); иначе оставить как есть",
+          "3. Если HashSet ещё не содержит pathbuf — добавить в seen и в deduped",
+          "4. Подсистема возвращает deduped"
+        ],
+        "extensions (Cockburn)": [
+          {"step": 2, "condition": "ancestor не существует или canonicalize провалился", "action": "пропустить ancestor, попробовать следующий; если ни один не сработал — вернуть исходный path"}
+        ],
+        "edge_cases": [
+          {"condition": "normalize_effective_paths=false", "action": "сохранить литеральные пути для downstream symlink-маскирования (.git, .codex)"},
+          {"condition": "normalize_effective_paths=true", "action": "сворачивать root-aliases (например /var/... под /private/var/...) к одному эффективному пути"}
+        ],
+        "lifecycle": null,
+        "ux": null,
+        "result": "Vec<AbsolutePathBuf> без дубликатов, либо в нормализованной, либо в литеральной форме в зависимости от флага"
+      }
+    },
+    {
+      "id": "SRC-0002/uc.sub/check-write-narrowing",
+      "src": "SRC-0002",
+      "composition": "use_case",
+      "level": "sub",
+      "strategic_domain": null,
+      "terms": {
+        "actor": "Подсистема FileSystemSandboxPolicy (has_write_narrowing_entries)",
+        "goal": "Определить, есть ли в restricted-политике запись, действительно сужающая широкий :root=write грант",
+        "steps": [
+          "1. Подсистема проверяет kind = Restricted; иначе возвращает false",
+          "2. Подсистема итерирует entries; пропускает can_write записи (они не сужают)",
+          "3. Для FileSystemPath::Path: вернуть true, если у этого пути нет equally-specific write-перекрытия (has_same_target_write_override == false)",
+          "4. Для Special::Root c access == None: вернуть true (root deny сужает root write)",
+          "5. Для Special::Minimal или Special::Unknown: вернуть false (не сужают)",
+          "6. Для прочих Special: вернуть true, если нет equally-specific write override"
+        ],
+        "extensions (Cockburn)": [
+          {"step": 3, "condition": "shadowed read-запись для того же пути перекрыта equally-specific write-записью", "action": "не считать narrowing — write-запись по precedence побеждает"}
+        ],
+        "edge_cases": [
+          {"condition": "Special::Root + Path-Read для docs (root=Write, docs=Read)", "action": "has_write_narrowing_entries=true → has_full_disk_write_access=false; needs_direct_runtime_enforcement=true"},
+          {"condition": "Path docs=Read и Path docs=Write одновременно с Special::Root=Write", "action": "shadowed read не сужает; has_full_disk_write_access остаётся true"}
+        ],
+        "lifecycle": null,
+        "ux": null,
+        "result": "bool — true, если есть запись, реально сужающая root-write; false — если все non-write записи перекрыты equally-specific write-записями"
+      }
+    },
+    {
+      "id": "SRC-0002/uc.sub/check-ask-from-decider",
+      "src": "SRC-0002",
+      "composition": "use_case",
+      "level": "sub",
+      "strategic_domain": null,
+      "terms": {
+        "actor": "Подсистема NetworkPolicyDecisionPayload (is_ask_from_decider)",
+        "goal": "Определить, является ли решение запросом подтверждения, исходящим от decider",
+        "steps": [
+          "1. Подсистема проверяет decision == NetworkPolicyDecision::Ask",
+          "2. Подсистема проверяет source == NetworkDecisionSource::Decider",
+          "3. Подсистема возвращает конъюнкцию (decision==Ask) && (source==Decider)"
+        ],
+        "extensions (Cockburn)": [],
+        "edge_cases": null,
+        "lifecycle": null,
+        "ux": null,
+        "result": "bool — true только если оба условия выполнены одновременно"
+      }
+    }
+  ]
+}

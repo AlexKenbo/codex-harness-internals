@@ -1,0 +1,477 @@
+{
+  "src": "SRC-0004",
+  "schema_version": "2.0",
+  "lens": "rule",
+  "compositions": [
+    {
+      "id": "SRC-0004/rule/max-user-input-text-chars",
+      "src": "SRC-0004",
+      "composition": "rule",
+      "terms": {
+        "condition": "Текст одного UserInput.Text ограничен консервативным потолком, чтобы одно сообщение не монополизировало большое контекстное окно",
+        "numbers": [
+          {"value": 1048576, "kind": "max_text_chars", "expression": "1 << 20"}
+        ],
+        "formula": "MAX_USER_INPUT_TEXT_CHARS = 1 << 20 = 1_048_576",
+        "gwt": {
+          "given": "pub const MAX_USER_INPUT_TEXT_CHARS: usize = 1 << 20",
+          "when": "проверка длины UserInput::Text.text",
+          "then": "максимально допустимое значение = 1_048_576 символов"
+        }
+      }
+    },
+    {
+      "id": "SRC-0004/rule/defer-loading-fallback-from-expose-to-context",
+      "src": "SRC-0004",
+      "composition": "rule",
+      "terms": {
+        "condition": "При десериализации DynamicToolSpec: defer_loading = deferLoading если присутствует, иначе !exposeToContext если присутствует, иначе false",
+        "numbers": null,
+        "formula": "defer_loading = deferLoading.unwrap_or_else(|| exposeToContext.map(|visible| !visible).unwrap_or(false))",
+        "gwt": {
+          "given": "wire JSON: {name, description, inputSchema, exposeToContext: false} (deferLoading отсутствует)",
+          "when": "DynamicToolSpec::deserialize",
+          "then": "defer_loading = !false = true (legacy инверсия)"
+        }
+      }
+    },
+    {
+      "id": "SRC-0004/rule/defer-loading-default",
+      "src": "SRC-0004",
+      "composition": "rule",
+      "terms": {
+        "condition": "Если ни deferLoading, ни exposeToContext не предоставлены — defer_loading = false",
+        "numbers": null,
+        "formula": null,
+        "gwt": null
+      }
+    },
+    {
+      "id": "SRC-0004/rule/utf8-fast-path",
+      "src": "SRC-0004",
+      "composition": "rule",
+      "terms": {
+        "condition": "Если входные байты валидны как UTF-8 — вернуть строку немедленно без определения кодировки",
+        "numbers": null,
+        "formula": "if let Ok(utf8_str) = std::str::from_utf8(bytes) { return utf8_str.to_owned(); }",
+        "gwt": {
+          "given": "bytes = [0x68, 0x65, 0x6C, 0x6C, 0x6F] (\"hello\" в UTF-8)",
+          "when": "bytes_to_string_smart(bytes)",
+          "then": "вернётся \"hello\" без вызова detect_encoding"
+        }
+      }
+    },
+    {
+      "id": "SRC-0004/rule/empty-bytes-empty-string",
+      "src": "SRC-0004",
+      "composition": "rule",
+      "terms": {
+        "condition": "Пустой входной поток байтов возвращает пустую строку без вызова детектора кодировки",
+        "numbers": [
+          {"value": 0, "kind": "byte_length"}
+        ],
+        "formula": "if bytes.is_empty() { return String::new(); }",
+        "gwt": {
+          "given": "bytes = []",
+          "when": "bytes_to_string_smart(bytes)",
+          "then": "вернётся \"\" немедленно (короткое замыкание)"
+        }
+      }
+    },
+    {
+      "id": "SRC-0004/rule/ibm866-to-windows-1252-coercion-allowlist",
+      "src": "SRC-0004",
+      "composition": "rule",
+      "terms": {
+        "condition": "Когда chardetng возвращает IBM866 для коротких строк состоящих исключительно из smart-punctuation байтов Windows-1252 (0x80-0x9F из allowlist) рядом с ASCII-словом — кодировка переключается на WINDOWS_1252",
+        "numbers": [
+          {"value": "0x80", "kind": "smart_punct_range_start"},
+          {"value": "0x9F", "kind": "smart_punct_range_end"},
+          {"value": "0xA0", "kind": "high_byte_disqualifier"},
+          {"value": "0x91", "kind": "allowlist_byte", "expression": "left single quotation mark ‘"},
+          {"value": "0x92", "kind": "allowlist_byte", "expression": "right single quotation mark ’"},
+          {"value": "0x93", "kind": "allowlist_byte", "expression": "left double quotation mark “"},
+          {"value": "0x94", "kind": "allowlist_byte", "expression": "right double quotation mark ”"},
+          {"value": "0x95", "kind": "allowlist_byte", "expression": "bullet •"},
+          {"value": "0x96", "kind": "allowlist_byte", "expression": "en dash –"},
+          {"value": "0x97", "kind": "allowlist_byte", "expression": "em dash —"},
+          {"value": "0x99", "kind": "allowlist_byte", "expression": "trade mark sign ™"}
+        ],
+        "formula": "if encoding == IBM866 && looks_like_windows_1252_punctuation(bytes) { return WINDOWS_1252; }; looks_like_windows_1252_punctuation = ∀ byte: (byte < 0xA0) AND (byte ∈ [0x80,0x9F] ⇒ byte ∈ WINDOWS_1252_PUNCT_BYTES) AND ∃ punct ∈ [0x80,0x9F] AND ∃ ASCII alpha",
+        "gwt": {
+          "given": "bytes содержат 0x93 (\"), ASCII слово \"test\", 0x94 (\"), ничего >= 0xA0; chardetng угадал IBM866",
+          "when": "detect_encoding(bytes)",
+          "then": "возвращается WINDOWS_1252 (smart quotes отрендерены как \"test\", не как Cyrillic \"УФЦ\")"
+        }
+      }
+    },
+    {
+      "id": "SRC-0004/rule/ibm866-coercion-disqualifiers",
+      "src": "SRC-0004",
+      "composition": "rule",
+      "terms": {
+        "condition": "Подмена IBM866 → WINDOWS_1252 НЕ происходит если: встречен любой байт >= 0xA0; встречен байт 0x80-0x9F не из WINDOWS_1252_PUNCT_BYTES; нет ни одной ASCII alphabetic; нет ни одного байта в диапазоне 0x80-0x9F",
+        "numbers": [
+          {"value": "0xA0", "kind": "high_byte_threshold"}
+        ],
+        "formula": "looks_like_windows_1252_punctuation = saw_extended_punctuation AND saw_ascii_word",
+        "gwt": {
+          "given": "bytes только smart-punctuation (например [0x93, 0x94]) без ASCII букв",
+          "when": "looks_like_windows_1252_punctuation(bytes)",
+          "then": "возвращается false (saw_ascii_word = false) — IBM866 сохраняется"
+        }
+      }
+    },
+    {
+      "id": "SRC-0004/rule/decode-had-errors-fallback",
+      "src": "SRC-0004",
+      "composition": "rule",
+      "terms": {
+        "condition": "Если encoding.decode сообщил had_errors = true — вернуть результат String::from_utf8_lossy (с заменителем U+FFFD)",
+        "numbers": null,
+        "formula": "let (decoded, _, had_errors) = encoding.decode(bytes); if had_errors { return String::from_utf8_lossy(bytes).into_owned(); } decoded.into_owned()",
+        "gwt": {
+          "given": "bytes невозможно декодировать выбранной encoding без ошибок",
+          "when": "decode_bytes(bytes, encoding)",
+          "then": "возвращается from_utf8_lossy(bytes) с Unicode replacement character вместо невалидных байтов"
+        }
+      }
+    },
+    {
+      "id": "SRC-0004/rule/exec-tool-call-output-defaults",
+      "src": "SRC-0004",
+      "composition": "rule",
+      "terms": {
+        "condition": "По умолчанию ExecToolCallOutput имеет exit_code = 0, пустые stdout/stderr/aggregated_output, duration = ZERO, timed_out = false",
+        "numbers": [
+          {"value": 0, "kind": "default_exit_code"},
+          {"value": "Duration::ZERO", "kind": "default_duration"}
+        ],
+        "formula": "Default::default() = { exit_code: 0, stdout: StreamOutput::new(\"\"), stderr: StreamOutput::new(\"\"), aggregated_output: StreamOutput::new(\"\"), duration: Duration::ZERO, timed_out: false }",
+        "gwt": {
+          "given": "ExecToolCallOutput::default()",
+          "when": "доступ к exit_code и duration",
+          "then": "exit_code = 0 и duration = Duration::ZERO и timed_out = false"
+        }
+      }
+    },
+    {
+      "id": "SRC-0004/rule/lossy-opt-i64-bounds",
+      "src": "SRC-0004",
+      "composition": "rule",
+      "terms": {
+        "condition": "Resource.size десериализуется через лояльный конвертер: i64 если возможно, иначе u64→i64 через try_from, иначе None — без падения парсинга",
+        "numbers": [
+          {"value": 5000000000, "kind": "test_value_in_i64_range"},
+          {"value": -1, "kind": "test_value_negative"},
+          {"value": "18446744073709551615", "kind": "test_value_u64_max_out_of_range"}
+        ],
+        "formula": "match Number: as_i64() Some => Ok(Some(v)); else as_u64() Some => Ok(i64::try_from(v).ok()); else Ok(None)",
+        "gwt": {
+          "given": "Resource JSON {name: \"big\", uri: \"file:///tmp/big\", size: 5_000_000_000u64}",
+          "when": "Resource::from_mcp_value(value)",
+          "then": "parsed.size == Some(5_000_000_000); для size = -1 → Some(-1); для size = 18446744073709551615 → None (вне i64)"
+        }
+      }
+    },
+    {
+      "id": "SRC-0004/rule/permission-grant-scope-default",
+      "src": "SRC-0004",
+      "composition": "rule",
+      "terms": {
+        "condition": "Если в RequestPermissionsResponse поле scope отсутствует — оно равно Turn (выдача только на текущий ход)",
+        "numbers": null,
+        "formula": "PermissionGrantScope::default() = Turn (#[default] на варианте Turn)",
+        "gwt": {
+          "given": "wire JSON RequestPermissionsResponse без поля scope",
+          "when": "deserialize",
+          "then": "scope = PermissionGrantScope::Turn"
+        }
+      }
+    },
+    {
+      "id": "SRC-0004/rule/request-permission-profile-is-empty",
+      "src": "SRC-0004",
+      "composition": "rule",
+      "terms": {
+        "condition": "RequestPermissionProfile пуст когда оба network и file_system равны None",
+        "numbers": null,
+        "formula": "is_empty = self.network.is_none() && self.file_system.is_none()",
+        "gwt": {
+          "given": "RequestPermissionProfile { network: None, file_system: None }",
+          "when": "is_empty()",
+          "then": "true"
+        }
+      }
+    },
+    {
+      "id": "SRC-0004/rule/request-permission-profile-deny-unknown-fields",
+      "src": "SRC-0004",
+      "composition": "rule",
+      "terms": {
+        "condition": "RequestPermissionProfile отвергает любые поля кроме network и file_system",
+        "numbers": null,
+        "formula": "#[serde(deny_unknown_fields)] на RequestPermissionProfile",
+        "gwt": {
+          "given": "wire JSON {network: ..., file_system: ..., extra: ...}",
+          "when": "deserialize в RequestPermissionProfile",
+          "then": "ошибка десериализации (unknown field 'extra')"
+        }
+      }
+    },
+    {
+      "id": "SRC-0004/rule/turn-id-default-empty-for-backwards-compat",
+      "src": "SRC-0004",
+      "composition": "rule",
+      "terms": {
+        "condition": "RequestPermissionsEvent.turn_id и RequestUserInputEvent.turn_id имеют default = пустая строка для backwards compatibility со старыми клиентами",
+        "numbers": null,
+        "formula": "#[serde(default)] на pub turn_id: String — fallback на String::default() = \"\"",
+        "gwt": {
+          "given": "wire JSON RequestPermissionsEvent {call_id: \"x\", permissions: {...}} (без turn_id)",
+          "when": "deserialize",
+          "then": "turn_id = \"\""
+        }
+      }
+    },
+    {
+      "id": "SRC-0004/rule/update-plan-args-deny-unknown-fields",
+      "src": "SRC-0004",
+      "composition": "rule",
+      "terms": {
+        "condition": "UpdatePlanArgs и PlanItemArg отвергают любые неизвестные поля при десериализации (строгая схема для todo/checklist tool)",
+        "numbers": null,
+        "formula": "#[serde(deny_unknown_fields)] на обеих структурах",
+        "gwt": {
+          "given": "wire JSON PlanItemArg {step: \"build\", status: \"pending\", priority: \"high\"}",
+          "when": "deserialize",
+          "then": "ошибка десериализации (unknown field 'priority')"
+        }
+      }
+    },
+    {
+      "id": "SRC-0004/rule/step-status-enum",
+      "src": "SRC-0004",
+      "composition": "rule",
+      "terms": {
+        "condition": "StepStatus может быть только одним из: pending, in_progress, completed (полное перечисление)",
+        "numbers": null,
+        "formula": null,
+        "gwt": {
+          "given": "PlanItemArg.status принимает значение из 3-элементного enum",
+          "when": "deserialize \"in_progress\"",
+          "then": "status = StepStatus::InProgress; \"queued\" → ошибка"
+        }
+      }
+    },
+    {
+      "id": "SRC-0004/rule/parsed-command-tagged-variants",
+      "src": "SRC-0004",
+      "composition": "rule",
+      "terms": {
+        "condition": "ParsedCommand сериализуется/десериализуется как tagged enum с тегом 'type' (snake_case): read, list_files, search, unknown — полное перечисление вариантов",
+        "numbers": null,
+        "formula": null,
+        "gwt": {
+          "given": "wire JSON {type: \"read\", cmd: \"cat foo\", name: \"foo\", path: \"/abs/foo\"}",
+          "when": "deserialize",
+          "then": "ParsedCommand::Read{cmd, name, path}; вариант 'unknown' принимает только cmd"
+        }
+      }
+    },
+    {
+      "id": "SRC-0004/rule/parsed-command-read-path-resolution",
+      "src": "SRC-0004",
+      "composition": "rule",
+      "terms": {
+        "condition": "Для ParsedCommand::Read.path: best-effort путь к читаемому файлу; когда возможно — абсолютный, иначе должен быть разрешён относительно cwd выполнения команды для получения абсолютного пути",
+        "numbers": null,
+        "formula": null,
+        "gwt": null
+      }
+    },
+    {
+      "id": "SRC-0004/rule/dynamic-tool-content-item-tag",
+      "src": "SRC-0004",
+      "composition": "rule",
+      "terms": {
+        "condition": "DynamicToolCallOutputContentItem — tagged enum с тегом 'type' (camelCase): inputText или inputImage; inputText содержит text, inputImage содержит imageUrl — полное перечисление",
+        "numbers": null,
+        "formula": null,
+        "gwt": {
+          "given": "wire JSON {type: \"inputText\", text: \"hello\"}",
+          "when": "deserialize",
+          "then": "DynamicToolCallOutputContentItem::InputText{text: \"hello\"}"
+        }
+      }
+    },
+    {
+      "id": "SRC-0004/rule/request-id-untagged",
+      "src": "SRC-0004",
+      "composition": "rule",
+      "terms": {
+        "condition": "RequestId десериализуется untagged: строка как RequestId::String, число как RequestId::Integer (i64); Display форматирует строку как есть, число как десятичное представление i64",
+        "numbers": null,
+        "formula": null,
+        "gwt": {
+          "given": "wire JSON \"req-1\" → RequestId::String(\"req-1\"); 42 → RequestId::Integer(42)",
+          "when": "Display::fmt",
+          "then": "\"req-1\" и \"42\" соответственно"
+        }
+      }
+    },
+    {
+      "id": "SRC-0004/rule/text-element-placeholder-fallback",
+      "src": "SRC-0004",
+      "composition": "rule",
+      "terms": {
+        "condition": "TextElement.placeholder(text) возвращает: явный placeholder если задан, иначе срез исходного текста по byte_range; внутренний _placeholder_for_conversion_only возвращает только явный placeholder без обращения к тексту (для use в From-импл, где исходный text недоступен)",
+        "numbers": null,
+        "formula": "placeholder<'a>(self, text) = self.placeholder.as_deref().or_else(|| text.get(self.byte_range.start..self.byte_range.end))",
+        "gwt": {
+          "given": "TextElement{byte_range: {start: 0, end: 5}, placeholder: None}; text = \"hello world\"",
+          "when": "placeholder(text)",
+          "then": "Some(\"hello\") — fallback на срез по byte_range"
+        }
+      }
+    },
+    {
+      "id": "SRC-0004/rule/text-element-map-range-preserves-placeholder",
+      "src": "SRC-0004",
+      "composition": "rule",
+      "terms": {
+        "condition": "map_range(F) возвращает копию TextElement с remapped byte_range и тем же placeholder (без изменений). Caller отвечает за то, что новый range всё ещё ссылается на тот же логический элемент в новом тексте",
+        "numbers": null,
+        "formula": "map_range(self, map: F) = Self { byte_range: map(self.byte_range), placeholder: self.placeholder.clone() }",
+        "gwt": null
+      }
+    },
+    {
+      "id": "SRC-0004/rule/byte-range-from-std-range",
+      "src": "SRC-0004",
+      "composition": "rule",
+      "terms": {
+        "condition": "ByteRange конвертируется из std::ops::Range<usize>: start = range.start (inclusive), end = range.end (exclusive)",
+        "numbers": null,
+        "formula": "From<Range<usize>> for ByteRange: { start: range.start, end: range.end }",
+        "gwt": {
+          "given": "Range { start: 3, end: 7 }",
+          "when": "ByteRange::from(range)",
+          "then": "ByteRange { start: 3, end: 7 }"
+        }
+      }
+    },
+    {
+      "id": "SRC-0004/rule/local-image-converted-to-image-on-serialization",
+      "src": "SRC-0004",
+      "composition": "rule",
+      "terms": {
+        "condition": "UserInput::LocalImage{path} конвертируется в UserInput::Image{image_url: base64-data-URL} во время сериализации запроса",
+        "numbers": null,
+        "formula": null,
+        "gwt": null
+      }
+    },
+    {
+      "id": "SRC-0004/rule/user-input-non-exhaustive",
+      "src": "SRC-0004",
+      "composition": "rule",
+      "terms": {
+        "condition": "UserInput помечен #[non_exhaustive] — внешние крейты не могут полагаться на закрытое перечисление вариантов (текущий перечень: text, image, local_image, skill, mention)",
+        "numbers": null,
+        "formula": null,
+        "gwt": null
+      }
+    },
+    {
+      "id": "SRC-0004/rule/text-elements-default-empty",
+      "src": "SRC-0004",
+      "composition": "rule",
+      "terms": {
+        "condition": "В UserInput::Text если text_elements отсутствует в payload — это пустой Vec",
+        "numbers": null,
+        "formula": "#[serde(default)] на Vec<TextElement>",
+        "gwt": {
+          "given": "wire JSON {type: \"text\", text: \"hi\"}",
+          "when": "deserialize",
+          "then": "UserInput::Text { text: \"hi\", text_elements: [] }"
+        }
+      }
+    },
+    {
+      "id": "SRC-0004/rule/mention-path-namespacing",
+      "src": "SRC-0004",
+      "composition": "rule",
+      "terms": {
+        "condition": "UserInput::Mention.path идентифицирует точную цель упоминания через схемы: app://<connector-id> или plugin://<plugin-name>@<marketplace-name>",
+        "numbers": null,
+        "formula": null,
+        "gwt": {
+          "given": "Mention { name: \"Slack\", path: \"app://slack-connector\" }",
+          "when": "интерпретация path",
+          "then": "цель — connector с id 'slack-connector'; для path 'plugin://my-plugin@market1' — плагин 'my-plugin' из маркетплейса 'market1'"
+        }
+      }
+    },
+    {
+      "id": "SRC-0004/rule/is-other-is-secret-defaults",
+      "src": "SRC-0004",
+      "composition": "rule",
+      "terms": {
+        "condition": "В RequestUserInputQuestion если поля isOther или isSecret отсутствуют в payload — оба = false",
+        "numbers": null,
+        "formula": "#[serde(rename = \"isOther\", default)] и #[serde(rename = \"isSecret\", default)]",
+        "gwt": {
+          "given": "wire JSON {id: \"q1\", header: \"H\", question: \"Q\"}",
+          "when": "deserialize",
+          "then": "is_other = false, is_secret = false"
+        }
+      }
+    },
+    {
+      "id": "SRC-0004/rule/answers-keyed-by-question-id",
+      "src": "SRC-0004",
+      "composition": "rule",
+      "terms": {
+        "condition": "RequestUserInputResponse.answers — HashMap, где ключ = id вопроса, значение = RequestUserInputAnswer{answers: Vec<String>}",
+        "numbers": null,
+        "formula": null,
+        "gwt": {
+          "given": "questions = [{id: \"q1\", ...}, {id: \"q2\", ...}]",
+          "when": "пользователь отвечает на оба",
+          "then": "answers = {\"q1\": {answers: [\"v1\"]}, \"q2\": {answers: [\"a\", \"b\"]}}"
+        }
+      }
+    },
+    {
+      "id": "SRC-0004/rule/wire-camel-case-with-snake-aliases",
+      "src": "SRC-0004",
+      "composition": "rule",
+      "terms": {
+        "condition": "При парсинге MCP wire-JSON: inputSchema (alias input_schema), outputSchema (alias output_schema), mimeType (alias mime_type), uriTemplate (alias uri_template) — оба варианта принимаются",
+        "numbers": null,
+        "formula": null,
+        "gwt": {
+          "given": "wire JSON Tool {name: \"x\", input_schema: {...}}",
+          "when": "Tool::from_mcp_value",
+          "then": "input_schema корректно распарсен через alias (несмотря на то что rename = inputSchema)"
+        }
+      }
+    },
+    {
+      "id": "SRC-0004/rule/meta-renamed-from-underscore",
+      "src": "SRC-0004",
+      "composition": "rule",
+      "terms": {
+        "condition": "Поле meta при сериализации/десериализации использует wire-ключ '_meta' (rename) для Tool, Resource, ResourceContent, CallToolResult; при отсутствии — пропускается (skip_serializing_if = Option::is_none)",
+        "numbers": null,
+        "formula": null,
+        "gwt": {
+          "given": "Tool{... meta: Some(json!({\"foo\": 1}))}",
+          "when": "сериализация",
+          "then": "wire JSON содержит ключ \"_meta\": {\"foo\": 1}"
+        }
+      }
+    }
+  ]
+}

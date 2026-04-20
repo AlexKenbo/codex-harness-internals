@@ -1,0 +1,754 @@
+{
+  "src": "SRC-0003",
+  "schema_version": "2.0",
+  "lens": "rule",
+  "compositions": [
+    {
+      "id": "SRC-0003/rule/agent-name-charset",
+      "src": "SRC-0003",
+      "composition": "rule",
+      "terms": {
+        "condition": "Имя агента (сегмент пути) обязано использовать только ASCII-lowercase, ASCII-digit и `_` — иначе validate_agent_name возвращает 'agent_name must use only lowercase letters, digits, and underscores'",
+        "numbers": null,
+        "formula": null,
+        "gwt": {"given": "agent_name = 'BadName'", "when": "AgentPath::root().join('BadName')", "then": "Err('agent_name must use only lowercase letters, digits, and underscores')"}
+      }
+    },
+    {
+      "id": "SRC-0003/rule/agent-name-non-empty",
+      "src": "SRC-0003",
+      "composition": "rule",
+      "terms": {
+        "condition": "Имя агента не может быть пустой строкой — validate_agent_name отвергает с 'agent_name must not be empty'",
+        "numbers": null,
+        "formula": null,
+        "gwt": {"given": "agent_name = ''", "when": "validate_agent_name", "then": "Err('agent_name must not be empty')"}
+      }
+    },
+    {
+      "id": "SRC-0003/rule/agent-name-reserved",
+      "src": "SRC-0003",
+      "composition": "rule",
+      "terms": {
+        "condition": "Зарезервированные имена сегментов: `root`, `.`, `..` — не могут использоваться как agent_name",
+        "numbers": null,
+        "formula": null,
+        "gwt": {"given": "reference = '../sibling'", "when": "AgentPath::root().resolve('../sibling')", "then": "Err('agent_name `..` is reserved')"}
+      }
+    },
+    {
+      "id": "SRC-0003/rule/agent-name-no-slash",
+      "src": "SRC-0003",
+      "composition": "rule",
+      "terms": {
+        "condition": "Сегмент имени агента не может содержать `/` — иначе ошибка 'agent_name must not contain `/`'",
+        "numbers": null,
+        "formula": null,
+        "gwt": {"given": "agent_name = 'a/b'", "when": "validate_agent_name", "then": "Err('agent_name must not contain `/`')"}
+      }
+    },
+    {
+      "id": "SRC-0003/rule/agent-path-must-start-with-root",
+      "src": "SRC-0003",
+      "composition": "rule",
+      "terms": {
+        "condition": "Абсолютный путь агента обязан начинаться с `/root` — иначе validate_absolute_path возвращает 'absolute agent paths must start with `/root`'",
+        "numbers": null,
+        "formula": null,
+        "gwt": {"given": "input = '/not-root'", "when": "AgentPath::try_from('/not-root')", "then": "Err('absolute agent paths must start with `/root`')"}
+      }
+    },
+    {
+      "id": "SRC-0003/rule/agent-path-no-trailing-slash",
+      "src": "SRC-0003",
+      "composition": "rule",
+      "terms": {
+        "condition": "Абсолютный путь не должен оканчиваться на `/` — validate_absolute_path возвращает 'absolute agent path must not end with `/`'; относительный аналог: 'relative agent path must not end with `/`'",
+        "numbers": null,
+        "formula": null,
+        "gwt": {"given": "path = '/root/researcher/'", "when": "validate_absolute_path", "then": "Err('absolute agent path must not end with `/`')"}
+      }
+    },
+    {
+      "id": "SRC-0003/rule/agent-path-non-empty-resolve",
+      "src": "SRC-0003",
+      "composition": "rule",
+      "terms": {
+        "condition": "Reference в AgentPath::resolve не может быть пустой строкой — иначе 'agent path must not be empty'",
+        "numbers": null,
+        "formula": null,
+        "gwt": {"given": "reference = ''", "when": "AgentPath::root().resolve('')", "then": "Err('agent path must not be empty')"}
+      }
+    },
+    {
+      "id": "SRC-0003/rule/known-plan-raw-aliases",
+      "src": "SRC-0003",
+      "composition": "rule",
+      "terms": {
+        "condition": "PlanType::from_raw_value распознаёт алиасы 'hc' → KnownPlan::Enterprise и 'education' → KnownPlan::Edu (в дополнение к 'enterprise' и 'edu'); KnownPlan deserialize также принимает alias 'hc' для Enterprise",
+        "numbers": null,
+        "formula": null,
+        "gwt": {"given": "raw = 'hc'", "when": "PlanType::from_raw_value('hc')", "then": "PlanType::Known(KnownPlan::Enterprise)"}
+      }
+    },
+    {
+      "id": "SRC-0003/rule/known-plan-case-insensitive",
+      "src": "SRC-0003",
+      "composition": "rule",
+      "terms": {
+        "condition": "PlanType::from_raw_value нормализует входное значение через ascii-lowercase до сравнения; регистр символов в raw не влияет на распознавание",
+        "numbers": null,
+        "formula": null,
+        "gwt": {"given": "raw = 'PRO'", "when": "PlanType::from_raw_value('PRO')", "then": "PlanType::Known(KnownPlan::Pro)"}
+      }
+    },
+    {
+      "id": "SRC-0003/rule/known-plan-unknown-preserves-raw",
+      "src": "SRC-0003",
+      "composition": "rule",
+      "terms": {
+        "condition": "Неизвестное raw-значение плана не отбрасывается — оборачивается в PlanType::Unknown(raw.to_string()) с сохранением оригинала",
+        "numbers": null,
+        "formula": null,
+        "gwt": {"given": "raw = 'mystery_plan'", "when": "PlanType::from_raw_value('mystery_plan')", "then": "PlanType::Unknown('mystery_plan')"}
+      }
+    },
+    {
+      "id": "SRC-0003/rule/account-plan-wire-names",
+      "src": "SRC-0003",
+      "composition": "rule",
+      "terms": {
+        "condition": "Wire-имена account::PlanType: SelfServeBusinessUsageBased ↔ 'self_serve_business_usage_based'; EnterpriseCbpUsageBased ↔ 'enterprise_cbp_usage_based'; ProLite ↔ 'prolite'; неизвестное значение десериализуется в PlanType::Unknown благодаря #[serde(other)]",
+        "numbers": null,
+        "formula": null,
+        "gwt": {"given": "JSON = '\"self_serve_business_usage_based\"'", "when": "serde_json::from_str::<PlanType>", "then": "PlanType::SelfServeBusinessUsageBased; обратная сериализация даёт ту же строку"}
+      }
+    },
+    {
+      "id": "SRC-0003/rule/account-plan-family-helpers",
+      "src": "SRC-0003",
+      "composition": "rule",
+      "terms": {
+        "condition": "is_team_like истинно только для PlanType::Team и SelfServeBusinessUsageBased; is_business_like истинно только для PlanType::Business и EnterpriseCbpUsageBased; группы не пересекаются",
+        "numbers": null,
+        "formula": null,
+        "gwt": {"given": "PlanType ∈ {Team, SelfServeBusinessUsageBased, Business, EnterpriseCbpUsageBased}", "when": "is_team_like / is_business_like", "then": "Team.is_team_like=true, SelfServeBusinessUsageBased.is_team_like=true, Business.is_team_like=false; Business.is_business_like=true, EnterpriseCbpUsageBased.is_business_like=true, Team.is_business_like=false"}
+      }
+    },
+    {
+      "id": "SRC-0003/rule/known-plan-workspace-account",
+      "src": "SRC-0003",
+      "composition": "rule",
+      "terms": {
+        "condition": "KnownPlan::is_workspace_account истинно для {Team, SelfServeBusinessUsageBased, Business, EnterpriseCbpUsageBased, Enterprise, Edu} и ложно для {Free, Go, Plus, Pro, ProLite}",
+        "numbers": null,
+        "formula": null,
+        "gwt": {"given": "KnownPlan = Enterprise", "when": "is_workspace_account()", "then": "true"}
+      }
+    },
+    {
+      "id": "SRC-0003/rule/provider-auth-default-timeout",
+      "src": "SRC-0003",
+      "composition": "rule",
+      "terms": {
+        "condition": "Если model_providers.<id>.auth.timeout_ms не задан в конфиге, применяется значение по умолчанию из DEFAULT_PROVIDER_AUTH_TIMEOUT_MS; значение должно быть NonZeroU64 (panic 'must be non-zero' при 0)",
+        "numbers": [
+          {"value": 5000, "kind": "default_timeout_ms"}
+        ],
+        "formula": "timeout = Duration::from_millis(timeout_ms)",
+        "gwt": {"given": "config без поля timeout_ms; DEFAULT_PROVIDER_AUTH_TIMEOUT_MS=5000", "when": "ModelProviderAuthInfo deserialize", "then": "timeout_ms = NonZeroU64(5000); timeout() = Duration::from_millis(5000)"}
+      }
+    },
+    {
+      "id": "SRC-0003/rule/provider-auth-default-refresh",
+      "src": "SRC-0003",
+      "composition": "rule",
+      "terms": {
+        "condition": "Если refresh_interval_ms не задан, используется DEFAULT_PROVIDER_AUTH_REFRESH_INTERVAL_MS; значение 0 отключает проактивное обновление токена (refresh_interval() возвращает None) — повторный запуск только после 401",
+        "numbers": [
+          {"value": 300000, "kind": "default_refresh_interval_ms"},
+          {"value": 0, "kind": "disable_proactive_refresh_marker"}
+        ],
+        "formula": "refresh_interval = NonZeroU64::new(refresh_interval_ms).map(Duration::from_millis)",
+        "gwt": {"given": "refresh_interval_ms = 0", "when": "ModelProviderAuthInfo::refresh_interval()", "then": "None — проактивное обновление отключено"}
+      }
+    },
+    {
+      "id": "SRC-0003/rule/provider-auth-deny-unknown-fields",
+      "src": "SRC-0003",
+      "composition": "rule",
+      "terms": {
+        "condition": "ModelProviderAuthInfo использует #[schemars(deny_unknown_fields)]; конфиг с неизвестными полями отвергается схемой",
+        "numbers": null,
+        "formula": null,
+        "gwt": null
+      }
+    },
+    {
+      "id": "SRC-0003/rule/provider-auth-cwd-fallback",
+      "src": "SRC-0003",
+      "composition": "rule",
+      "terms": {
+        "condition": "default_provider_auth_cwd сначала пробует AbsolutePathBuf::deserialize('.'); при неудаче — AbsolutePathBuf::current_dir(); при невозможности резолва — panic 'provider auth cwd must resolve'",
+        "numbers": null,
+        "formula": null,
+        "gwt": null
+      }
+    },
+    {
+      "id": "SRC-0003/rule/auto-compact-token-limit-clamp",
+      "src": "SRC-0003",
+      "composition": "rule",
+      "terms": {
+        "condition": "Эффективный auto_compact_token_limit ограничен 90% от context_window; при наличии конфигурируемого config_limit берётся min(config_limit, context_limit). Без context_window применяется только config_limit (может быть None)",
+        "numbers": [
+          {"value": 9, "kind": "compaction_numerator"},
+          {"value": 10, "kind": "compaction_denominator"}
+        ],
+        "formula": "context_limit = (context_window * 9) / 10; result = min(config_limit, context_limit) | context_limit | config_limit",
+        "gwt": {"given": "context_window = 200000, auto_compact_token_limit = 250000", "when": "ModelInfo::auto_compact_token_limit()", "then": "context_limit = 180000 (=200000*9/10); result = min(250000, 180000) = 180000"}
+      }
+    },
+    {
+      "id": "SRC-0003/rule/effective-context-window-default",
+      "src": "SRC-0003",
+      "composition": "rule",
+      "terms": {
+        "condition": "Если effective_context_window_percent не передан с сервера — применяется default 95% (default_effective_context_window_percent)",
+        "numbers": [
+          {"value": 95, "kind": "default_effective_context_window_percent"}
+        ],
+        "formula": null,
+        "gwt": {"given": "ModelInfo JSON без effective_context_window_percent", "when": "deserialize", "then": "effective_context_window_percent = 95"}
+      }
+    },
+    {
+      "id": "SRC-0003/rule/default-input-modalities",
+      "src": "SRC-0003",
+      "composition": "rule",
+      "terms": {
+        "condition": "Если input_modalities не передан с сервера — применяется консервативный дефолт [Text, Image] (legacy-совместимость)",
+        "numbers": null,
+        "formula": null,
+        "gwt": {"given": "ModelInfo JSON без input_modalities", "when": "deserialize → default_input_modalities()", "then": "input_modalities = [Text, Image]"}
+      }
+    },
+    {
+      "id": "SRC-0003/rule/personality-placeholder-substitution",
+      "src": "SRC-0003",
+      "composition": "rule",
+      "terms": {
+        "condition": "Если model_messages.instructions_template содержит подстроку '{{ personality }}' (PERSONALITY_PLACEHOLDER), она заменяется на значение personality_<variant> из ModelInstructionsVariables; при отсутствии значения подставляется пустая строка",
+        "numbers": null,
+        "formula": "result = template.replace('{{ personality }}', personality_message_or_empty)",
+        "gwt": {"given": "template = 'Hello {{ personality }}', personality_friendly = 'friendly', personality = Personality::Friendly", "when": "ModelInfo::get_model_instructions(Some(Friendly))", "then": "'Hello friendly'"}
+      }
+    },
+    {
+      "id": "SRC-0003/rule/personality-template-fallback",
+      "src": "SRC-0003",
+      "composition": "rule",
+      "terms": {
+        "condition": "Если instructions_template отсутствует, но personality запрошен — выбрасывается tracing::warn 'Model personality requested but model_messages is missing, falling back to base instructions.' и возвращается base_instructions",
+        "numbers": null,
+        "formula": null,
+        "gwt": {"given": "model_messages.instructions_template = None, base_instructions = 'base'", "when": "ModelInfo::get_model_instructions(Some(Friendly))", "then": "result = 'base'; warn-лог зафиксирован"}
+      }
+    },
+    {
+      "id": "SRC-0003/rule/personality-none-empty-message",
+      "src": "SRC-0003",
+      "composition": "rule",
+      "terms": {
+        "condition": "Personality::None всегда возвращает Some(пустая строка) из get_personality_message — независимо от заполненности personality_default; это гарантирует, что плейсхолдер заменяется на пустую строку",
+        "numbers": null,
+        "formula": null,
+        "gwt": {"given": "ModelInstructionsVariables { personality_default=None, friendly=None, pragmatic=None }; personality = Some(Personality::None)", "when": "get_personality_message", "then": "Some('') (пустая строка)"}
+      }
+    },
+    {
+      "id": "SRC-0003/rule/personality-default-fallback",
+      "src": "SRC-0003",
+      "composition": "rule",
+      "terms": {
+        "condition": "Если personality не передан (None) — get_personality_message возвращает personality_default.clone(); если personality_default отсутствует, результат = None",
+        "numbers": null,
+        "formula": null,
+        "gwt": {"given": "ModelInstructionsVariables { personality_default=Some('default'), ... }; personality = None", "when": "get_personality_message", "then": "Some('default')"}
+      }
+    },
+    {
+      "id": "SRC-0003/rule/instructions-variables-completeness",
+      "src": "SRC-0003",
+      "composition": "rule",
+      "terms": {
+        "condition": "ModelInstructionsVariables::is_complete = true только при всех трёх personality_default, personality_friendly, personality_pragmatic == Some(...); supports_personality на ModelMessages требует наличие placeholder И is_complete",
+        "numbers": null,
+        "formula": null,
+        "gwt": {"given": "personality_default=None, friendly=Some, pragmatic=Some", "when": "is_complete()", "then": "false"}
+      }
+    },
+    {
+      "id": "SRC-0003/rule/reasoning-effort-rank",
+      "src": "SRC-0003",
+      "composition": "rule",
+      "terms": {
+        "condition": "ReasoningEffort упорядочены по rank: None=0, Minimal=1, Low=2, Medium=3, High=4, XHigh=5; nearest_effort выбирает supported кандидата с минимальной |rank(candidate) - rank(target)|; при равенстве — первый встреченный",
+        "numbers": [
+          {"value": 0, "kind": "rank_none"},
+          {"value": 1, "kind": "rank_minimal"},
+          {"value": 2, "kind": "rank_low"},
+          {"value": 3, "kind": "rank_medium"},
+          {"value": 4, "kind": "rank_high"},
+          {"value": 5, "kind": "rank_xhigh"}
+        ],
+        "formula": "nearest = argmin(|effort_rank(candidate) - effort_rank(target)|)",
+        "gwt": {"given": "target = ReasoningEffort::XHigh (rank=5), supported = [Low (2), Medium (3)]", "when": "nearest_effort", "then": "Medium (дистанция 2 vs Low дистанция 3)"}
+      }
+    },
+    {
+      "id": "SRC-0003/rule/reasoning-effort-fromstr",
+      "src": "SRC-0003",
+      "composition": "rule",
+      "terms": {
+        "condition": "FromStr для ReasoningEffort парсит lowercase wire-имя (none/minimal/low/medium/high/xhigh) через serde_json::from_value; неизвестное значение → Err('invalid reasoning_effort: <s>')",
+        "numbers": null,
+        "formula": null,
+        "gwt": {"given": "s = 'unsupported'", "when": "'unsupported'.parse::<ReasoningEffort>()", "then": "Err('invalid reasoning_effort: unsupported')"}
+      }
+    },
+    {
+      "id": "SRC-0003/rule/model-preset-default-effort-fallback",
+      "src": "SRC-0003",
+      "composition": "rule",
+      "terms": {
+        "condition": "При конвертации ModelInfo → ModelPreset, если default_reasoning_level отсутствует, default_reasoning_effort = ReasoningEffort::None",
+        "numbers": null,
+        "formula": null,
+        "gwt": {"given": "ModelInfo { default_reasoning_level = None }", "when": "ModelPreset::from(info)", "then": "default_reasoning_effort = ReasoningEffort::None"}
+      }
+    },
+    {
+      "id": "SRC-0003/rule/model-preset-show-in-picker",
+      "src": "SRC-0003",
+      "composition": "rule",
+      "terms": {
+        "condition": "show_in_picker = true тогда и только тогда, когда info.visibility == ModelVisibility::List; для Hide и None show_in_picker = false",
+        "numbers": null,
+        "formula": "show_in_picker = (visibility == List)",
+        "gwt": {"given": "info.visibility = List", "when": "ModelPreset::from(info)", "then": "show_in_picker = true"}
+      }
+    },
+    {
+      "id": "SRC-0003/rule/model-preset-mark-default",
+      "src": "SRC-0003",
+      "composition": "rule",
+      "terms": {
+        "condition": "mark_default_by_picker_visibility сбрасывает все is_default; назначает is_default=true первому picker-visible presetу; если такого нет — первому в списке; гарантия: не более одного default",
+        "numbers": null,
+        "formula": null,
+        "gwt": {"given": "presets = [{show_in_picker=false}, {show_in_picker=true}, {show_in_picker=true}]", "when": "mark_default_by_picker_visibility(&mut presets)", "then": "presets[1].is_default = true; остальные false"}
+      }
+    },
+    {
+      "id": "SRC-0003/rule/model-preset-supports-fast-mode",
+      "src": "SRC-0003",
+      "composition": "rule",
+      "terms": {
+        "condition": "ModelPreset::supports_fast_mode() = true тогда и только тогда, когда additional_speed_tiers содержит литерал 'fast' (SPEED_TIER_FAST)",
+        "numbers": null,
+        "formula": null,
+        "gwt": {"given": "additional_speed_tiers = ['fast']", "when": "supports_fast_mode()", "then": "true"}
+      }
+    },
+    {
+      "id": "SRC-0003/rule/model-preset-filter-by-auth",
+      "src": "SRC-0003",
+      "composition": "rule",
+      "terms": {
+        "condition": "filter_by_auth: если chatgpt_mode == true — пропускаются все presets; иначе остаются только presets с supported_in_api == true",
+        "numbers": null,
+        "formula": null,
+        "gwt": {"given": "presets = [{supported_in_api=true}, {supported_in_api=false}], chatgpt_mode = false", "when": "filter_by_auth", "then": "результат = [{supported_in_api=true}]"}
+      }
+    },
+    {
+      "id": "SRC-0003/rule/mode-kind-aliases-to-default",
+      "src": "SRC-0003",
+      "composition": "rule",
+      "terms": {
+        "condition": "ModeKind десериализует значения {'code', 'pair_programming', 'execute', 'custom'} как Default через #[serde(alias=...)]; PairProgramming и Execute варианты пропускаются из serialize/deserialize (#[serde(skip_*)])",
+        "numbers": null,
+        "formula": null,
+        "gwt": {"given": "JSON ∈ {'\"code\"', '\"pair_programming\"', '\"execute\"', '\"custom\"'}", "when": "serde_json::from_str::<ModeKind>", "then": "ModeKind::Default для каждого"}
+      }
+    },
+    {
+      "id": "SRC-0003/rule/mode-kind-tui-visible",
+      "src": "SRC-0003",
+      "composition": "rule",
+      "terms": {
+        "condition": "is_tui_visible = true только для ModeKind::{Plan, Default}; PairProgramming и Execute не видны в TUI; константа TUI_VISIBLE_COLLABORATION_MODES = [Default, Plan]",
+        "numbers": null,
+        "formula": null,
+        "gwt": {"given": "ModeKind ∈ {Plan, Default, PairProgramming, Execute}", "when": "is_tui_visible()", "then": "Plan=true, Default=true, PairProgramming=false, Execute=false"}
+      }
+    },
+    {
+      "id": "SRC-0003/rule/mode-kind-allows-user-input",
+      "src": "SRC-0003",
+      "composition": "rule",
+      "terms": {
+        "condition": "allows_request_user_input = true только для ModeKind::Plan; остальные режимы (Default/PairProgramming/Execute) не разрешают запрос пользовательского ввода",
+        "numbers": null,
+        "formula": null,
+        "gwt": {"given": "mode = ModeKind::Default", "when": "allows_request_user_input()", "then": "false"}
+      }
+    },
+    {
+      "id": "SRC-0003/rule/collaboration-mask-clear-semantics",
+      "src": "SRC-0003",
+      "composition": "rule",
+      "terms": {
+        "condition": "В CollaborationModeMask Some(None) очищает Option-поле (reasoning_effort или developer_instructions); None оставляет текущее значение; Some(Some(value)) устанавливает новое; mask.name игнорируется при apply_mask",
+        "numbers": null,
+        "formula": null,
+        "gwt": {"given": "mode.settings = { reasoning_effort=Some(High), developer_instructions=Some('stay focused') }; mask = { reasoning_effort=Some(None), developer_instructions=Some(None) }", "when": "apply_mask(&mask)", "then": "settings.reasoning_effort = None, settings.developer_instructions = None; mode.mode сохранён"}
+      }
+    },
+    {
+      "id": "SRC-0003/rule/web-search-merge-overlay-priority",
+      "src": "SRC-0003",
+      "composition": "rule",
+      "terms": {
+        "condition": "WebSearchToolConfig::merge: overlay имеет приоритет per-field. context_size: other.or(self); allowed_domains: other.clone().or_else(self.clone); location: оба Some → WebSearchLocation::merge per-field overlay-then-base; иначе единственный Some, иначе None",
+        "numbers": null,
+        "formula": null,
+        "gwt": {"given": "base.allowed_domains = Some(['openai.com']), overlay.allowed_domains = None", "when": "merge", "then": "result.allowed_domains = Some(['openai.com']) (сохраняется из base, потому что overlay None)"}
+      }
+    },
+    {
+      "id": "SRC-0003/rule/web-search-location-merge",
+      "src": "SRC-0003",
+      "composition": "rule",
+      "terms": {
+        "condition": "WebSearchLocation::merge: per-field — overlay.field.clone().or_else(|| self.field.clone()); каждое поле (country/region/city/timezone) обрабатывается независимо",
+        "numbers": null,
+        "formula": null,
+        "gwt": {"given": "base = {country=Some('US'), region=Some('CA'), city=None, timezone=Some('America/Los_Angeles')}; overlay = {country=None, region=Some('WA'), city=Some('Seattle'), timezone=None}", "when": "base.merge(&overlay)", "then": "{country=Some('US'), region=Some('WA'), city=Some('Seattle'), timezone=Some('America/Los_Angeles')}"}
+      }
+    },
+    {
+      "id": "SRC-0003/rule/codex-err-retryable-set",
+      "src": "SRC-0003",
+      "composition": "rule",
+      "terms": {
+        "condition": "CodexErr::is_retryable = true только для {Stream, Timeout, UnexpectedStatus, ResponseStreamFailed, ConnectionFailed, InternalServerError, InternalAgentDied, Io, Json, TokioJoin}; всё остальное (включая UsageLimitReached, ServerOverloaded, RetryLimit, RefreshTokenFailed, Sandbox, ContextWindowExceeded, ThreadNotFound, AgentLimitReached, Spawn, SessionConfiguredNotFirstEvent, Interrupted, TurnAborted, Fatal, EnvVar, InvalidImageRequest, InvalidRequest, UnsupportedOperation, QuotaExceeded, UsageNotIncluded, LandlockSandboxExecutableNotProvided, LandlockRuleset, LandlockPathFd) → false",
+        "numbers": null,
+        "formula": null,
+        "gwt": {"given": "CodexErr::ServerOverloaded", "when": "is_retryable()", "then": "false (несмотря на общий характер ошибки сервера, ретрай не делается)"}
+      }
+    },
+    {
+      "id": "SRC-0003/rule/codex-err-protocol-mapping",
+      "src": "SRC-0003",
+      "composition": "rule",
+      "terms": {
+        "condition": "to_codex_protocol_error: ContextWindowExceeded→ContextWindowExceeded; {UsageLimitReached, QuotaExceeded, UsageNotIncluded}→UsageLimitExceeded; ServerOverloaded→ServerOverloaded; RetryLimit→ResponseTooManyFailedAttempts{http_status_code}; ConnectionFailed→HttpConnectionFailed{http_status_code}; ResponseStreamFailed→ResponseStreamConnectionFailed{http_status_code}; RefreshTokenFailed→Unauthorized; {SessionConfiguredNotFirstEvent, InternalServerError, InternalAgentDied}→InternalServerError; {UnsupportedOperation, ThreadNotFound, AgentLimitReached}→BadRequest; Sandbox→SandboxError; default→Other",
+        "numbers": null,
+        "formula": null,
+        "gwt": {"given": "CodexErr::RefreshTokenFailed(...)", "when": "to_codex_protocol_error()", "then": "CodexErrorInfo::Unauthorized"}
+      }
+    },
+    {
+      "id": "SRC-0003/rule/codex-err-http-status-extraction",
+      "src": "SRC-0003",
+      "composition": "rule",
+      "terms": {
+        "condition": "http_status_code_value: RetryLimit→err.status; UnexpectedStatus→err.status; ConnectionFailed→err.source.status(); ResponseStreamFailed→err.source.status(); все остальные варианты CodexErr → None; результат конвертируется в u16 через StatusCode::as_u16",
+        "numbers": null,
+        "formula": null,
+        "gwt": null
+      }
+    },
+    {
+      "id": "SRC-0003/rule/error-message-ui-budget",
+      "src": "SRC-0003",
+      "composition": "rule",
+      "terms": {
+        "condition": "Сообщения об ошибках для UI ограничены ERROR_MESSAGE_UI_MAX_BYTES = 2 KiB (2*1024 байт); усечение делается через truncate_text с TruncationPolicy::Bytes, использующее truncate_middle_chars",
+        "numbers": [
+          {"value": 2048, "kind": "error_message_ui_max_bytes"}
+        ],
+        "formula": "max_bytes = 2 * 1024 = 2048",
+        "gwt": {"given": "длинное сообщение ошибки длиной 5000 байт", "when": "get_error_message_ui", "then": "результат усечён до ≤ 2048 байт через truncate_middle_chars"}
+      }
+    },
+    {
+      "id": "SRC-0003/rule/sandbox-denied-message-source",
+      "src": "SRC-0003",
+      "composition": "rule",
+      "terms": {
+        "condition": "Для Sandbox(SandboxErr::Denied) UI-сообщение выбирается по приоритету: aggregated_output (если непустой после trim) → 'stderr\\nstdout' (оба непустые) → stderr (только stderr) → stdout (только stdout) → 'command failed inside sandbox with exit code {exit_code}' (оба пустые)",
+        "numbers": null,
+        "formula": null,
+        "gwt": {"given": "output.aggregated_output.text = ''; stderr = ''; stdout = ''; exit_code = 137", "when": "get_error_message_ui", "then": "'command failed inside sandbox with exit code 137'"}
+      }
+    },
+    {
+      "id": "SRC-0003/rule/sandbox-timeout-message",
+      "src": "SRC-0003",
+      "composition": "rule",
+      "terms": {
+        "condition": "Для Sandbox(SandboxErr::Timeout) UI-сообщение формируется как 'error: command timed out after {duration.as_millis()} ms'",
+        "numbers": null,
+        "formula": "message = format!('error: command timed out after {} ms', output.duration.as_millis())",
+        "gwt": {"given": "output.duration = Duration::from_millis(15000)", "when": "get_error_message_ui", "then": "'error: command timed out after 15000 ms'"}
+      }
+    },
+    {
+      "id": "SRC-0003/rule/unexpected-response-body-truncation",
+      "src": "SRC-0003",
+      "composition": "rule",
+      "terms": {
+        "condition": "Тело ответа в UnexpectedResponseError::display_body усекается до UNEXPECTED_RESPONSE_BODY_MAX_BYTES = 1000 байт через truncate_with_ellipsis с сохранением char-boundary",
+        "numbers": [
+          {"value": 1000, "kind": "unexpected_response_body_max_bytes"}
+        ],
+        "formula": "если text.len() > 1000 → cut = 1000; while !text.is_char_boundary(cut): cut -= 1; result = text[..cut] + '...'",
+        "gwt": {"given": "body длиной 5000 ASCII-байт", "when": "display_body", "then": "результат длиной 1003 байта (1000 + '...')"}
+      }
+    },
+    {
+      "id": "SRC-0003/rule/unexpected-response-empty-body",
+      "src": "SRC-0003",
+      "composition": "rule",
+      "terms": {
+        "condition": "Если body после trim пустое и не содержит парсимого .error.message — display_body возвращает строку 'Unknown error'",
+        "numbers": null,
+        "formula": null,
+        "gwt": {"given": "UnexpectedResponseError { body = '   ', ... }", "when": "display_body", "then": "'Unknown error'"}
+      }
+    },
+    {
+      "id": "SRC-0003/rule/unexpected-response-cloudflare-friendly",
+      "src": "SRC-0003",
+      "composition": "rule",
+      "terms": {
+        "condition": "friendly_message выводит CLOUDFLARE_BLOCKED_MESSAGE только при выполнении ВСЕХ условий: status == 403 (FORBIDDEN) И body содержит подстроку 'Cloudflare' И body содержит подстроку 'blocked'; иначе friendly_message = None",
+        "numbers": [
+          {"value": 403, "kind": "http_forbidden_status"}
+        ],
+        "formula": null,
+        "gwt": {"given": "status = 403, body = 'Sorry, you have been blocked by Cloudflare'", "when": "friendly_message", "then": "Some('Access blocked by Cloudflare. This usually happens when connecting from a restricted region (status 403)')"}
+      }
+    },
+    {
+      "id": "SRC-0003/rule/unexpected-response-extract-message",
+      "src": "SRC-0003",
+      "composition": "rule",
+      "terms": {
+        "condition": "extract_error_message парсит body как JSON и достаёт строку из path .error.message, после trim; пустая строка → None; невалидный JSON или отсутствие path → None",
+        "numbers": null,
+        "formula": null,
+        "gwt": {"given": "body = '{\"error\":{\"message\":\"  rate limited  \"}}'", "when": "extract_error_message", "then": "Some('rate limited')"}
+      }
+    },
+    {
+      "id": "SRC-0003/rule/usage-limit-custom-limit-name",
+      "src": "SRC-0003",
+      "composition": "rule",
+      "terms": {
+        "condition": "Если rate_limits.limit_name присутствует, не пуст после trim И не равен 'codex' (case-insensitive) — Display эмитит 'You\\'ve hit your usage limit for {limit_name}. Switch to another model now,{retry_suffix_after_or}'",
+        "numbers": null,
+        "formula": null,
+        "gwt": {"given": "rate_limits.limit_name = Some('reasoning'), resets_at = None", "when": "Display", "then": "'You\\'ve hit your usage limit for reasoning. Switch to another model now, or try again later.'"}
+      }
+    },
+    {
+      "id": "SRC-0003/rule/usage-limit-codex-limit-skipped",
+      "src": "SRC-0003",
+      "composition": "rule",
+      "terms": {
+        "condition": "Если limit_name (после trim, case-insensitive) равен 'codex' — кастомная ветка пропускается, выбирается ветка по promo_message или plan_type",
+        "numbers": null,
+        "formula": null,
+        "gwt": {"given": "rate_limits.limit_name = Some('CODEX'), promo_message = None, plan_type = Some(KnownPlan::Plus)", "when": "Display", "then": "сообщение по ветке Plus: 'Upgrade to Pro / purchase more credits ...'"}
+      }
+    },
+    {
+      "id": "SRC-0003/rule/usage-limit-by-plan",
+      "src": "SRC-0003",
+      "composition": "rule",
+      "terms": {
+        "condition": "Сообщение лимита по plan_type (KnownPlan): Plus → 'Upgrade to Pro' + ссылка + ссылка на покупку credits; {Team, SelfServeBusinessUsageBased, Business, EnterpriseCbpUsageBased} → 'send a request to your admin'; {Free, Go} → 'Upgrade to Plus'; {Pro, ProLite} → 'purchase more credits'; {Enterprise, Edu} → нейтральное; PlanType::Unknown(_) или None → нейтральное (через retry_suffix)",
+        "numbers": null,
+        "formula": null,
+        "gwt": {"given": "plan_type = Some(PlanType::Known(KnownPlan::Free)), resets_at = None, promo_message = None, rate_limits.limit_name = None", "when": "Display", "then": "'You\\'ve hit your usage limit. Upgrade to Plus to continue using Codex (https://chatgpt.com/explore/plus), or try again later.'"}
+      }
+    },
+    {
+      "id": "SRC-0003/rule/retry-suffix-format",
+      "src": "SRC-0003",
+      "composition": "rule",
+      "terms": {
+        "condition": "retry_suffix(resets_at): Some(t) → ' Try again at {format_retry_timestamp(t)}.'; None → ' Try again later.'. retry_suffix_after_or аналогично, но префикс ' or try again ...'",
+        "numbers": null,
+        "formula": null,
+        "gwt": {"given": "resets_at = None", "when": "retry_suffix(None)", "then": "' Try again later.'"}
+      }
+    },
+    {
+      "id": "SRC-0003/rule/format-retry-timestamp-same-day",
+      "src": "SRC-0003",
+      "composition": "rule",
+      "terms": {
+        "condition": "format_retry_timestamp в локальной TZ: если local_reset.date == local_now.date → '%-I:%M %p' (например '3:45 PM'); иначе '%b %-d{day_suffix}, %Y %-I:%M %p' (например 'Mar 21st, 2025 3:45 PM')",
+        "numbers": null,
+        "formula": null,
+        "gwt": null
+      }
+    },
+    {
+      "id": "SRC-0003/rule/day-suffix-rules",
+      "src": "SRC-0003",
+      "composition": "rule",
+      "terms": {
+        "condition": "day_suffix(day): days 11..=13 → 'th' (специальное правило подростковых чисел); иначе по day % 10: 1→'st', 2→'nd', 3→'rd', остальное→'th'",
+        "numbers": [
+          {"value": 11, "kind": "teen_lower_bound"},
+          {"value": 13, "kind": "teen_upper_bound"}
+        ],
+        "formula": "if day in 11..=13: 'th'; else match day % 10: 1→'st', 2→'nd', 3→'rd', _→'th'",
+        "gwt": {"given": "day ∈ {1, 2, 3, 11, 12, 13, 21, 22, 23}", "when": "day_suffix", "then": "1→'st', 2→'nd', 3→'rd', 11→'th', 12→'th', 13→'th', 21→'st', 22→'nd', 23→'rd'"}
+      }
+    },
+    {
+      "id": "SRC-0003/rule/format-si-suffix-units",
+      "src": "SRC-0003",
+      "composition": "rule",
+      "terms": {
+        "condition": "format_si_suffix использует UNITS = [(1000,'K'), (1_000_000,'M'), (1_000_000_000,'G')]; для каждой единицы выбирает frac_digits: 2 если round(100*n/scale) < 1000; 1 если round(10*n/scale) < 1000; 0 если round(n/scale) < 1000; выше 1000G — '{round(n/1e9)}G' через format_with_separators_with_formatter",
+        "numbers": [
+          {"value": 1000, "kind": "scale_K"},
+          {"value": 1000000, "kind": "scale_M"},
+          {"value": 1000000000, "kind": "scale_G"}
+        ],
+        "formula": "frac_digits selection: round(100*n/scale)<1000?2:(round(10*n/scale)<1000?1:0); scaled = round(value * 10^frac_digits); Decimal::multiply_pow10(-frac_digits)",
+        "gwt": {"given": "n ∈ {0, 999, 1000, 1200, 10000, 100000, 999500, 1000000, 1234000, 12345678, 999950000, 1000000000, 1234000000, 1234000000000}", "when": "format_si_suffix(n)", "then": "{0→'0', 999→'999', 1000→'1.00K', 1200→'1.20K', 10000→'10.0K', 100000→'100K', 999500→'1.00M', 1000000→'1.00M', 1234000→'1.23M', 12345678→'12.3M', 999950000→'1.00G', 1000000000→'1.00G', 1234000000→'1.23G', 1234000000000→'1,234G'}"}
+      }
+    },
+    {
+      "id": "SRC-0003/rule/format-si-suffix-non-negative",
+      "src": "SRC-0003",
+      "composition": "rule",
+      "terms": {
+        "condition": "format_si_suffix приводит n к max(0): отрицательные значения отображаются как 0",
+        "numbers": [
+          {"value": 0, "kind": "minimum_floor"}
+        ],
+        "formula": "n = n.max(0)",
+        "gwt": {"given": "n = -500", "when": "format_si_suffix(-500)", "then": "'0' (n приведён к 0 перед форматированием)"}
+      }
+    },
+    {
+      "id": "SRC-0003/rule/locale-formatter-fallback",
+      "src": "SRC-0003",
+      "composition": "rule",
+      "terms": {
+        "condition": "DecimalFormatter инициализируется через OnceLock: пытается построить из системной локали (sys_locale::get_locale().parse()); при неудаче — fallback на en-US (panic если en-US не парсится — должно быть всегда валидно)",
+        "numbers": null,
+        "formula": null,
+        "gwt": null
+      }
+    },
+    {
+      "id": "SRC-0003/rule/refresh-token-error-display",
+      "src": "SRC-0003",
+      "composition": "rule",
+      "terms": {
+        "condition": "RefreshTokenFailedError помечен #[error('{message}')]; Display возвращает поле message без преобразований; reason используется для категоризации, не для строкового представления",
+        "numbers": null,
+        "formula": null,
+        "gwt": {"given": "RefreshTokenFailedError::new(Expired, 'token expired at 2025-01-01')", "when": "to_string()", "then": "'token expired at 2025-01-01'"}
+      }
+    },
+    {
+      "id": "SRC-0003/rule/cancel-err-into-turn-aborted",
+      "src": "SRC-0003",
+      "composition": "rule",
+      "terms": {
+        "condition": "From<CancelErr> for CodexErr всегда возвращает CodexErr::TurnAborted независимо от содержимого CancelErr; информация о причине отмены теряется",
+        "numbers": null,
+        "formula": null,
+        "gwt": {"given": "CancelErr (любой вариант)", "when": "Into::<CodexErr>::into", "then": "CodexErr::TurnAborted (исходная причина не передаётся)"}
+      }
+    },
+    {
+      "id": "SRC-0003/rule/env-var-error-display",
+      "src": "SRC-0003",
+      "composition": "rule",
+      "terms": {
+        "condition": "EnvVarError::Display формирует 'Missing environment variable: `{var}`.' и опционально добавляет ' {instructions}', если instructions = Some(...)",
+        "numbers": null,
+        "formula": null,
+        "gwt": {"given": "EnvVarError { var = 'OPENAI_API_KEY', instructions = Some('Set via export OPENAI_API_KEY=...') }", "when": "to_string()", "then": "'Missing environment variable: `OPENAI_API_KEY`. Set via export OPENAI_API_KEY=...'"}
+      }
+    },
+    {
+      "id": "SRC-0003/rule/web-search-deny-unknown-fields",
+      "src": "SRC-0003",
+      "composition": "rule",
+      "terms": {
+        "condition": "Все web-search struct'ы (WebSearchLocation, WebSearchToolConfig, WebSearchFilters, WebSearchUserLocation, WebSearchConfig) помечены #[schemars(deny_unknown_fields)]: схема отвергает конфиг с неизвестными полями",
+        "numbers": null,
+        "formula": null,
+        "gwt": null
+      }
+    },
+    {
+      "id": "SRC-0003/rule/sandbox-mode-default-readonly",
+      "src": "SRC-0003",
+      "composition": "rule",
+      "terms": {
+        "condition": "Default для SandboxMode = ReadOnly (выбран как наименее привилегированный — opt-in для workspace-write/danger-full-access)",
+        "numbers": null,
+        "formula": null,
+        "gwt": {"given": "конфиг без явного sandbox_mode", "when": "SandboxMode::default()", "then": "SandboxMode::ReadOnly"}
+      }
+    },
+    {
+      "id": "SRC-0003/rule/approvals-reviewer-default-user",
+      "src": "SRC-0003",
+      "composition": "rule",
+      "terms": {
+        "condition": "Default для ApprovalsReviewer = User; альтернатива GuardianSubagent — opt-in для делегирования approval решений subagentу с risk-based decision framework",
+        "numbers": null,
+        "formula": null,
+        "gwt": {"given": "конфиг без явного approvals.reviewer", "when": "ApprovalsReviewer::default()", "then": "ApprovalsReviewer::User"}
+      }
+    },
+    {
+      "id": "SRC-0003/rule/windows-sandbox-default-disabled",
+      "src": "SRC-0003",
+      "composition": "rule",
+      "terms": {
+        "condition": "Default для WindowsSandboxLevel = Disabled — Windows-sandbox по умолчанию выключен; включается явно через RestrictedToken или Elevated",
+        "numbers": null,
+        "formula": null,
+        "gwt": {"given": "конфиг без явного значения", "when": "WindowsSandboxLevel::default()", "then": "WindowsSandboxLevel::Disabled"}
+      }
+    },
+    {
+      "id": "SRC-0003/rule/alt-screen-default-auto",
+      "src": "SRC-0003",
+      "composition": "rule",
+      "terms": {
+        "condition": "Default для AltScreenMode = Auto: автоматическое определение терминального мультиплексора; в Zellij альтернативный экран отключается (для сохранения scrollback), в остальных терминалах — включается; CLI флаг --no-alt-screen переопределяет настройку",
+        "numbers": null,
+        "formula": null,
+        "gwt": null
+      }
+    }
+  ]
+}

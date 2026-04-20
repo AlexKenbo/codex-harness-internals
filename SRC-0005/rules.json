@@ -1,0 +1,1025 @@
+{
+  "src": "SRC-0005",
+  "schema_version": "2.0",
+  "lens": "rule",
+  "compositions": [
+    {
+      "id": "SRC-0005/rule/log-partition-size-limit",
+      "src": "SRC-0005",
+      "composition": "rule",
+      "terms": {
+        "condition": "Каждая партиция логов (per thread_id для тредовых, per process_uuid для threadless, плюс отдельная партиция для threadless с process_uuid IS NULL) удерживается так, чтобы SUM(estimated_bytes) <= LOG_PARTITION_SIZE_LIMIT_BYTES; при превышении удаляются строки с newest-first cumulative_bytes > лимита",
+        "numbers": [
+          {
+            "value": 10485760,
+            "kind": "threshold (bytes, = 10 * 1024 * 1024)"
+          }
+        ],
+        "formula": "estimated_bytes = length(feedback_log_body OR message) + length(level) + length(target) + length(module_path?) + length(file?); cumulative_bytes = SUM(estimated_bytes) OVER (PARTITION BY thread_id|process_uuid ORDER BY ts DESC, ts_nanos DESC, id DESC); удаляются строки где cumulative_bytes > LOG_PARTITION_SIZE_LIMIT_BYTES",
+        "gwt": {
+          "given": "thread_id='thread-1' имеет 2 строки по 6 MiB feedback_log_body (ts=1, ts=2)",
+          "when": "insert_logs срабатывает второй вставкой и запускает prune_logs_after_insert",
+          "then": "cumulative_bytes для ts=1 (старейшая, считая newest-first это вторая в кумуляте) превышает 10 MiB → удаляется, остаётся только ts=2; rows.len()=1, ts=2"
+        }
+      }
+    },
+    {
+      "id": "SRC-0005/rule/log-partition-row-limit",
+      "src": "SRC-0005",
+      "composition": "rule",
+      "terms": {
+        "condition": "Каждая партиция логов (per thread_id, per process_uuid threadless, threadless null process_uuid) удерживается так, чтобы COUNT(*) <= LOG_PARTITION_ROW_LIMIT; при превышении удаляются самые старые строки",
+        "numbers": [
+          {
+            "value": 1000,
+            "kind": "threshold (rows per partition)"
+          }
+        ],
+        "formula": "row_number = ROW_NUMBER() OVER (PARTITION BY thread_id|process_uuid ORDER BY ts DESC, ts_nanos DESC, id DESC); удаляются строки где row_number > LOG_PARTITION_ROW_LIMIT",
+        "gwt": {
+          "given": "thread_id='thread-row-limit' получил вставку 1001 строки (ts от 1 до 1001)",
+          "when": "insert_logs триггерит prune_logs_after_insert",
+          "then": "после prune остаётся ровно 1000 строк, минимальный сохранённый ts=2, максимальный ts=1001 (самая старая ts=1 удалена)"
+        }
+      }
+    },
+    {
+      "id": "SRC-0005/rule/single-oversized-log-row-removed",
+      "src": "SRC-0005",
+      "composition": "rule",
+      "terms": {
+        "condition": "Если в партиции единственная строка превышает LOG_PARTITION_SIZE_LIMIT_BYTES, она удаляется (бюджет 0 → newest-first cumulative_bytes для неё уже > лимита)",
+        "numbers": [
+          {
+            "value": 10485760,
+            "kind": "threshold (bytes)"
+          },
+          {
+            "value": 11534336,
+            "kind": "пример из тестов: 11 MiB (= 11 * 1024 * 1024)"
+          }
+        ],
+        "formula": "cumulative_bytes(самая новая) = estimated_bytes(самая новая); если > 10 MiB → удалить",
+        "gwt": {
+          "given": "вставлен один LogEntry с feedback_log_body длиной 11 MiB ('d'.repeat(11*1024*1024)) и thread_id='thread-oversized'",
+          "when": "insert_logs запускает prune_logs_after_insert",
+          "then": "query_logs(thread_ids=['thread-oversized']) возвращает пустой результат — единственная строка удалена"
+        }
+      }
+    },
+    {
+      "id": "SRC-0005/rule/log-retention-window",
+      "src": "SRC-0005",
+      "composition": "rule",
+      "terms": {
+        "condition": "При запуске StateRuntime::init выполняется run_logs_startup_maintenance, который удаляет все строки logs со ts < (now - LOG_RETENTION_DAYS дней)",
+        "numbers": [
+          {
+            "value": 10,
+            "kind": "retention window (days)"
+          }
+        ],
+        "formula": "cutoff_ts = (Utc::now() - chrono::Duration::days(LOG_RETENTION_DAYS)).timestamp(); DELETE FROM logs WHERE ts < cutoff_ts",
+        "gwt": {
+          "given": "logs DB содержит строки с ts = (now - 11 дней) и ts = (now - 5 дней)",
+          "when": "StateRuntime::init вызывает run_logs_startup_maintenance",
+          "then": "строки старше 10 дней удалены; оставшиеся подвергаются WAL checkpoint(TRUNCATE) и incremental_vacuum (best-effort)"
+        }
+      }
+    },
+    {
+      "id": "SRC-0005/rule/feedback-logs-bytes-cap",
+      "src": "SRC-0005",
+      "composition": "rule",
+      "terms": {
+        "condition": "query_feedback_logs_for_threads возвращает строки в порядке от старой к новой; новейшая строка добавляется только если total_bytes + line.len() <= LOG_PARTITION_SIZE_LIMIT_BYTES, иначе цикл прерывается; SQL дополнительно ограничивает выборку cumulative_estimated_bytes <= LOG_PARTITION_SIZE_LIMIT_BYTES",
+        "numbers": [
+          {
+            "value": 10485760,
+            "kind": "max_bytes из LOG_PARTITION_SIZE_LIMIT_BYTES"
+          }
+        ],
+        "formula": "max_bytes = usize::try_from(LOG_PARTITION_SIZE_LIMIT_BYTES).unwrap_or(usize::MAX); for line in lines (newest-first): if total_bytes + line.len() > max_bytes → break, else total_bytes += line.len()",
+        "gwt": {
+          "given": "thread-oversized содержит две строки: 'small' и 11 MiB feedback_log_body",
+          "when": "вызывается query_feedback_logs('thread-oversized')",
+          "then": "результат пустой Vec<u8> — newest 11 MiB строка превышает 10 MiB бюджета и приводит к break ещё до накопления; SQL CTE bounded_feedback_logs тоже её отфильтровывает"
+        }
+      }
+    },
+    {
+      "id": "SRC-0005/rule/feedback-logs-latest-process-only",
+      "src": "SRC-0005",
+      "composition": "rule",
+      "terms": {
+        "condition": "При сборе feedback-логов для треда подмешиваются только threadless строки с process_uuid, равным последнему ненулевому process_uuid этого треда (latest_processes CTE — выбирает process_uuid с непустым значением по ts DESC, ts_nanos DESC, id DESC LIMIT 1)",
+        "numbers": [],
+        "formula": "latest_process_uuid(thread_id) = SELECT process_uuid FROM logs WHERE logs.thread_id = thread_id AND process_uuid IS NOT NULL ORDER BY ts DESC, ts_nanos DESC, id DESC LIMIT 1; включаются threadless строки только если их process_uuid IN latest_processes",
+        "gwt": {
+          "given": "тред 'thread-1' оставил логи в proc-old (ts=2) и proc-new (ts=3); threadless строки есть в proc-old (ts=1) и proc-new (ts=4)",
+          "when": "query_feedback_logs('thread-1')",
+          "then": "результат содержит ts=2 (тред proc-old), ts=3 (тред proc-new) и ts=4 (threadless proc-new); ts=1 (threadless proc-old) исключён — proc-old уже не latest"
+        }
+      }
+    },
+    {
+      "id": "SRC-0005/rule/empty-thread-list-feedback-shortcut",
+      "src": "SRC-0005",
+      "composition": "rule",
+      "terms": {
+        "condition": "Если thread_ids пуст в query_feedback_logs_for_threads — возвращается пустой Vec<u8> без обращения к БД",
+        "numbers": [],
+        "formula": null,
+        "gwt": null
+      }
+    },
+    {
+      "id": "SRC-0005/rule/db-filename-versioning",
+      "src": "SRC-0005",
+      "composition": "rule",
+      "terms": {
+        "condition": "Имя файла БД формируется по шаблону '<base_name>_<version>.sqlite'; при init все файлы с unversioned именем '<base>.sqlite' и любые '<base>_<digits+>.sqlite', не совпадающие с текущей версией, удаляются вместе с их -wal/-shm/-journal сидекарами; файлы с любыми другими именами (например 'state.sqlite_backup', '123') не трогаются",
+        "numbers": [],
+        "formula": "filename = format!('{base_name}_{version}.sqlite'); should_remove(file_name) = (нормализованное file_name по суффиксам '-wal','-shm','-journal' != current_name) AND (нормализованное == '<base>.sqlite' OR совпадает с шаблоном '<base>_<digits+>.sqlite')",
+        "gwt": {
+          "given": "codex_home содержит файлы: 'state.sqlite' и 'state_<previous_version>.sqlite' с сидекарами '-wal','-shm','-journal', а также unrelated 'state.sqlite_backup' и numeric-named '123'",
+          "when": "StateRuntime::init выполняется",
+          "then": "удалены: 'state.sqlite{,-wal,-shm,-journal}' и 'state_<previous_version>.sqlite{,-wal,-shm,-journal}'; сохранены: текущий 'state_<STATE_DB_VERSION>.sqlite', 'state.sqlite_backup' и '123'"
+        }
+      }
+    },
+    {
+      "id": "SRC-0005/rule/legacy-cleanup-sort-order",
+      "src": "SRC-0005",
+      "composition": "rule",
+      "terms": {
+        "condition": "При удалении legacy DB файлов пути сортируются по убыванию длины имени (std::cmp::Reverse(path.as_os_str().len())) — сидекары -wal/-shm/-journal удаляются раньше основного файла, что необходимо на Windows",
+        "numbers": [],
+        "formula": "legacy_paths.sort_by_key(|path| Reverse(path.as_os_str().len()))",
+        "gwt": {
+          "given": "[ 'state.sqlite' (12), 'state.sqlite-wal' (16), 'state.sqlite-shm' (16), 'state.sqlite-journal' (20) ]",
+          "when": "сортировка по Reverse(len)",
+          "then": "порядок удаления: 'state.sqlite-journal', затем '-wal' и '-shm' (по 16), затем 'state.sqlite' — основной файл удаляется последним"
+        }
+      }
+    },
+    {
+      "id": "SRC-0005/rule/state-db-incremental-auto-vacuum",
+      "src": "SRC-0005",
+      "composition": "rule",
+      "terms": {
+        "condition": "После открытия state DB и применения миграций, если PRAGMA auto_vacuum != INCREMENTAL (значение 2 у sqlite), выполняется PRAGMA auto_vacuum=INCREMENTAL и одиночный VACUUM (best-effort); затем PRAGMA incremental_vacuum (best-effort); для logs DB — auto_vacuum=INCREMENTAL устанавливается через SqliteAutoVacuum::Incremental в options без принудительного VACUUM",
+        "numbers": [
+          {
+            "value": 2,
+            "kind": "SQLite auto_vacuum INCREMENTAL код"
+          }
+        ],
+        "formula": "SqliteAutoVacuum::Incremental as i64 == 2; if PRAGMA auto_vacuum != 2 → PRAGMA auto_vacuum = INCREMENTAL; VACUUM (best-effort, lock errors игнорируются)",
+        "gwt": {
+          "given": "logs DB только что открыт через open_logs_sqlite",
+          "when": "тест читает PRAGMA auto_vacuum",
+          "then": "значение = 2 (INCREMENTAL); миграция выполнена"
+        }
+      }
+    },
+    {
+      "id": "SRC-0005/rule/sqlite-pool-options",
+      "src": "SRC-0005",
+      "composition": "rule",
+      "terms": {
+        "condition": "Базовые опции SqliteConnectOptions для всех подключений: create_if_missing=true, journal_mode=WAL, synchronous=NORMAL, busy_timeout=5 секунд, log_statements=Off; пулы (state и logs) ограничены max_connections=5",
+        "numbers": [
+          {
+            "value": 5,
+            "kind": "busy_timeout (seconds)"
+          },
+          {
+            "value": 5,
+            "kind": "max_connections"
+          }
+        ],
+        "formula": "SqliteConnectOptions::new().filename(path).create_if_missing(true).journal_mode(WAL).synchronous(Normal).busy_timeout(Duration::from_secs(5)).log_statements(Off); SqlitePoolOptions::new().max_connections(5)",
+        "gwt": {
+          "given": "open_state_sqlite вызывается с любым корректным путём",
+          "when": "SqlitePoolOptions::new().max_connections(5).connect_with(options)",
+          "then": "максимум 5 одновременных подключений в пуле, busy_timeout = 5 секунд при конкурентном доступе"
+        }
+      }
+    },
+    {
+      "id": "SRC-0005/rule/runtime-migrator-tolerates-newer-versions",
+      "src": "SRC-0005",
+      "composition": "rule",
+      "terms": {
+        "condition": "runtime_state_migrator не падает с MigrateError::VersionMissing для уже применённых миграций с номерами выше известных текущему бинарю; строгий STATE_MIGRATOR такие миграции отвергает (используется в тестах для контраста)",
+        "numbers": [],
+        "formula": null,
+        "gwt": {
+          "given": "state DB содержит applied_migrations с version=9999 (искусственно вставленная 'future migration')",
+          "when": "open_state_sqlite запускает runtime_state_migrator",
+          "then": "миграция проходит без ошибок; параллельно STATE_MIGRATOR на той же БД возвращает MigrateError::VersionMissing(9999)"
+        }
+      }
+    },
+    {
+      "id": "SRC-0005/rule/agent-job-cancellation-only-from-pending-or-running",
+      "src": "SRC-0005",
+      "composition": "rule",
+      "terms": {
+        "condition": "mark_agent_job_cancelled(job_id, reason) переводит job в Cancelled только если status IN (Pending, Running); запись reason в last_error; возвращает true если rows_affected > 0",
+        "numbers": [],
+        "formula": "UPDATE agent_jobs SET status='Cancelled', updated_at=now, completed_at=now, last_error=? WHERE id=? AND status IN ('Pending','Running')",
+        "gwt": {
+          "given": "job в status='Completed'",
+          "when": "вызов mark_agent_job_cancelled(job_id, 'reason')",
+          "then": "rows_affected=0 → возвращает false; статус не меняется"
+        }
+      }
+    },
+    {
+      "id": "SRC-0005/rule/agent-job-item-result-atomic-completion",
+      "src": "SRC-0005",
+      "composition": "rule",
+      "terms": {
+        "condition": "report_agent_job_item_result атомарно завершает item только если status='Running' И assigned_thread_id = reporting_thread_id; иначе rows_affected=0 (поздний report или другой тред); при успехе устанавливаются status='Completed', result_json, reported_at=completed_at=updated_at=now, assigned_thread_id=NULL",
+        "numbers": [],
+        "formula": "UPDATE agent_job_items SET status='Completed', result_json=?, reported_at=?, completed_at=?, updated_at=?, last_error=NULL, assigned_thread_id=NULL WHERE job_id=? AND item_id=? AND status='Running' AND assigned_thread_id=?",
+        "gwt": {
+          "given": "job/item был в Running с assigned_thread_id='thread-1'; затем mark_agent_job_item_failed перевёл item в Failed",
+          "when": "report_agent_job_item_result(job_id, item_id, 'thread-1', json!({'late': true}))",
+          "then": "accepted=false (rows_affected=0); item.status остаётся Failed; item.result_json = None; item.last_error = Some('missing report')"
+        }
+      }
+    },
+    {
+      "id": "SRC-0005/rule/agent-job-item-attempt-counter",
+      "src": "SRC-0005",
+      "composition": "rule",
+      "terms": {
+        "condition": "Каждый перевод item из Pending в Running через mark_agent_job_item_running[_with_thread] увеличивает attempt_count на 1; при возврате в Pending (mark_agent_job_item_pending) attempt_count не сбрасывается",
+        "numbers": [
+          {
+            "value": 1,
+            "kind": "attempt increment"
+          }
+        ],
+        "formula": "UPDATE agent_job_items SET status='Running', attempt_count = attempt_count + 1, updated_at=?, last_error=NULL, assigned_thread_id=? WHERE job_id=? AND item_id=? AND status='Pending'",
+        "gwt": {
+          "given": "item только что создан (attempt_count=0, status=Pending)",
+          "when": "mark_agent_job_item_running_with_thread(job_id, item_id, thread_id) — переводит в Running",
+          "then": "rows_affected>0 → возвращает true; attempt_count в БД равен 1"
+        }
+      }
+    },
+    {
+      "id": "SRC-0005/rule/agent-job-item-completed-requires-result",
+      "src": "SRC-0005",
+      "composition": "rule",
+      "terms": {
+        "condition": "mark_agent_job_item_completed помечает item как Completed только если status='Running' И result_json IS NOT NULL — иначе rows_affected=0",
+        "numbers": [],
+        "formula": "UPDATE agent_job_items SET status='Completed', completed_at=?, updated_at=?, assigned_thread_id=NULL WHERE job_id=? AND item_id=? AND status='Running' AND result_json IS NOT NULL",
+        "gwt": {
+          "given": "item в status='Running' но result_json IS NULL",
+          "when": "вызов mark_agent_job_item_completed(job_id, item_id)",
+          "then": "rows_affected=0; статус не меняется (item остаётся Running без result_json)"
+        }
+      }
+    },
+    {
+      "id": "SRC-0005/rule/backfill-singleton-row",
+      "src": "SRC-0005",
+      "composition": "rule",
+      "terms": {
+        "condition": "backfill_state — singleton с id=1; ensure_backfill_state_row INSERT id=1 status=Pending ON CONFLICT(id) DO NOTHING обеспечивает наличие ровно одной строки",
+        "numbers": [
+          {
+            "value": 1,
+            "kind": "singleton row id"
+          }
+        ],
+        "formula": "INSERT INTO backfill_state (id, status, last_watermark, last_success_at, updated_at) VALUES (1, 'Pending', NULL, NULL, now) ON CONFLICT(id) DO NOTHING",
+        "gwt": {
+          "given": "свежая БД без backfill_state записи",
+          "when": "runtime.get_backfill_state()",
+          "then": "ensure_backfill_state_row создаёт запись id=1 status=Pending; возвращает BackfillState{status: Pending, last_watermark: None, last_success_at: None}"
+        }
+      }
+    },
+    {
+      "id": "SRC-0005/rule/backfill-claim-singleton-with-lease",
+      "src": "SRC-0005",
+      "composition": "rule",
+      "terms": {
+        "condition": "try_claim_backfill переводит singleton row в Running только если status != Complete И (status != Running ИЛИ updated_at <= now - lease_seconds); в противном случае возвращает false; статус Complete блокирует claim навсегда",
+        "numbers": [],
+        "formula": "lease_cutoff = now - max(lease_seconds, 0); UPDATE backfill_state SET status='Running', updated_at=now WHERE id=1 AND status != 'Complete' AND (status != 'Running' OR updated_at <= lease_cutoff); claim успешен ⟺ rows_affected == 1",
+        "gwt": {
+          "given": "первый claim с lease_seconds=3600 успешен (rows_affected=1); затем сразу второй try_claim",
+          "when": "duplicate_claim = try_claim_backfill(3600) — текущая запись Running, updated_at свежий (≤ 3600s)",
+          "then": "duplicate_claim = false; затем когда updated_at искусственно установлен на (now - 10000) — try_claim_backfill(10) возвращает true (lease протух)"
+        }
+      }
+    },
+    {
+      "id": "SRC-0005/rule/backfill-blocked-after-complete",
+      "src": "SRC-0005",
+      "composition": "rule",
+      "terms": {
+        "condition": "После mark_backfill_complete singleton имеет status='Complete'; любой последующий try_claim_backfill возвращает false независимо от lease_seconds",
+        "numbers": [],
+        "formula": "WHERE id=1 AND status != 'Complete' исключает Complete-строку из любого UPDATE",
+        "gwt": {
+          "given": "mark_backfill_complete выполнен, status='Complete'",
+          "when": "try_claim_backfill(3600)",
+          "then": "claim_after_complete = false — UPDATE не находит подходящих строк"
+        }
+      }
+    },
+    {
+      "id": "SRC-0005/rule/backfill-complete-preserves-watermark",
+      "src": "SRC-0005",
+      "composition": "rule",
+      "terms": {
+        "condition": "mark_backfill_complete(last_watermark) использует COALESCE(?, last_watermark) — если передан None, сохраняется существующий watermark; last_success_at и updated_at устанавливаются в now",
+        "numbers": [],
+        "formula": "UPDATE backfill_state SET status='Complete', last_watermark=COALESCE(?, last_watermark), last_success_at=?, updated_at=? WHERE id=1",
+        "gwt": {
+          "given": "checkpoint_backfill('sessions/2026/01/27/rollout-a.jsonl') установил last_watermark",
+          "when": "mark_backfill_complete(Some('sessions/2026/01/28/rollout-b.jsonl'))",
+          "then": "last_watermark = 'sessions/2026/01/28/rollout-b.jsonl'; last_success_at заполнен"
+        }
+      }
+    },
+    {
+      "id": "SRC-0005/rule/remote-control-key-app-server-client-name",
+      "src": "SRC-0005",
+      "composition": "rule",
+      "terms": {
+        "condition": "Уникальный ключ remote_control_enrollments: (websocket_url, account_id, app_server_client_name) — Option<String> сериализуется как пустая строка ('') для NULL; при чтении обратно пустая строка декодируется в None",
+        "numbers": [],
+        "formula": "remote_control_app_server_client_name_key(opt) = opt.unwrap_or(''); app_server_client_name_from_key(s) = if s.is_empty() { None } else { Some(s) }",
+        "gwt": {
+          "given": "две записи с одинаковым websocket_url и account_id='account-a' vs 'account-b', обе с app_server_client_name=Some('desktop-client')",
+          "when": "get_remote_control_enrollment(url, 'account-a', Some('desktop-client'))",
+          "then": "возвращает запись с server_id='srv_e_first'; повторный запрос с 'account-missing' → None; запрос с 'account-a', Some('other-client') → None (другой ключ)"
+        }
+      }
+    },
+    {
+      "id": "SRC-0005/rule/thread-spawn-edge-one-parent-per-child",
+      "src": "SRC-0005",
+      "composition": "rule",
+      "terms": {
+        "condition": "Уникальность ребра spawn по child_thread_id: один parent на ребёнка. ON CONFLICT(child_thread_id) DO UPDATE SET parent=excluded.parent, status=excluded.status (для upsert) или DO NOTHING (для insert_if_absent и для авто-вставки из source)",
+        "numbers": [],
+        "formula": "INSERT INTO thread_spawn_edges (parent_thread_id, child_thread_id, status) VALUES (?, ?, ?) ON CONFLICT(child_thread_id) DO UPDATE SET parent_thread_id = excluded.parent_thread_id, status = excluded.status",
+        "gwt": {
+          "given": "ребро (parent='A', child='C', status='Open') уже существует",
+          "when": "upsert_thread_spawn_edge('B', 'C', 'Closed')",
+          "then": "ON CONFLICT(child_thread_id) сработал → запись стала (parent='B', child='C', status='Closed') — у C ровно один parent"
+        }
+      }
+    },
+    {
+      "id": "SRC-0005/rule/thread-spawn-descendants-bfs-order",
+      "src": "SRC-0005",
+      "composition": "rule",
+      "terms": {
+        "condition": "list_thread_spawn_descendants_with_status выдаёт потомков breadth-first: ORDER BY depth ASC, child_thread_id ASC; depth у прямых детей = 1, у внуков = 2, и т.д.",
+        "numbers": [
+          {
+            "value": 1,
+            "kind": "depth прямых детей"
+          }
+        ],
+        "formula": "WITH RECURSIVE subtree(child_thread_id, depth) AS (SELECT child_thread_id, 1 ... UNION ALL SELECT edge.child_thread_id, subtree.depth+1 ...) SELECT child_thread_id FROM subtree ORDER BY depth ASC, child_thread_id ASC",
+        "gwt": {
+          "given": "parent → child → grandchild, обе ребра status=Open",
+          "when": "list_thread_spawn_descendants_with_status(parent, Open)",
+          "then": "результат = [child, grandchild] (BFS)"
+        }
+      }
+    },
+    {
+      "id": "SRC-0005/rule/thread-spawn-find-by-path-uniqueness",
+      "src": "SRC-0005",
+      "composition": "rule",
+      "terms": {
+        "condition": "find_thread_spawn_child_by_path / find_thread_spawn_descendant_by_path требуют уникальность результата по agent_path; если найдено больше одного — возвращается ошибка 'multiple agents found for canonical path `<path>`'; LIMIT 2 в SQL ограничивает выборку",
+        "numbers": [
+          {
+            "value": 2,
+            "kind": "LIMIT для дешёвой проверки уникальности"
+          }
+        ],
+        "formula": "SELECT threads.id FROM thread_spawn_edges JOIN threads ... WHERE ... ORDER BY threads.id LIMIT 2; затем in-Rust: ids.len() == 0 → None, == 1 → Some, else → Err",
+        "gwt": {
+          "given": "у parent_thread_id есть два дочерних треда с одинаковым agent_path='canon/path'",
+          "when": "find_thread_spawn_child_by_path(parent_thread_id, 'canon/path')",
+          "then": "SELECT с LIMIT 2 возвращает 2 строки → возвращается Err 'multiple agents found for canonical path `canon/path`'"
+        }
+      }
+    },
+    {
+      "id": "SRC-0005/rule/thread-list-excludes-empty-first-message",
+      "src": "SRC-0005",
+      "composition": "rule",
+      "terms": {
+        "condition": "push_thread_filters всегда добавляет 'AND threads.first_user_message <> '' — треды без первого пользовательского сообщения не попадают в list_threads, list_thread_ids и find_thread_by_exact_title",
+        "numbers": [],
+        "formula": "WHERE 1=1 AND threads.archived = (1|0) AND threads.first_user_message <> '' [AND threads.source IN (...)] [AND threads.model_provider IN (...)] [AND instr(threads.title, search_term) > 0]",
+        "gwt": {
+          "given": "тред с first_user_message=''",
+          "when": "list_threads(...)",
+          "then": "тред не возвращается — фильтр first_user_message <> '' исключает его"
+        }
+      }
+    },
+    {
+      "id": "SRC-0005/rule/thread-list-pagination-anchor-tiebreak",
+      "src": "SRC-0005",
+      "composition": "rule",
+      "terms": {
+        "condition": "Курсорная пагинация по anchor: фильтр (sort_column < anchor_ts OR (sort_column = anchor_ts AND id < anchor.id)); сортировка ORDER BY sort_column DESC, id DESC; LIMIT page_size+1 (чтобы определить наличие next_anchor)",
+        "numbers": [],
+        "formula": "limit = page_size.saturating_add(1); next_anchor берётся из последнего items[item.last()] если items.len() > page_size (после pop); иначе None",
+        "gwt": {
+          "given": "page_size=5; в БД 6 тредов подходят под фильтры",
+          "when": "list_threads(page_size=5, anchor=None, ...)",
+          "then": "limit = 6 (5+1) → SELECT вернул 6 строк → items.pop() → items.len()=5; next_anchor = anchor_from_item(items.last(), sort_key)"
+        }
+      }
+    },
+    {
+      "id": "SRC-0005/rule/thread-updated-at-monotonic-millis",
+      "src": "SRC-0005",
+      "composition": "rule",
+      "terms": {
+        "condition": "allocate_thread_updated_at гарантирует уникальные монотонные миллисекунды: candidate > current → CAS до candidate; |current - candidate| >= 1000 → допустить historical candidate как есть; иначе bumped = current + 1 через CAS",
+        "numbers": [
+          {
+            "value": 1000,
+            "kind": "окно 'hot one-second bucket' (millis)"
+          },
+          {
+            "value": 1,
+            "kind": "bump на следующий ms внутри bucket"
+          }
+        ],
+        "formula": "loop: current = thread_updated_at_millis.load(Relaxed); if candidate > current → CAS(current, candidate); elif candidate.saturating_add(1000) <= current → break candidate; else bumped = current.saturating_add(1); CAS(current, bumped)",
+        "gwt": {
+          "given": "first.updated_at = 1_700_001_111_123 ms, second.updated_at = 1_700_001_111_123 ms (одинаковый wall-clock); затем older.updated_at = 1_700_001_100_123 ms",
+          "when": "upsert first → upsert second → upsert older",
+          "then": "first.updated_at_ms = 1_700_001_111_123; second.updated_at_ms = 1_700_001_111_124 (bump +1); older.updated_at_ms = 1_700_001_100_123 (historical, |11000| >= 1000 → как есть)"
+        }
+      }
+    },
+    {
+      "id": "SRC-0005/rule/thread-updated-at-legacy-seconds-promotion",
+      "src": "SRC-0005",
+      "composition": "rule",
+      "terms": {
+        "condition": "Если в строке threads нет updated_at_ms (legacy seconds-only), при чтении updated_at интерпретируется как секунды; промоция к миллисекундам = умножение на 1000 (видно через get_thread)",
+        "numbers": [
+          {
+            "value": 1000,
+            "kind": "множитель seconds → millis"
+          }
+        ],
+        "formula": "datetime_to_epoch_millis(persisted.updated_at) == legacy_updated_at_seconds * 1000 (при отсутствии updated_at_ms)",
+        "gwt": {
+          "given": "UPDATE threads SET updated_at = 1_700_001_112 (без updated_at_ms) для first_id",
+          "when": "get_thread(first_id)",
+          "then": "datetime_to_epoch_millis(legacy.updated_at) == 1_700_001_112_000"
+        }
+      }
+    },
+    {
+      "id": "SRC-0005/rule/thread-upsert-preserves-creation-memory-mode",
+      "src": "SRC-0005",
+      "composition": "rule",
+      "terms": {
+        "condition": "Обычный upsert_thread не пишет колонку memory_mode в части ON CONFLICT DO UPDATE — поэтому ранее установленный memory_mode (например, 'disabled' через upsert_thread_with_creation_memory_mode) сохраняется при последующих апдейтах метаданных",
+        "numbers": [],
+        "formula": "INSERT ... ON CONFLICT(id) DO UPDATE SET rollout_path=excluded.rollout_path, ..., git_origin_url=excluded.git_origin_url — без memory_mode в SET-list",
+        "gwt": {
+          "given": "upsert_thread_with_creation_memory_mode(metadata, Some('disabled')) → memory_mode='disabled'",
+          "when": "потом upsert_thread(metadata) с изменённым title",
+          "then": "memory_mode остаётся 'disabled' (SELECT memory_mode FROM threads = 'disabled')"
+        }
+      }
+    },
+    {
+      "id": "SRC-0005/rule/thread-default-memory-mode-enabled",
+      "src": "SRC-0005",
+      "composition": "rule",
+      "terms": {
+        "condition": "При первичной вставке треда (insert_thread_if_absent или upsert_thread_with_creation_memory_mode без переданного creation_memory_mode) колонка memory_mode принимает значение 'enabled' по умолчанию",
+        "numbers": [],
+        "formula": "bind value = creation_memory_mode.unwrap_or('enabled'); insert_thread_if_absent биндит литерал 'enabled'",
+        "gwt": {
+          "given": "вызов upsert_thread (== upsert_thread_with_creation_memory_mode без переданного creation_memory_mode)",
+          "when": "INSERT в threads",
+          "then": "memory_mode колонка = 'enabled' (creation_memory_mode.unwrap_or('enabled'))"
+        }
+      }
+    },
+    {
+      "id": "SRC-0005/rule/insert-thread-if-absent-noop-on-existing",
+      "src": "SRC-0005",
+      "composition": "rule",
+      "terms": {
+        "condition": "insert_thread_if_absent использует ON CONFLICT(id) DO NOTHING — при существующей строке метаданные не перезаписываются (сохраняется tokens_used, first_user_message, updated_at и т.д.); возвращает true только если rows_affected > 0",
+        "numbers": [],
+        "formula": "INSERT INTO threads (...) VALUES (...) ON CONFLICT(id) DO NOTHING; return rows_affected > 0",
+        "gwt": {
+          "given": "существующий тред с tokens_used=123 и first_user_message='newer preview' и updated_at=1_700_000_100",
+          "when": "insert_thread_if_absent(fallback с tokens_used=0, first_user_message=None, updated_at=1_700_000_000)",
+          "then": "inserted=false; persisted.tokens_used=123; persisted.first_user_message='newer preview'; updated_at_ms неизменён"
+        }
+      }
+    },
+    {
+      "id": "SRC-0005/rule/update-thread-git-info-conditional",
+      "src": "SRC-0005",
+      "composition": "rule",
+      "terms": {
+        "condition": "update_thread_git_info использует CASE WHEN ? THEN ? ELSE git_<field> END для каждого из git_sha/git_branch/git_origin_url; внешний Option различает 'не передавать' (None) и 'установить значение или NULL' (Some(value))",
+        "numbers": [],
+        "formula": "UPDATE threads SET git_sha = CASE WHEN git_sha.is_some() THEN git_sha.flatten() ELSE git_sha END, git_branch = ..., git_origin_url = ... WHERE id = ?",
+        "gwt": {
+          "given": "тред с git_sha=Some('abc123'), git_branch=Some('feature/branch'), git_origin_url=Some('git@example.com:openai/codex.git')",
+          "when": "update_thread_git_info(thread_id, Some(None), Some(None), Some(None))",
+          "then": "git_sha=None, git_branch=None, git_origin_url=None — поля очищены"
+        }
+      }
+    },
+    {
+      "id": "SRC-0005/rule/apply-rollout-prefer-existing-git-info",
+      "src": "SRC-0005",
+      "composition": "rule",
+      "terms": {
+        "condition": "apply_rollout_items при наличии existing_metadata вызывает metadata.prefer_existing_git_info(existing); это сохраняет уже накопленные значения git_branch (даже если в новых items есть branch) и заполняет недостающие поля git_sha/git_origin_url из новых данных",
+        "numbers": [],
+        "formula": "metadata.prefer_existing_git_info(existing_metadata) — branch берётся из existing если был, остальные пробелы заполняются из новых rollout items",
+        "gwt": {
+          "given": "тред с git_branch='sqlite-branch' (без git_sha/git_origin_url); rollout item с GitInfo{commit_hash='rollout-sha', branch='rollout-branch', repository_url='git@example.com:openai/codex.git'}",
+          "when": "apply_rollout_items(builder, items, None, None)",
+          "then": "persisted.git_sha='rollout-sha' (заполнен новым); persisted.git_branch='sqlite-branch' (сохранён существующий); persisted.git_origin_url='git@example.com:openai/codex.git' (заполнен новым)"
+        }
+      }
+    },
+    {
+      "id": "SRC-0005/rule/apply-rollout-memory-mode-from-last-meta",
+      "src": "SRC-0005",
+      "composition": "rule",
+      "terms": {
+        "condition": "extract_memory_mode перебирает items в обратном порядке и берёт первое не-None значение memory_mode из RolloutItem::SessionMeta; затем set_thread_memory_mode перезаписывает колонку memory_mode (сохранение creation-mode не действует — здесь явно update)",
+        "numbers": [],
+        "formula": "items.iter().rev().find_map(|item| match item { SessionMeta(m) => m.meta.memory_mode.clone(), _ => None })",
+        "gwt": {
+          "given": "тред с memory_mode='enabled' (после первичного upsert)",
+          "when": "apply_rollout_items с items=[SessionMeta{ memory_mode: Some('polluted') }]",
+          "then": "get_thread_memory_mode = Some('polluted')"
+        }
+      }
+    },
+    {
+      "id": "SRC-0005/rule/apply-rollout-updated-at-priority",
+      "src": "SRC-0005",
+      "composition": "rule",
+      "terms": {
+        "condition": "В apply_rollout_items приоритет источника updated_at: явный updated_at_override > file_modified_time_utc(rollout_path); если оба отсутствуют — metadata.updated_at не меняется",
+        "numbers": [],
+        "formula": "let updated_at = match updated_at_override { Some(x) => Some(x), None => file_modified_time_utc(rollout_path).await }; if let Some(updated_at) = updated_at { metadata.updated_at = updated_at }",
+        "gwt": {
+          "given": "тред с базовым updated_at=1_700_000_000; вызов с updated_at_override = 1_700_001_234",
+          "when": "apply_rollout_items(..., Some(1_700_001_234))",
+          "then": "persisted.updated_at == 1_700_001_234 (override победил)"
+        }
+      }
+    },
+    {
+      "id": "SRC-0005/rule/dynamic-tools-once-per-thread",
+      "src": "SRC-0005",
+      "composition": "rule",
+      "terms": {
+        "condition": "persist_dynamic_tools пишет инструменты один раз на тред: для каждого (thread_id, position) — INSERT ON CONFLICT(thread_id, position) DO NOTHING; пустой массив или None пропускают запись; чтение через get_dynamic_tools возвращает None если строк нет",
+        "numbers": [],
+        "formula": "for (idx, tool) in tools.iter().enumerate() { let position = i64::try_from(idx).unwrap_or(i64::MAX); INSERT thread_dynamic_tools(thread_id, position, name, description, input_schema, defer_loading) VALUES (...) ON CONFLICT(thread_id, position) DO NOTHING }",
+        "gwt": {
+          "given": "thread_dynamic_tools уже содержит (thread_id='T', position=0, name='tool_a')",
+          "when": "повторный persist_dynamic_tools(T, [tool_with_name='tool_b'])",
+          "then": "INSERT (thread_id='T', position=0, name='tool_b') на CONFLICT (thread_id, position) DO NOTHING — запись 'tool_a' остаётся, 'tool_b' не записан"
+        }
+      }
+    },
+    {
+      "id": "SRC-0005/rule/stage1-claim-skip-up-to-date",
+      "src": "SRC-0005",
+      "composition": "rule",
+      "terms": {
+        "condition": "try_claim_stage1_job возвращает SkippedUpToDate если хотя бы одно из выполнено: stage1_outputs.source_updated_at >= source_updated_at ИЛИ jobs.last_success_watermark >= source_updated_at для (kind='memory_stage1', job_key=thread_id)",
+        "numbers": [],
+        "formula": "if existing_stage1_outputs.source_updated_at >= source_updated_at → SkippedUpToDate; if existing_job.last_success_watermark.is_some_and(|w| w >= source_updated_at) → SkippedUpToDate",
+        "gwt": {
+          "given": "stage1_outputs(thread_id=T).source_updated_at = 100; вызов try_claim_stage1_job с source_updated_at=100",
+          "when": "try_claim_stage1_job(T, owner, 100, lease_seconds, max_running_jobs)",
+          "then": "100 >= 100 → возвращается Stage1JobClaimOutcome::SkippedUpToDate без INSERT/UPDATE"
+        }
+      }
+    },
+    {
+      "id": "SRC-0005/rule/stage1-claim-max-running-jobs",
+      "src": "SRC-0005",
+      "composition": "rule",
+      "terms": {
+        "condition": "Захват stage-1 job происходит только если глобальный счётчик running с активным lease (lease_until > now) для kind='memory_stage1' < max_running_jobs; проверка применяется и для INSERT-ветки и для UPSERT-ветки в одном запросе",
+        "numbers": [],
+        "formula": "WHERE (SELECT COUNT(*) FROM jobs WHERE kind='memory_stage1' AND status='running' AND lease_until IS NOT NULL AND lease_until > started_at AND job_key != excluded.job_key) < max_running_jobs",
+        "gwt": {
+          "given": "max_running_jobs=2; в jobs уже 2 строки kind='memory_stage1' status='running' с lease_until > now (job_key != текущий)",
+          "when": "try_claim_stage1_job(thread_id, ..., max_running_jobs=2)",
+          "then": "WHERE-подзапрос вернёт 2 не < 2 → INSERT не сработает; затем последующая диагностика вернёт SkippedRunning"
+        }
+      }
+    },
+    {
+      "id": "SRC-0005/rule/stage1-default-retry-remaining",
+      "src": "SRC-0005",
+      "composition": "rule",
+      "terms": {
+        "condition": "При создании или продвижении claim'а stage-1 retry_remaining устанавливается в DEFAULT_RETRY_REMAINING при условии advance input_watermark (excluded.input_watermark > existing.input_watermark); при failure retry_remaining уменьшается на 1",
+        "numbers": [
+          {
+            "value": 3,
+            "kind": "DEFAULT_RETRY_REMAINING"
+          },
+          {
+            "value": 1,
+            "kind": "decrement при failure"
+          }
+        ],
+        "formula": "ON CONFLICT ... retry_remaining = CASE WHEN excluded.input_watermark > COALESCE(jobs.input_watermark, -1) THEN 3 ELSE jobs.retry_remaining END; failure: retry_remaining = retry_remaining - 1",
+        "gwt": {
+          "given": "существующая jobs строка с retry_remaining=0 и input_watermark=50; новый claim с input_watermark=100",
+          "when": "try_claim_stage1_job(... source_updated_at=100, ...)",
+          "then": "excluded.input_watermark=100 > existing=50 → CASE сработает → retry_remaining перезапишется в 3 (DEFAULT_RETRY_REMAINING); claim успешен"
+        }
+      }
+    },
+    {
+      "id": "SRC-0005/rule/stage1-claim-retry-window",
+      "src": "SRC-0005",
+      "composition": "rule",
+      "terms": {
+        "condition": "Захват stage-1 разрешён, если retry_at IS NULL ИЛИ retry_at <= now ИЛИ input_watermark advanced; и retry_remaining > 0 ИЛИ input_watermark advanced; иначе диагностика SkippedRetryBackoff (retry_at>now) или SkippedRetryExhausted (retry_remaining<=0)",
+        "numbers": [],
+        "formula": "WHERE (jobs.retry_at IS NULL OR jobs.retry_at <= started_at OR excluded.input_watermark > COALESCE(jobs.input_watermark,-1)) AND (jobs.retry_remaining > 0 OR excluded.input_watermark > COALESCE(jobs.input_watermark,-1))",
+        "gwt": {
+          "given": "jobs строка с retry_at = now + 60, retry_remaining=2, input_watermark=50; новый claim с input_watermark=50",
+          "when": "try_claim_stage1_job(... source_updated_at=50, ...)",
+          "then": "input_watermark не advanced (50 == 50) и retry_at > now → INSERT не сработает; диагностика вернёт SkippedRetryBackoff"
+        }
+      }
+    },
+    {
+      "id": "SRC-0005/rule/stage1-startup-claim-window",
+      "src": "SRC-0005",
+      "composition": "rule",
+      "terms": {
+        "condition": "claim_stage1_jobs_for_startup отбирает чужие active треды с memory_mode='enabled', чьи updated_at_ms попадают в (now - max_age_days * 86_400_000, now - min_rollout_idle_hours * 3_600_000); и stage-1 watermark отстаёт от updated_at_ms (с поправкой +1 секунда * 1000)",
+        "numbers": [
+          {
+            "value": 86400,
+            "kind": "секунд в дне"
+          },
+          {
+            "value": 3600,
+            "kind": "секунд в часе"
+          },
+          {
+            "value": 1000,
+            "kind": "ms на секунду"
+          }
+        ],
+        "formula": "max_age_cutoff = (now - Duration::days(max_age_days)).timestamp_millis(); idle_cutoff = (now - Duration::hours(min_rollout_idle_hours)).timestamp_millis(); WHERE updated_at_ms >= max_age_cutoff AND updated_at_ms <= idle_cutoff AND ((COALESCE(stage1_outputs.source_updated_at,-1)+1)*1000) <= updated_at_ms AND ((COALESCE(jobs.last_success_watermark,-1)+1)*1000) <= updated_at_ms",
+        "gwt": {
+          "given": "max_age_days=30; min_rollout_idle_hours=1",
+          "when": "claim_stage1_jobs_for_startup",
+          "then": "max_age_cutoff = now - 30*86_400_000 ms; idle_cutoff = now - 1*3_600_000 ms; threads.updated_at_ms должен быть >= max_age_cutoff (свежее 30 дней) И <= idle_cutoff (старее 1 часа)"
+        }
+      }
+    },
+    {
+      "id": "SRC-0005/rule/stage1-output-upsert-condition",
+      "src": "SRC-0005",
+      "composition": "rule",
+      "terms": {
+        "condition": "В mark_stage1_job_succeeded запись stage1_outputs обновляется только если новый source_updated_at >= существующий (WHERE excluded.source_updated_at >= stage1_outputs.source_updated_at); при равенстве — перезапись сохраняется (>= не >)",
+        "numbers": [],
+        "formula": "INSERT INTO stage1_outputs (...) VALUES (...) ON CONFLICT(thread_id) DO UPDATE SET source_updated_at=excluded.source_updated_at, raw_memory=excluded.raw_memory, rollout_summary=excluded.rollout_summary, rollout_slug=excluded.rollout_slug, generated_at=excluded.generated_at WHERE excluded.source_updated_at >= stage1_outputs.source_updated_at",
+        "gwt": {
+          "given": "stage1_outputs(thread_id=T).source_updated_at = 200; вызов mark_stage1_job_succeeded с source_updated_at=150",
+          "when": "INSERT ON CONFLICT DO UPDATE WHERE excluded.source_updated_at >= existing",
+          "then": "150 >= 200 ложно → UPDATE не выполняется; существующая запись (source_updated_at=200) сохраняется"
+        }
+      }
+    },
+    {
+      "id": "SRC-0005/rule/stage1-success-no-output-deletes-and-enqueues",
+      "src": "SRC-0005",
+      "composition": "rule",
+      "terms": {
+        "condition": "mark_stage1_job_succeeded_no_output удаляет существующую stage1_outputs строку для треда и enqueues phase-2 consolidation только если deleted_rows > 0; ownership_token обязан совпадать с running job",
+        "numbers": [],
+        "formula": "UPDATE jobs SET status='done', last_success_watermark=input_watermark WHERE ownership_token=?; DELETE FROM stage1_outputs WHERE thread_id=?; if deleted_rows > 0 → enqueue_global_consolidation_with_executor(tx, source_updated_at)",
+        "gwt": {
+          "given": "stage1_outputs существует для треда T; jobs строка running с ownership_token='tok'",
+          "when": "mark_stage1_job_succeeded_no_output(T, 'tok')",
+          "then": "UPDATE jobs status='done'; DELETE stage1_outputs WHERE thread_id=T deleted_rows=1; → enqueue_global_consolidation_with_executor(tx, source_updated_at) выполнен"
+        }
+      }
+    },
+    {
+      "id": "SRC-0005/rule/stage1-ownership-required-for-finalization",
+      "src": "SRC-0005",
+      "composition": "rule",
+      "terms": {
+        "condition": "Все финализирующие операции stage-1 (succeeded, succeeded_no_output, failed) применяются только если status='running' И ownership_token совпадает; иначе rows_affected=0 (защита от потери ownership)",
+        "numbers": [],
+        "formula": "WHERE kind='memory_stage1' AND job_key=? AND status='running' AND ownership_token=?",
+        "gwt": {
+          "given": "jobs строка running с ownership_token='real-token'",
+          "when": "mark_stage1_job_succeeded(T, 'wrong-token', ...)",
+          "then": "rows_affected=0 → возвращается false; status='running' не меняется"
+        }
+      }
+    },
+    {
+      "id": "SRC-0005/rule/global-phase2-singleton-job-key",
+      "src": "SRC-0005",
+      "composition": "rule",
+      "terms": {
+        "condition": "Phase-2 consolidation — singleton: kind='memory_consolidate_global', job_key='global'; все операции (enqueue, claim, heartbeat, succeeded, failed) идут по этой паре",
+        "numbers": [],
+        "formula": "JOB_KIND_MEMORY_CONSOLIDATE_GLOBAL = 'memory_consolidate_global'; MEMORY_CONSOLIDATION_JOB_KEY = 'global'; WHERE kind=? AND job_key=?",
+        "gwt": {
+          "given": "вызов enqueue_global_consolidation(input_watermark=N)",
+          "when": "INSERT INTO jobs",
+          "then": "kind='memory_consolidate_global', job_key='global' — все последующие операции (claim/heartbeat/succeeded/failed) идут по этой паре"
+        }
+      }
+    },
+    {
+      "id": "SRC-0005/rule/global-phase2-claim-skip-not-dirty",
+      "src": "SRC-0005",
+      "composition": "rule",
+      "terms": {
+        "condition": "try_claim_global_phase2_job возвращает SkippedNotDirty если: singleton row отсутствует ИЛИ input_watermark <= last_success_watermark ИЛИ retry_remaining <= 0 ИЛИ retry_at > now; SkippedRunning если status='running' и lease_until > now",
+        "numbers": [],
+        "formula": "if input_watermark.unwrap_or(0) <= last_success_watermark.unwrap_or(0) → SkippedNotDirty; if retry_remaining <= 0 → SkippedNotDirty; if retry_at.is_some_and(|r| r > now) → SkippedNotDirty; if status=='running' && lease_until > now → SkippedRunning",
+        "gwt": {
+          "given": "singleton с input_watermark=100, last_success_watermark=100",
+          "when": "try_claim_global_phase2_job(worker_id, lease_seconds)",
+          "then": "100 <= 100 → SkippedNotDirty (claim не выполняется)"
+        }
+      }
+    },
+    {
+      "id": "SRC-0005/rule/global-phase2-success-watermark-monotonic",
+      "src": "SRC-0005",
+      "composition": "rule",
+      "terms": {
+        "condition": "mark_global_phase2_job_succeeded продвигает last_success_watermark монотонно: max(COALESCE(last_success_watermark, 0), completed_watermark); требуется ownership_token и status='running'",
+        "numbers": [
+          {
+            "value": 0,
+            "kind": "fallback для COALESCE last_success_watermark"
+          }
+        ],
+        "formula": "UPDATE jobs SET status='done', last_success_watermark = max(COALESCE(last_success_watermark, 0), ?) WHERE kind=? AND job_key=? AND status='running' AND ownership_token=?",
+        "gwt": {
+          "given": "jobs(global) running с last_success_watermark=200, ownership_token='tok'",
+          "when": "mark_global_phase2_job_succeeded('tok', completed_watermark=150, [])",
+          "then": "max(200, 150) = 200 → last_success_watermark остаётся 200; status='done', selected_for_phase2 baseline сброшен"
+        }
+      }
+    },
+    {
+      "id": "SRC-0005/rule/phase2-baseline-rewrite-on-success",
+      "src": "SRC-0005",
+      "composition": "rule",
+      "terms": {
+        "condition": "При успехе phase-2 selected_for_phase2 baseline переписывается атомарно: сначала всем stage1_outputs устанавливается selected_for_phase2=0 и selected_for_phase2_source_updated_at=NULL; затем для каждого selected_outputs устанавливается selected_for_phase2=1 и selected_for_phase2_source_updated_at = output.source_updated_at WHERE thread_id и source_updated_at точно совпадают",
+        "numbers": [
+          {
+            "value": 1,
+            "kind": "флаг selected_for_phase2 при включении"
+          },
+          {
+            "value": 0,
+            "kind": "флаг при сбросе"
+          }
+        ],
+        "formula": "UPDATE stage1_outputs SET selected_for_phase2=0, selected_for_phase2_source_updated_at=NULL WHERE selected_for_phase2!=0 OR selected_for_phase2_source_updated_at IS NOT NULL; для каждого output: UPDATE stage1_outputs SET selected_for_phase2=1, selected_for_phase2_source_updated_at=? WHERE thread_id=? AND source_updated_at=?",
+        "gwt": {
+          "given": "stage1_outputs строки A (selected_for_phase2=1) и B (=0); selected_outputs = [B со своим source_updated_at]",
+          "when": "mark_global_phase2_job_succeeded(...)",
+          "then": "сначала всем строкам устанавливается selected_for_phase2=0; затем B получает selected_for_phase2=1 и selected_for_phase2_source_updated_at = B.source_updated_at; A теряет selected_for_phase2"
+        }
+      }
+    },
+    {
+      "id": "SRC-0005/rule/global-phase2-failed-decrements-retry",
+      "src": "SRC-0005",
+      "composition": "rule",
+      "terms": {
+        "condition": "mark_global_phase2_job_failed устанавливает status='error', retry_at=now+retry_delay_seconds, retry_remaining-=1; обновление только если status='running' и ownership_token совпадает; вариант _if_unowned дополнительно матчит ownership_token IS NULL для recovery застрявшего unowned running",
+        "numbers": [
+          {
+            "value": 1,
+            "kind": "decrement retry_remaining"
+          }
+        ],
+        "formula": "UPDATE jobs SET status='error', finished_at=now, lease_until=NULL, retry_at=now+max(retry_delay_seconds,0), retry_remaining=retry_remaining-1, last_error=? WHERE ... AND status='running' AND (ownership_token=? [OR ownership_token IS NULL])",
+        "gwt": {
+          "given": "jobs(global) running с retry_remaining=3, ownership_token='tok'",
+          "when": "mark_global_phase2_job_failed('tok', 'reason', retry_delay_seconds=60)",
+          "then": "status='error'; retry_at = now + 60; retry_remaining = 2; lease_until=NULL"
+        }
+      }
+    },
+    {
+      "id": "SRC-0005/rule/enqueue-global-consolidation-always-bumps",
+      "src": "SRC-0005",
+      "composition": "rule",
+      "terms": {
+        "condition": "enqueue_global_consolidation всегда продвигает input_watermark: если переданное значение > существующего — берётся переданное, иначе COALESCE(jobs.input_watermark, 0) + 1; running job сохраняет status='running' и retry_at, прочие переходят в 'pending' с retry_at=NULL; retry_remaining = max(существ, DEFAULT_RETRY_REMAINING)",
+        "numbers": [
+          {
+            "value": 3,
+            "kind": "DEFAULT_RETRY_REMAINING (нижняя граница retry_remaining)"
+          },
+          {
+            "value": 1,
+            "kind": "минимальный bump при равенстве/меньшем input_watermark"
+          }
+        ],
+        "formula": "INSERT (kind='memory_consolidate_global', job_key='global', status='pending', retry_remaining=3, input_watermark=?) ON CONFLICT(kind, job_key) DO UPDATE SET status = CASE WHEN jobs.status='running' THEN 'running' ELSE 'pending' END, retry_at = CASE WHEN jobs.status='running' THEN jobs.retry_at ELSE NULL END, retry_remaining = max(jobs.retry_remaining, excluded.retry_remaining), input_watermark = CASE WHEN excluded.input_watermark > COALESCE(jobs.input_watermark, 0) THEN excluded.input_watermark ELSE COALESCE(jobs.input_watermark, 0) + 1 END",
+        "gwt": {
+          "given": "jobs(global) с input_watermark=100; вызов enqueue_global_consolidation(input_watermark=80)",
+          "when": "ON CONFLICT DO UPDATE",
+          "then": "80 > 100 ложно → input_watermark = COALESCE(100, 0) + 1 = 101; всегда продвигается грязная метка"
+        }
+      }
+    },
+    {
+      "id": "SRC-0005/rule/get-phase2-input-selection-eligibility",
+      "src": "SRC-0005",
+      "composition": "rule",
+      "terms": {
+        "condition": "get_phase2_input_selection: current selection берёт stage1_outputs JOIN threads (memory_mode='enabled'), отфильтровывает строки где обе trim(raw_memory) и trim(rollout_summary) пустые, оставляет только те, где (last_usage IS NOT NULL AND last_usage >= cutoff) ИЛИ (last_usage IS NULL AND source_updated_at >= cutoff); сортировка усиливает usage и свежесть",
+        "numbers": [],
+        "formula": "cutoff = (now - Duration::days(max_unused_days)).timestamp(); ORDER BY COALESCE(usage_count, 0) DESC, COALESCE(last_usage, source_updated_at) DESC, source_updated_at DESC, thread_id DESC LIMIT n",
+        "gwt": {
+          "given": "max_unused_days=14; cutoff = now - 14 дней; stage1_outputs строка с непустым raw_memory, last_usage = NULL, source_updated_at = (now - 20 дней)",
+          "when": "get_phase2_input_selection(n=10, max_unused_days=14)",
+          "then": "last_usage IS NULL И source_updated_at < cutoff → строка не входит в current selected"
+        }
+      }
+    },
+    {
+      "id": "SRC-0005/rule/phase2-removed-and-retained-diff",
+      "src": "SRC-0005",
+      "composition": "rule",
+      "terms": {
+        "condition": "Phase2InputSelection.retained_thread_ids — current rows, у которых selected_for_phase2 != 0 И selected_for_phase2_source_updated_at == текущему source_updated_at (precisely matched snapshot); removed — previous selected (selected_for_phase2=1) рows, чей thread_id отсутствует в current selection",
+        "numbers": [],
+        "formula": "if row.selected_for_phase2 != 0 AND row.selected_for_phase2_source_updated_at == row.source_updated_at → retained.push(thread_id); for prev_row in previous_selected: if !current_thread_ids.contains(prev_row.thread_id) → removed.push(stage1_output_ref_from_parts(thread_id, source_updated_at, rollout_slug))",
+        "gwt": {
+          "given": "previous_selected содержит thread_id='T1' (selected_for_phase2=1); current selection вернул только 'T2'",
+          "when": "get_phase2_input_selection",
+          "then": "removed = [stage1_output_ref_from_parts('T1', source_updated_at, rollout_slug)]; retained_thread_ids не содержит 'T1'"
+        }
+      }
+    },
+    {
+      "id": "SRC-0005/rule/list-stage1-outputs-non-empty-only",
+      "src": "SRC-0005",
+      "composition": "rule",
+      "terms": {
+        "condition": "list_stage1_outputs_for_global фильтрует пустые строки: WHERE t.memory_mode='enabled' AND (length(trim(so.raw_memory)) > 0 OR length(trim(so.rollout_summary)) > 0); сортировка ORDER BY source_updated_at DESC, thread_id DESC LIMIT n",
+        "numbers": [],
+        "formula": "SELECT ... FROM stage1_outputs so LEFT JOIN threads t ON t.id=so.thread_id WHERE t.memory_mode='enabled' AND (length(trim(so.raw_memory)) > 0 OR length(trim(so.rollout_summary)) > 0) ORDER BY so.source_updated_at DESC, so.thread_id DESC LIMIT ?",
+        "gwt": {
+          "given": "stage1_outputs со строкой raw_memory='   ', rollout_summary='   ' (whitespace only)",
+          "when": "list_stage1_outputs_for_global(n=10)",
+          "then": "trim даёт пустые строки → length(trim(...)) > 0 ложно для обеих → строка исключена из выдачи"
+        }
+      }
+    },
+    {
+      "id": "SRC-0005/rule/prune-stage1-respects-baseline",
+      "src": "SRC-0005",
+      "composition": "rule",
+      "terms": {
+        "condition": "prune_stage1_outputs_for_retention удаляет только строки с selected_for_phase2=0 (baseline защищён); среди них удаляются строки с COALESCE(last_usage, source_updated_at) < cutoff в порядке от стайлой к свежей, не более limit",
+        "numbers": [],
+        "formula": "cutoff = (now - Duration::days(max_unused_days)).timestamp(); DELETE FROM stage1_outputs WHERE thread_id IN (SELECT thread_id FROM stage1_outputs WHERE selected_for_phase2=0 AND COALESCE(last_usage, source_updated_at) < cutoff ORDER BY COALESCE(last_usage, source_updated_at) ASC, source_updated_at ASC, thread_id ASC LIMIT ?)",
+        "gwt": {
+          "given": "stage1_outputs строка A с selected_for_phase2=1, last_usage = (now - 100 дней); строка B с selected_for_phase2=0, last_usage = (now - 100 дней); max_unused_days=30, limit=10",
+          "when": "prune_stage1_outputs_for_retention(30, 10)",
+          "then": "удалена только B (A защищена baseline); удалено 1 строка"
+        }
+      }
+    },
+    {
+      "id": "SRC-0005/rule/record-stage1-usage-increments",
+      "src": "SRC-0005",
+      "composition": "rule",
+      "terms": {
+        "condition": "record_stage1_output_usage инкрементит usage_count на 1 и пишет last_usage=now для каждого thread_id из списка; отсутствующие thread_id игнорируются (UPDATE без эффекта); пустой список — return 0 без транзакции",
+        "numbers": [
+          {
+            "value": 1,
+            "kind": "usage_count increment"
+          }
+        ],
+        "formula": "for thread_id in thread_ids: UPDATE stage1_outputs SET usage_count = COALESCE(usage_count, 0) + 1, last_usage = now WHERE thread_id = ?",
+        "gwt": {
+          "given": "stage1_outputs(thread_id='T').usage_count=5, last_usage=NULL",
+          "when": "record_stage1_output_usage([T])",
+          "then": "UPDATE: usage_count = COALESCE(5, 0) + 1 = 6; last_usage = now; updated_rows=1"
+        }
+      }
+    },
+    {
+      "id": "SRC-0005/rule/clear-memory-data-scope",
+      "src": "SRC-0005",
+      "composition": "rule",
+      "terms": {
+        "condition": "clear_memory_data удаляет все строки stage1_outputs и все строки jobs с kind IN ('memory_stage1', 'memory_consolidate_global') в одной транзакции; jobs с другими kind не затрагиваются",
+        "numbers": [],
+        "formula": "BEGIN; DELETE FROM stage1_outputs; DELETE FROM jobs WHERE kind = 'memory_stage1' OR kind = 'memory_consolidate_global'; COMMIT",
+        "gwt": {
+          "given": "БД содержит stage1_outputs (3 строки), jobs kind='memory_stage1' (2), kind='memory_consolidate_global' (1), kind='other' (5)",
+          "when": "clear_memory_data()",
+          "then": "stage1_outputs пуст; jobs(memory_stage1) и jobs(memory_consolidate_global) удалены; jobs(other) сохранены (5 строк)"
+        }
+      }
+    },
+    {
+      "id": "SRC-0005/rule/mark-thread-polluted-conditional-enqueue",
+      "src": "SRC-0005",
+      "composition": "rule",
+      "terms": {
+        "condition": "mark_thread_memory_mode_polluted: UPDATE memory_mode='polluted' WHERE id=? AND memory_mode != 'polluted'; если rows_affected=0 — return false; иначе если SELECT selected_for_phase2 для thread_id != 0 — enqueue_global_consolidation(now); все операции в одной транзакции",
+        "numbers": [],
+        "formula": "BEGIN; UPDATE threads SET memory_mode='polluted' WHERE id=? AND memory_mode != 'polluted'; if rows_affected=0 → COMMIT; return false; else SELECT selected_for_phase2 FROM stage1_outputs WHERE thread_id=?; if != 0 → enqueue_global_consolidation_with_executor(tx, now); COMMIT; return true",
+        "gwt": {
+          "given": "тред T с memory_mode='enabled'; stage1_outputs(T).selected_for_phase2 = 1",
+          "when": "mark_thread_memory_mode_polluted(T)",
+          "then": "UPDATE memory_mode='polluted' rows_affected=1; SELECT selected_for_phase2 = 1 != 0 → enqueue_global_consolidation_with_executor(tx, now); commit; return true"
+        }
+      }
+    },
+    {
+      "id": "SRC-0005/rule/agent-job-status-enum",
+      "src": "SRC-0005",
+      "composition": "rule",
+      "terms": {
+        "condition": "AgentJobStatus = {Pending, Running, Completed, Failed, Cancelled}; AgentJobItemStatus = {Pending, Running, Completed, Failed} (без Cancelled); cancellation действует только на job уровне (mark_agent_job_cancelled), не на item",
+        "numbers": [],
+        "formula": null,
+        "gwt": null
+      }
+    },
+    {
+      "id": "SRC-0005/rule/feedback-log-line-format",
+      "src": "SRC-0005",
+      "composition": "rule",
+      "terms": {
+        "condition": "format_feedback_log_line форматирует RFC3339 timestamp с микросекундной точностью UTC, выравнивает level вправо в 5 символов, добавляет body; если body не оканчивается на '\\n' — добавляет; при out-of-range ts/ts_nanos — fallback '<ts>.<ts_nanos:09>Z'",
+        "numbers": [
+          {
+            "value": 5,
+            "kind": "ширина выравнивания level"
+          },
+          {
+            "value": 9,
+            "kind": "ширина zero-padding ts_nanos в fallback"
+          }
+        ],
+        "formula": "let nanos = u32::try_from(ts_nanos).unwrap_or(0); let timestamp = DateTime::<Utc>::from_timestamp(ts, nanos).map(|dt| dt.to_rfc3339_opts(SecondsFormat::Micros, true)).unwrap_or(format!('{ts}.{ts_nanos:09}Z')); let mut line = format!('{timestamp} {level:>5} {body}'); if !line.ends_with('\\n') { line.push('\\n') }",
+        "gwt": {
+          "given": "ts=1, ts_nanos=123_456_000, level='INFO', body='alpha'",
+          "when": "format_feedback_log_line(1, 123_456_000, 'INFO', 'alpha')",
+          "then": "результат = '1970-01-01T00:00:01.123456Z  INFO alpha\\n' (level выровнен вправо до 5 символов с пробелом перед 'INFO', добавлен trailing newline)"
+        }
+      }
+    }
+  ]
+}

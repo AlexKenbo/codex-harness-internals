@@ -1,0 +1,933 @@
+{
+  "src": "SRC-0007",
+  "schema_version": "2.0",
+  "lens": "structural",
+  "compositions": [
+    {
+      "id": "SRC-0007/entity/rollout-file",
+      "src": "SRC-0007",
+      "composition": "entity",
+      "terms": {
+        "object": "Rollout file — JSONL-файл истории Codex-сессии (thread), хранящий SessionMeta + последовательность items для replay/resume/inspect",
+        "attributes": [
+          "path: абсолютный путь к файлу",
+          "filename pattern: rollout-YYYY-MM-DDThh-mm-ss-<uuid>.jsonl (ROLLOUT_PREFIX='rollout-', ROLLOUT_SUFFIX='.jsonl')",
+          "created_at: RFC3339 timestamp (секундная точность из filename)",
+          "updated_at: RFC3339 timestamp (из file mtime, miллисекундная точность)",
+          "thread_id: ThreadId (UUID, извлекается из session meta)",
+          "первая строка: SessionMetaLine (meta + git)",
+          "последующие строки: RolloutLine { timestamp, item } в JSONL формате",
+          "directory layout: NestedByDate (~/.codex/sessions/YYYY/MM/DD/) или Flat"
+        ],
+        "relationships": [
+          {"to": "SRC-0007/entity/session-meta-line", "rel": "contains", "card": "1:1"},
+          {"to": "SRC-0007/entity/rollout-item", "rel": "contains", "card": "1:N"},
+          {"to": "SRC-0007/entity/thread-metadata-row", "rel": "reconciles_to", "card": "1:1"}
+        ],
+        "enumerations": null,
+        "data_flows": [
+          {"source": "RolloutRecorder.record_items", "transform": "is_persisted_response_item filter + sanitize_rollout_item_for_persistence", "sink": "rollout .jsonl (append)"},
+          {"source": "rollout .jsonl (read)", "transform": "RolloutRecorder.load_rollout_items (parse lines, extract thread_id from first SessionMeta)", "sink": "InitialHistory::Resumed { conversation_id, history, rollout_path }"}
+        ],
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0007/entity/session-meta",
+      "src": "SRC-0007",
+      "composition": "entity",
+      "terms": {
+        "object": "SessionMeta — заголовочная запись thread (первая строка rollout-файла), описывающая параметры сессии",
+        "attributes": [
+          "id: ThreadId",
+          "forked_from_id: Option<ThreadId> — thread-источник если это форк",
+          "timestamp: строка (формат [year]-[month]-[day]T[hour]:[minute]:[second].[subsecond digits:3]Z)",
+          "cwd: PathBuf (рабочая директория на момент старта сессии)",
+          "originator: строка (из default_client originator())",
+          "cli_version: строка (CARGO_PKG_VERSION)",
+          "agent_nickname: Option<String>",
+          "agent_role: Option<String>",
+          "agent_path: Option<String>",
+          "source: SessionSource",
+          "model_provider: Option<String>",
+          "base_instructions: Option<BaseInstructions>",
+          "dynamic_tools: Option<Vec<DynamicToolSpec>>",
+          "memory_mode: Option<String> ('disabled' если generate_memories=false, иначе None/'enabled')"
+        ],
+        "relationships": [
+          {"to": "SRC-0007/entity/session-meta-line", "rel": "wrapped_in", "card": "1:1"},
+          {"to": "SRC-0007/entity/git-info", "rel": "associated_with", "card": "1:0..1"}
+        ],
+        "enumerations": null,
+        "data_flows": [
+          {"source": "RolloutRecorderParams::Create (conversation_id, forked_from_id, source, base_instructions, dynamic_tools)", "transform": "RolloutRecorder::new — построение SessionMeta с добавлением timestamp, cwd, originator, cli_version, agent fields из source, model_provider, memory_mode", "sink": "write_session_meta → SessionMetaLine → rollout file первая строка"}
+        ],
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0007/entity/session-meta-line",
+      "src": "SRC-0007",
+      "composition": "entity",
+      "terms": {
+        "object": "SessionMetaLine — контейнер SessionMeta + GitInfo, сериализуется первой строкой rollout-файла",
+        "attributes": [
+          "meta: SessionMeta",
+          "git: Option<ProtocolGitInfo> (commit_hash, branch, repository_url)"
+        ],
+        "relationships": [
+          {"to": "SRC-0007/entity/session-meta", "rel": "contains", "card": "1:1"},
+          {"to": "SRC-0007/entity/rollout-item", "rel": "is_variant_of", "card": "N:1"}
+        ],
+        "enumerations": null,
+        "data_flows": [
+          {"source": "collect_git_info(cwd)", "transform": "map to ProtocolGitInfo", "sink": "SessionMetaLine.git"}
+        ],
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0007/entity/rollout-item",
+      "src": "SRC-0007",
+      "composition": "entity",
+      "terms": {
+        "object": "RolloutItem — элемент rollout-файла (вариант enum, представляет один тип события в истории thread)",
+        "attributes": [
+          "variant: SessionMeta(SessionMetaLine) | ResponseItem(ResponseItem) | Compacted(CompactedItem) | TurnContext(TurnContext) | EventMsg(EventMsg)"
+        ],
+        "relationships": [
+          {"to": "SRC-0007/entity/rollout-file", "rel": "appended_to", "card": "N:1"}
+        ],
+        "enumerations": {
+          "variants": ["SessionMeta", "ResponseItem", "Compacted", "TurnContext", "EventMsg"]
+        },
+        "data_flows": [
+          {"source": "record_items(items)", "transform": "is_persisted_response_item filter по policy (ResponseItem / EventMsg mode-зависимо / Compacted|TurnContext|SessionMeta всегда persist)", "sink": "pending_items → JsonlWriter.write_rollout_item"},
+          {"source": "RolloutItem::EventMsg(ExecCommandEnd) в Extended режиме", "transform": "sanitize_rollout_item_for_persistence: aggregated_output truncate_middle_chars(10_000 bytes); stdout/stderr/formatted_output cleared", "sink": "persisted EventMsg::ExecCommandEnd с truncated output"}
+        ],
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0007/entity/rollout-recorder",
+      "src": "SRC-0007",
+      "composition": "entity",
+      "terms": {
+        "object": "RolloutRecorder — handle для записи rollout-файла одной thread (обёртка над фоновой writer-task + MPSC-каналом)",
+        "attributes": [
+          "tx: Sender<RolloutCmd>",
+          "writer_task: Arc<RolloutWriterTask> (handle + terminal_failure)",
+          "rollout_path: PathBuf",
+          "state_db: Option<StateDbHandle>",
+          "event_persistence_mode: EventPersistenceMode"
+        ],
+        "relationships": [
+          {"to": "SRC-0007/entity/rollout-file", "rel": "writes", "card": "1:1"},
+          {"to": "SRC-0007/entity/rollout-writer-state", "rel": "delegates_to", "card": "1:1"},
+          {"to": "SRC-0007/entity/thread-metadata-row", "rel": "syncs_to", "card": "1:1"}
+        ],
+        "enumerations": null,
+        "data_flows": [
+          {"source": "record_items → MPSC channel (capacity 256)", "transform": "rollout_writer task processes RolloutCmd::{AddItems,Persist,Flush,Shutdown}", "sink": "RolloutWriterState.pending_items → JsonlWriter → файл"}
+        ],
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0007/entity/rollout-recorder-params",
+      "src": "SRC-0007",
+      "composition": "entity",
+      "terms": {
+        "object": "RolloutRecorderParams — входные параметры создания RolloutRecorder (Create или Resume)",
+        "attributes": [
+          "Create { conversation_id: ThreadId, forked_from_id: Option<ThreadId>, source: SessionSource, base_instructions: BaseInstructions, dynamic_tools: Vec<DynamicToolSpec>, event_persistence_mode: EventPersistenceMode }",
+          "Resume { path: PathBuf, event_persistence_mode: EventPersistenceMode }"
+        ],
+        "relationships": [
+          {"to": "SRC-0007/entity/rollout-recorder", "rel": "constructs", "card": "1:1"}
+        ],
+        "enumerations": {
+          "variants": ["Create", "Resume"]
+        },
+        "data_flows": null,
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0007/entity/rollout-writer-state",
+      "src": "SRC-0007",
+      "composition": "entity",
+      "terms": {
+        "object": "RolloutWriterState — внутреннее состояние фоновой writer-task (буфер pending_items + recovery)",
+        "attributes": [
+          "writer: Option<JsonlWriter>",
+          "deferred_log_file_info: Option<LogFileInfo> (path, conversation_id, timestamp для отложенной материализации)",
+          "pending_items: Vec<RolloutItem> (элементы в буфере, не дописанные в файл)",
+          "meta: Option<SessionMeta> (будет записано как первая строка при первом write)",
+          "cwd: PathBuf",
+          "rollout_path: PathBuf",
+          "state_db_ctx: Option<StateDbHandle>",
+          "state_builder: Option<ThreadMetadataBuilder>",
+          "default_provider: String",
+          "generate_memories: bool",
+          "last_logged_error: Option<String> (deduplication сообщений об ошибке записи)"
+        ],
+        "relationships": [
+          {"to": "SRC-0007/entity/rollout-file", "rel": "writes", "card": "1:1"},
+          {"to": "SRC-0007/entity/rollout-item", "rel": "buffers", "card": "1:N"}
+        ],
+        "enumerations": null,
+        "data_flows": [
+          {"source": "pending_items", "transform": "write_pending_once: ensure_writer_open → write_session_meta_if_needed → write_pending_items_once → flush", "sink": "JsonlWriter → async file"},
+          {"source": "write error (any step)", "transform": "enter_recovery_mode (writer=None, last_logged_error recorded); retry once через write_pending_with_recovery", "sink": "pending_items retained (suffix не списанных элементов)"}
+        ],
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0007/entity/rollout-cmd",
+      "src": "SRC-0007",
+      "composition": "entity",
+      "terms": {
+        "object": "RolloutCmd — команда для фоновой writer-task (через MPSC-канал)",
+        "attributes": [
+          "AddItems(Vec<RolloutItem>) — добавить items в буфер (без ack)",
+          "Persist { ack: oneshot::Sender<io::Result<()>> } — материализовать файл и записать буфер",
+          "Flush { ack: oneshot::Sender<io::Result<()>> } — дождаться записи всех буферизованных items",
+          "Shutdown { ack: oneshot::Sender<io::Result<()>> } — записать остаток и закрыть writer"
+        ],
+        "relationships": [
+          {"to": "SRC-0007/entity/rollout-writer-state", "rel": "processed_by", "card": "N:1"}
+        ],
+        "enumerations": {
+          "variants": ["AddItems", "Persist", "Flush", "Shutdown"]
+        },
+        "data_flows": null,
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0007/entity/event-persistence-mode",
+      "src": "SRC-0007",
+      "composition": "entity",
+      "terms": {
+        "object": "EventPersistenceMode — режим persistence для EventMsg в rollout-файле (минимум vs. расширенный набор событий)",
+        "attributes": [
+          "variant Limited (default): legacy минимальная поверхность событий",
+          "variant Extended: расширенная поверхность (для app-server history reconstruction)"
+        ],
+        "relationships": [
+          {"to": "SRC-0007/entity/rollout-recorder", "rel": "parameterizes", "card": "1:1"},
+          {"to": "SRC-0007/entity/rollout-item", "rel": "filters", "card": "1:N"}
+        ],
+        "enumerations": {
+          "EventPersistenceMode": ["Limited", "Extended"],
+          "Limited persisted EventMsg (всегда)": [
+            "UserMessage", "AgentMessage", "AgentReasoning", "AgentReasoningRawContent",
+            "TokenCount", "ThreadNameUpdated", "ContextCompacted", "EnteredReviewMode",
+            "ExitedReviewMode", "ThreadRolledBack", "UndoCompleted", "TurnAborted",
+            "TurnStarted", "TurnComplete", "ImageGenerationEnd",
+            "ItemCompleted(TurnItem::Plan) — только Plan-подвариант"
+          ],
+          "Extended-only persisted EventMsg (только в Extended режиме)": [
+            "Error", "GuardianAssessment", "WebSearchEnd", "ExecCommandEnd", "PatchApplyEnd",
+            "McpToolCallEnd", "ViewImageToolCall", "CollabAgentSpawnEnd",
+            "CollabAgentInteractionEnd", "CollabWaitingEnd", "CollabCloseEnd",
+            "CollabResumeEnd", "DynamicToolCallRequest", "DynamicToolCallResponse"
+          ],
+          "Never persisted EventMsg": [
+            "Warning", "RealtimeConversationStarted", "RealtimeConversationSdp",
+            "RealtimeConversationRealtime", "RealtimeConversationClosed", "ModelReroute",
+            "AgentMessageDelta", "AgentReasoningDelta", "AgentReasoningRawContentDelta",
+            "AgentReasoningSectionBreak", "RawResponseItem", "SessionConfigured",
+            "McpToolCallBegin", "WebSearchBegin", "ExecCommandBegin", "TerminalInteraction",
+            "ExecCommandOutputDelta", "ExecApprovalRequest", "RequestPermissions",
+            "RequestUserInput", "ElicitationRequest", "ApplyPatchApprovalRequest",
+            "BackgroundEvent", "StreamError", "PatchApplyBegin", "TurnDiff",
+            "GetHistoryEntryResponse", "UndoStarted", "McpListToolsResponse",
+            "RealtimeConversationListVoicesResponse", "McpStartupUpdate", "McpStartupComplete",
+            "ListSkillsResponse", "PlanUpdate", "ShutdownComplete", "DeprecationNotice",
+            "ItemStarted", "HookStarted", "HookCompleted", "AgentMessageContentDelta",
+            "PlanDelta", "ReasoningContentDelta", "ReasoningRawContentDelta",
+            "SkillsUpdateAvailable", "CollabAgentSpawnBegin", "CollabAgentInteractionBegin",
+            "CollabWaitingBegin", "CollabCloseBegin", "CollabResumeBegin", "ImageGenerationBegin",
+            "ItemCompleted (если item != TurnItem::Plan)"
+          ]
+        },
+        "data_flows": null,
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0007/entity/response-item-persist-policy",
+      "src": "SRC-0007",
+      "composition": "entity",
+      "terms": {
+        "object": "ResponseItem persistence policy — правила фильтрации ResponseItem для rollout и memories",
+        "attributes": [
+          "rollout persistence (should_persist_response_item): true для Message/Reasoning/LocalShellCall/FunctionCall/ToolSearchCall/FunctionCallOutput/ToolSearchOutput/CustomToolCall/CustomToolCallOutput/WebSearchCall/ImageGenerationCall/GhostSnapshot/Compaction; false для Other",
+          "memories persistence (should_persist_response_item_for_memories): true для Message (если role != 'developer'), LocalShellCall, FunctionCall, ToolSearchCall, FunctionCallOutput, ToolSearchOutput, CustomToolCall, CustomToolCallOutput, WebSearchCall; false для Reasoning, ImageGenerationCall, GhostSnapshot, Compaction, Other"
+        ],
+        "relationships": [
+          {"to": "SRC-0007/entity/rollout-item", "rel": "filters", "card": "1:N"}
+        ],
+        "enumerations": {
+          "ResponseItem rollout-persisted": ["Message", "Reasoning", "LocalShellCall", "FunctionCall", "ToolSearchCall", "FunctionCallOutput", "ToolSearchOutput", "CustomToolCall", "CustomToolCallOutput", "WebSearchCall", "ImageGenerationCall", "GhostSnapshot", "Compaction"],
+          "ResponseItem rollout-NOT-persisted": ["Other"],
+          "ResponseItem memories-persisted": ["Message (role != 'developer')", "LocalShellCall", "FunctionCall", "ToolSearchCall", "FunctionCallOutput", "ToolSearchOutput", "CustomToolCall", "CustomToolCallOutput", "WebSearchCall"],
+          "ResponseItem memories-NOT-persisted": ["Message (role == 'developer')", "Reasoning", "ImageGenerationCall", "GhostSnapshot", "Compaction", "Other"]
+        },
+        "data_flows": null,
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0007/entity/thread-item",
+      "src": "SRC-0007",
+      "composition": "entity",
+      "terms": {
+        "object": "ThreadItem — summary одного rollout-файла для списочных операций",
+        "attributes": [
+          "path: PathBuf (абсолютный путь к rollout)",
+          "thread_id: Option<ThreadId>",
+          "first_user_message: Option<String>",
+          "cwd: Option<PathBuf>",
+          "git_branch: Option<String>",
+          "git_sha: Option<String>",
+          "git_origin_url: Option<String>",
+          "source: Option<SessionSource>",
+          "agent_nickname: Option<String>",
+          "agent_role: Option<String>",
+          "model_provider: Option<String>",
+          "cli_version: Option<String>",
+          "created_at: Option<String> (RFC3339, из filename timestamp, секундная точность)",
+          "updated_at: Option<String> (RFC3339, из file mtime, millis precision)"
+        ],
+        "relationships": [
+          {"to": "SRC-0007/entity/threads-page", "rel": "contained_in", "card": "N:1"},
+          {"to": "SRC-0007/entity/rollout-file", "rel": "summarizes", "card": "1:1"}
+        ],
+        "enumerations": null,
+        "data_flows": [
+          {"source": "rollout file head (до 10 records, +200 при ожидании UserMessage)", "transform": "read_head_summary: парсит SessionMeta + первое UserMessage EventMsg, заполняет HeadTailSummary", "sink": "ThreadItem через build_thread_item"},
+          {"source": "file mtime", "transform": "truncate_to_millis + format_rfc3339", "sink": "ThreadItem.updated_at"}
+        ],
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0007/entity/threads-page",
+      "src": "SRC-0007",
+      "composition": "entity",
+      "terms": {
+        "object": "ThreadsPage — страница списка thread-summaries с cursor-пагинацией",
+        "attributes": [
+          "items: Vec<ThreadItem> (ordered newest first)",
+          "next_cursor: Option<Cursor> — токен для resume",
+          "num_scanned_files: usize — сколько файлов было просмотрено в этом запросе",
+          "reached_scan_cap: bool — true если hit MAX_SCAN_FILES"
+        ],
+        "relationships": [
+          {"to": "SRC-0007/entity/thread-item", "rel": "contains", "card": "1:N"},
+          {"to": "SRC-0007/entity/cursor", "rel": "paginates_via", "card": "1:0..1"}
+        ],
+        "enumerations": null,
+        "data_flows": null,
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0007/entity/cursor",
+      "src": "SRC-0007",
+      "composition": "entity",
+      "terms": {
+        "object": "Cursor — токен пагинации для ThreadsPage (timestamp + UUID)",
+        "attributes": [
+          "ts: OffsetDateTime",
+          "id: Uuid",
+          "serialized формат: '<ts_rfc3339>|<uuid>' (парсинг: split на '|', ts accepts RFC3339 или filename format YYYY-MM-DDThh-mm-ss)"
+        ],
+        "relationships": [
+          {"to": "SRC-0007/entity/threads-page", "rel": "paginates", "card": "1:1"},
+          {"to": "SRC-0007/entity/anchor-state", "rel": "consumed_by", "card": "1:1"}
+        ],
+        "enumerations": null,
+        "data_flows": [
+          {"source": "Cursor", "transform": "serialize: format '<ts>|<uuid>' / deserialize: parse_cursor split_once('|') → Uuid + (RFC3339 или filename ts format)", "sink": "opaque string token"},
+          {"source": "codex_state::Anchor { ts, id }", "transform": "From<Anchor> — ts нано-секунды → OffsetDateTime.from_unix_timestamp_nanos (fallback UNIX_EPOCH)", "sink": "Cursor"}
+        ],
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0007/entity/anchor-state",
+      "src": "SRC-0007",
+      "composition": "entity",
+      "terms": {
+        "object": "AnchorState — state-машина пропуска элементов до прохождения cursor при пагинации",
+        "attributes": [
+          "ts: OffsetDateTime (из Cursor или UNIX_EPOCH если anchor=None)",
+          "id: Uuid (из Cursor или Uuid::nil)",
+          "passed: bool (true если уже прошли anchor point; если anchor=None → passed=true сразу)"
+        ],
+        "relationships": [
+          {"to": "SRC-0007/entity/cursor", "rel": "initialized_from", "card": "1:1"}
+        ],
+        "enumerations": null,
+        "data_flows": [
+          {"source": "scan (ts, id) per file", "transform": "should_skip: если !passed и (ts < self.ts OR (ts == self.ts и id < self.id)) → passed=true, вернуть false; если ts>=self.ts и id>=self.id — вернуть true (skip)", "sink": "ControlFlow по паре"}
+        ],
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0007/entity/thread-list-config",
+      "src": "SRC-0007",
+      "composition": "entity",
+      "terms": {
+        "object": "ThreadListConfig — конфигурация запроса списка thread",
+        "attributes": [
+          "allowed_sources: &[SessionSource] — разрешённые источники (пустой = все)",
+          "model_providers: Option<&[String]> — фильтр по провайдерам (None = все)",
+          "default_provider: &str",
+          "layout: ThreadListLayout (NestedByDate — ~/.codex/sessions/YYYY/MM/DD; Flat — плоская директория)"
+        ],
+        "relationships": [
+          {"to": "SRC-0007/entity/threads-page", "rel": "parameterizes_scan_for", "card": "1:1"}
+        ],
+        "enumerations": {
+          "ThreadListLayout": ["NestedByDate", "Flat"],
+          "ThreadSortKey": ["CreatedAt", "UpdatedAt"]
+        },
+        "data_flows": null,
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0007/entity/provider-matcher",
+      "src": "SRC-0007",
+      "composition": "entity",
+      "terms": {
+        "object": "ProviderMatcher — матчер для фильтрации rollout-файлов по model_provider",
+        "attributes": [
+          "filters: &[String] (None если filters.is_empty() → matcher не создаётся)",
+          "matches_default_provider: bool (true если default_provider присутствует в filters)"
+        ],
+        "relationships": [
+          {"to": "SRC-0007/entity/thread-list-config", "rel": "built_from", "card": "1:1"}
+        ],
+        "enumerations": null,
+        "data_flows": [
+          {"source": "session provider (Some(provider) из head summary)", "transform": "matches: Some(provider) → filters.any(candidate == provider); None → matches_default_provider", "sink": "bool (include/exclude ThreadItem)"}
+        ],
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0007/entity/session-index-entry",
+      "src": "SRC-0007",
+      "composition": "entity",
+      "terms": {
+        "object": "SessionIndexEntry — запись в append-only журнале session_index.jsonl (маппинг thread_id ↔ thread_name)",
+        "attributes": [
+          "id: ThreadId",
+          "thread_name: String",
+          "updated_at: String (RFC3339 UTC; 'unknown' если format failed)"
+        ],
+        "relationships": [
+          {"to": "SRC-0007/entity/session-index", "rel": "appended_to", "card": "N:1"}
+        ],
+        "enumerations": null,
+        "data_flows": [
+          {"source": "append_thread_name(codex_home, thread_id, name)", "transform": "OffsetDateTime::now_utc().format(Rfc3339) → SessionIndexEntry → serde_json line + '\\n'", "sink": "session_index.jsonl (tokio create/append)"}
+        ],
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0007/entity/session-index",
+      "src": "SRC-0007",
+      "composition": "entity",
+      "terms": {
+        "object": "Session index (session_index.jsonl) — append-only файл-журнал, маппинг thread_id ↔ thread_name; последняя запись для id/name побеждает",
+        "attributes": [
+          "путь: <codex_home>/session_index.jsonl (константа SESSION_INDEX_FILE)",
+          "READ_CHUNK_SIZE = 8192 байт (размер chunk при реверсивном сканировании)",
+          "порядок: append-only, чтение от конца к началу (scan_index_from_end) для получения самой свежей записи"
+        ],
+        "relationships": [
+          {"to": "SRC-0007/entity/session-index-entry", "rel": "contains", "card": "1:N"},
+          {"to": "SRC-0007/entity/rollout-file", "rel": "indexes", "card": "1:1"}
+        ],
+        "enumerations": null,
+        "data_flows": [
+          {"source": "session_index.jsonl (reverse scan from end by 8192-byte chunks)", "transform": "parse_line_from_rev (reverse bytes до '\\n', UTF-8, serde_json::from_str<SessionIndexEntry>) + predicate (by_id или by_name)", "sink": "Option<SessionIndexEntry> / stream ThreadId через mpsc"}
+        ],
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0007/entity/thread-metadata-row",
+      "src": "SRC-0007",
+      "composition": "entity",
+      "terms": {
+        "object": "Thread metadata row (в SQLite state db) — SQLite-зеркало rollout metadata (id, path, cwd, provider, created/updated/archived_at, git, cli_version, agent fields, source, memory_mode, dynamic_tools)",
+        "attributes": [
+          "id: ThreadId",
+          "rollout_path: PathBuf",
+          "cwd: PathBuf (normalized через normalize_for_path_comparison при записи)",
+          "model_provider: String",
+          "created_at: DateTime<Utc>",
+          "updated_at: DateTime<Utc>",
+          "archived_at: Option<DateTime<Utc>>",
+          "source: String",
+          "agent_nickname, agent_role: Option<String>",
+          "git_sha, git_branch, git_origin_url: Option<String>",
+          "cli_version: String",
+          "first_user_message: Option<String>",
+          "title: String (для search)",
+          "memory_mode: строка (по умолчанию 'enabled', 'disabled' если generate_memories=false)",
+          "dynamic_tools: Option<Vec<DynamicToolSpec>>"
+        ],
+        "relationships": [
+          {"to": "SRC-0007/entity/rollout-file", "rel": "mirrors", "card": "1:1"},
+          {"to": "SRC-0007/entity/backfill-state", "rel": "gated_by", "card": "N:1"}
+        ],
+        "enumerations": null,
+        "data_flows": [
+          {"source": "rollout file (read session meta + items)", "transform": "extract_metadata_from_rollout → ThreadMetadataBuilder → build + apply_rollout_item per item; cwd normalize; prefer_existing_git_info если row уже есть", "sink": "SQLite upsert_thread + set_thread_memory_mode + persist_dynamic_tools"},
+          {"source": "rollout write (record_items)", "transform": "sync_thread_state_after_write: apply_rollout_items (если items affect metadata или new_memory_mode) ИНАЧЕ touch_thread_updated_at (lightweight timestamp update)", "sink": "SQLite"},
+          {"source": "filesystem fallback после stale/missing DB path", "transform": "read_repair_rollout_path: fast path (clone + update rollout_path + cwd normalize + archived_at handling; skip if equal) / slow path (reconcile_rollout через extract)", "sink": "SQLite upsert (warn 'state db discrepancy ... upsert_needed fast path/slow path')"}
+        ],
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0007/entity/backfill-state",
+      "src": "SRC-0007",
+      "composition": "entity",
+      "terms": {
+        "object": "BackfillState — состояние миграции rollout-файлов в SQLite (однократная полная scan при старте)",
+        "attributes": [
+          "status: BackfillStatus",
+          "last_watermark: Option<String> (relative path последнего processed rollout, с '\\\\' заменённым на '/')"
+        ],
+        "relationships": [
+          {"to": "SRC-0007/entity/thread-metadata-row", "rel": "gates_access_to", "card": "1:N"},
+          {"to": "SRC-0007/entity/rollout-file", "rel": "scans", "card": "1:N"}
+        ],
+        "enumerations": {
+          "BackfillStatus": ["Complete", "Running", "(others visible via as_str() not enumerated in this SRC)"]
+        },
+        "data_flows": [
+          {"source": "~/.codex/sessions + archived_sessions (collect_rollout_paths — рекурсивный stack-based обход, фильтр rollout-*.jsonl)", "transform": "sort by watermark; filter > last_watermark; chunk BACKFILL_BATCH_SIZE; per rollout: extract_metadata_from_rollout → upsert_thread + set_thread_memory_mode + persist_dynamic_tools; checkpoint watermark после каждого batch", "sink": "SQLite rows + backfill_state: mark_backfill_complete(last_watermark)"}
+        ],
+        "config": {
+          "BACKFILL_BATCH_SIZE": {"value": 200, "source": "hardcoded const (metadata.rs)", "default": 200},
+          "BACKFILL_LEASE_SECONDS": {"value": 900, "source": "hardcoded const (metadata.rs, #[cfg(not(test))])", "default": 900},
+          "BACKFILL_LEASE_SECONDS (test)": {"value": 1, "source": "hardcoded const (metadata.rs, #[cfg(test)])", "default": 1}
+        }
+      }
+    },
+    {
+      "id": "SRC-0007/entity/backfill-stats",
+      "src": "SRC-0007",
+      "composition": "entity",
+      "terms": {
+        "object": "BackfillStats — счётчики прогресса backfill (scanned/upserted/failed)",
+        "attributes": [
+          "scanned: число просмотренных rollout (saturating_add)",
+          "upserted: число успешных upsert (saturating_add)",
+          "failed: число ошибок (saturating_add)"
+        ],
+        "relationships": [
+          {"to": "SRC-0007/entity/backfill-state", "rel": "reports_on", "card": "1:1"}
+        ],
+        "enumerations": {
+          "backfill_outcome (metric status)": ["success (failed==0)", "failed (upserted==0)", "partial_failure (else)"]
+        },
+        "data_flows": [
+          {"source": "BackfillStats", "transform": "OTel counter DB_METRIC_BACKFILL c tag status=upserted/failed + DB_METRIC_BACKFILL_DURATION_MS timer с status", "sink": "metric client"}
+        ],
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0007/entity/extraction-outcome",
+      "src": "SRC-0007",
+      "composition": "entity",
+      "terms": {
+        "object": "ExtractionOutcome — результат extract_metadata_from_rollout (metadata + memory_mode + parse_errors)",
+        "attributes": [
+          "metadata: ThreadMetadataBuilder built",
+          "memory_mode: Option<String> (из последнего SessionMeta в файле)",
+          "parse_errors: usize (количество строк, которые не удалось распарсить как RolloutLine/JSON)"
+        ],
+        "relationships": [
+          {"to": "SRC-0007/entity/rollout-file", "rel": "extracted_from", "card": "1:1"},
+          {"to": "SRC-0007/entity/thread-metadata-row", "rel": "produces", "card": "1:1"}
+        ],
+        "enumerations": null,
+        "data_flows": [
+          {"source": "rollout file lines", "transform": "RolloutRecorder::load_rollout_items: parse каждую строку как JSON (warn на ошибке, parse_errors +=1 saturating) → RolloutLine → RolloutItem variants; первый встреченный SessionMeta даёт thread_id", "sink": "(items, thread_id, parse_errors)"},
+          {"source": "parse_errors > 0", "transform": "OTel counter DB_ERROR_METRIC с stage='backfill_sessions'", "sink": "metric"}
+        ],
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0007/entity/rollout-config",
+      "src": "SRC-0007",
+      "composition": "entity",
+      "terms": {
+        "object": "RolloutConfig / RolloutConfigView — конфиг rollout-слоя (ключевые paths и параметры сессии)",
+        "attributes": [
+          "codex_home: PathBuf (корень ~/.codex — sessions/ + archived_sessions/ + session_index.jsonl)",
+          "sqlite_home: PathBuf (расположение state db)",
+          "cwd: PathBuf (рабочая директория сессии)",
+          "model_provider_id: String",
+          "generate_memories: bool"
+        ],
+        "relationships": [
+          {"to": "SRC-0007/entity/rollout-recorder", "rel": "configures", "card": "1:N"},
+          {"to": "SRC-0007/entity/session-meta", "rel": "seeds_cwd_provider_memory_mode", "card": "1:1"}
+        ],
+        "enumerations": null,
+        "data_flows": null,
+        "config": {
+          "SESSIONS_SUBDIR": {"value": "sessions", "source": "hardcoded pub const (lib.rs)", "default": "sessions"},
+          "ARCHIVED_SESSIONS_SUBDIR": {"value": "archived_sessions", "source": "hardcoded pub const (lib.rs)", "default": "archived_sessions"},
+          "INTERACTIVE_SESSION_SOURCES": {"value": ["Cli", "VSCode", "Custom('atlas')", "Custom('chatgpt')"], "source": "hardcoded static LazyLock (lib.rs)", "default": "Cli, VSCode, Custom('atlas'), Custom('chatgpt')"},
+          "SESSION_INDEX_FILE": {"value": "session_index.jsonl", "source": "hardcoded const (session_index.rs)", "default": "session_index.jsonl"},
+          "ROLLOUT_PREFIX": {"value": "rollout-", "source": "hardcoded const (metadata.rs / list.rs)", "default": "rollout-"},
+          "ROLLOUT_SUFFIX": {"value": ".jsonl", "source": "hardcoded const (metadata.rs / list.rs)", "default": ".jsonl"},
+          "MAX_SCAN_FILES": {"value": 10000, "source": "hardcoded const (list.rs)", "default": 10000},
+          "HEAD_RECORD_LIMIT": {"value": 10, "source": "hardcoded const (list.rs)", "default": 10},
+          "USER_EVENT_SCAN_LIMIT": {"value": 200, "source": "hardcoded const (list.rs)", "default": 200},
+          "PERSISTED_EXEC_AGGREGATED_OUTPUT_MAX_BYTES": {"value": 10000, "source": "hardcoded const (recorder.rs)", "default": 10000}
+        }
+      }
+    },
+    {
+      "id": "SRC-0007/entity/thread-store",
+      "src": "SRC-0007",
+      "composition": "entity",
+      "terms": {
+        "object": "ThreadStore — storage-neutral boundary (trait) над thread persistence: create/resume/append/read/list/set_name/update_metadata/archive/unarchive",
+        "attributes": [
+          "create_thread(CreateThreadParams) → Box<dyn ThreadRecorder>",
+          "resume_thread_recorder(ResumeThreadRecorderParams) → Box<dyn ThreadRecorder>",
+          "append_items(AppendThreadItemsParams)",
+          "load_history(LoadThreadHistoryParams) → StoredThreadHistory",
+          "read_thread(ReadThreadParams) → StoredThread",
+          "list_threads(ListThreadsParams) → ThreadPage",
+          "set_thread_name(SetThreadNameParams)",
+          "update_thread_metadata(UpdateThreadMetadataParams) → StoredThread",
+          "archive_thread(ArchiveThreadParams)",
+          "unarchive_thread(ArchiveThreadParams) → StoredThread"
+        ],
+        "relationships": [
+          {"to": "SRC-0007/entity/local-thread-store", "rel": "implemented_by", "card": "1:1"},
+          {"to": "SRC-0007/entity/thread-recorder", "rel": "produces", "card": "1:N"},
+          {"to": "SRC-0007/entity/stored-thread", "rel": "returns", "card": "1:N"}
+        ],
+        "enumerations": null,
+        "data_flows": null,
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0007/entity/thread-recorder",
+      "src": "SRC-0007",
+      "composition": "entity",
+      "terms": {
+        "object": "ThreadRecorder — storage-neutral live-append handle (обёртка над RolloutRecorder)",
+        "attributes": [
+          "thread_id() → ThreadId",
+          "record_items(items)",
+          "persist() — материализует lazy storage и пишет",
+          "flush() — дождаться durability",
+          "shutdown() — flush + close"
+        ],
+        "relationships": [
+          {"to": "SRC-0007/entity/rollout-recorder", "rel": "wraps", "card": "1:1"},
+          {"to": "SRC-0007/entity/thread-store", "rel": "produced_by", "card": "N:1"}
+        ],
+        "enumerations": null,
+        "data_flows": null,
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0007/entity/local-thread-store",
+      "src": "SRC-0007",
+      "composition": "entity",
+      "terms": {
+        "object": "LocalThreadStore — локальная реализация ThreadStore (filesystem + SQLite), delegates к codex_rollout",
+        "attributes": [
+          "config: RolloutConfig",
+          "supported: read_thread, list_threads, archive_thread, unarchive_thread",
+          "unsupported (в текущем slice): create_thread, resume_thread_recorder, append_items, load_history, set_thread_name, update_thread_metadata (возвращают ThreadStoreError::Internal 'local thread store does not implement {operation} in this slice')"
+        ],
+        "relationships": [
+          {"to": "SRC-0007/entity/thread-store", "rel": "implements", "card": "1:1"},
+          {"to": "SRC-0007/entity/rollout-config", "rel": "uses", "card": "1:1"},
+          {"to": "SRC-0007/entity/rollout-file", "rel": "operates_on", "card": "1:N"}
+        ],
+        "enumerations": null,
+        "data_flows": null,
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0007/entity/stored-thread",
+      "src": "SRC-0007",
+      "composition": "entity",
+      "terms": {
+        "object": "StoredThread — store-owned thread metadata для list/read/resume ответов",
+        "attributes": [
+          "thread_id: ThreadId",
+          "rollout_path: Option<PathBuf>",
+          "forked_from_id: Option<ThreadId>",
+          "preview: String (первое UserMessage или пусто)",
+          "name: Option<String>",
+          "model_provider: String",
+          "model: Option<String>",
+          "reasoning_effort: Option<ReasoningEffort>",
+          "created_at: DateTime<Utc>",
+          "updated_at: DateTime<Utc>",
+          "archived_at: Option<DateTime<Utc>>",
+          "cwd: PathBuf",
+          "cli_version: String",
+          "source: SessionSource (default Unknown)",
+          "agent_nickname, agent_role, agent_path: Option<String>",
+          "git_info: Option<GitInfo> { commit_hash, branch, repository_url }",
+          "approval_mode: AskForApproval (default OnRequest)",
+          "sandbox_policy: SandboxPolicy (default new_read_only_policy)",
+          "token_usage: Option<TokenUsage>",
+          "first_user_message: Option<String>",
+          "history: Option<StoredThreadHistory>"
+        ],
+        "relationships": [
+          {"to": "SRC-0007/entity/thread-item", "rel": "built_from", "card": "1:1"},
+          {"to": "SRC-0007/entity/thread-page", "rel": "contained_in", "card": "N:1"}
+        ],
+        "enumerations": null,
+        "data_flows": [
+          {"source": "ThreadItem + archived flag + default_provider", "transform": "stored_thread_from_rollout_item: thread_id из item или parsed из filename (last 36-char UUID после '-', stem.len() >= 37); created_at парсится из RFC3339 (fallback Utc::now); updated_at RFC3339 fallback created_at; archived_at = archived.then_some(updated_at); model_provider из item или default_provider если empty; preview = first_user_message.clone().unwrap_or_default", "sink": "Option<StoredThread>"}
+        ],
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0007/entity/stored-thread-history",
+      "src": "SRC-0007",
+      "composition": "entity",
+      "terms": {
+        "object": "StoredThreadHistory — persisted items thread без требования filesystem path (для resume/fork/rollback/memory)",
+        "attributes": [
+          "thread_id: ThreadId",
+          "items: Vec<RolloutItem> (в replay order)"
+        ],
+        "relationships": [
+          {"to": "SRC-0007/entity/stored-thread", "rel": "populates_history_field_of", "card": "1:1"},
+          {"to": "SRC-0007/entity/rollout-item", "rel": "contains", "card": "1:N"}
+        ],
+        "enumerations": null,
+        "data_flows": [
+          {"source": "rollout file path", "transform": "RolloutRecorder::load_rollout_items → (items, thread_id, parse_errors)", "sink": "StoredThreadHistory { thread_id, items }"}
+        ],
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0007/entity/thread-page",
+      "src": "SRC-0007",
+      "composition": "entity",
+      "terms": {
+        "object": "ThreadPage — страница StoredThread (storage-neutral версия ThreadsPage)",
+        "attributes": [
+          "items: Vec<StoredThread>",
+          "next_cursor: Option<String> (opaque)"
+        ],
+        "relationships": [
+          {"to": "SRC-0007/entity/stored-thread", "rel": "contains", "card": "1:N"},
+          {"to": "SRC-0007/entity/threads-page", "rel": "mapped_from", "card": "1:1"}
+        ],
+        "enumerations": null,
+        "data_flows": null,
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0007/entity/list-threads-params",
+      "src": "SRC-0007",
+      "composition": "entity",
+      "terms": {
+        "object": "ListThreadsParams — параметры запроса списка thread через ThreadStore",
+        "attributes": [
+          "page_size: usize",
+          "cursor: Option<String>",
+          "sort_key: ThreadSortKey (CreatedAt default / UpdatedAt)",
+          "allowed_sources: Vec<SessionSource> (пусто = impl default)",
+          "model_providers: Option<Vec<String>> (None = impl default, пустой = все провайдеры)",
+          "archived: bool",
+          "search_term: Option<String>"
+        ],
+        "relationships": [
+          {"to": "SRC-0007/entity/thread-page", "rel": "yields", "card": "1:1"}
+        ],
+        "enumerations": {
+          "ThreadSortKey": ["CreatedAt (default)", "UpdatedAt"]
+        },
+        "data_flows": null,
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0007/entity/create-thread-params",
+      "src": "SRC-0007",
+      "composition": "entity",
+      "terms": {
+        "object": "CreateThreadParams — параметры создания thread через ThreadStore.create_thread",
+        "attributes": [
+          "thread_id: ThreadId (сгенерирован до открытия persistence)",
+          "forked_from_id: Option<ThreadId>",
+          "source: SessionSource",
+          "base_instructions: BaseInstructions",
+          "dynamic_tools: Vec<DynamicToolSpec>",
+          "event_persistence_mode: ThreadEventPersistenceMode (Limited default / Extended)"
+        ],
+        "relationships": [
+          {"to": "SRC-0007/entity/thread-recorder", "rel": "yields", "card": "1:1"},
+          {"to": "SRC-0007/entity/session-meta", "rel": "seeds", "card": "1:1"}
+        ],
+        "enumerations": {
+          "ThreadEventPersistenceMode": ["Limited (default)", "Extended"]
+        },
+        "data_flows": null,
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0007/entity/read-thread-params",
+      "src": "SRC-0007",
+      "composition": "entity",
+      "terms": {
+        "object": "ReadThreadParams — параметры чтения thread summary + optional history",
+        "attributes": [
+          "thread_id: ThreadId",
+          "include_archived: bool",
+          "include_history: bool"
+        ],
+        "relationships": [
+          {"to": "SRC-0007/entity/stored-thread", "rel": "yields", "card": "1:1"}
+        ],
+        "enumerations": null,
+        "data_flows": null,
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0007/entity/archive-thread-params",
+      "src": "SRC-0007",
+      "composition": "entity",
+      "terms": {
+        "object": "ArchiveThreadParams — параметры archive/unarchive thread",
+        "attributes": [
+          "thread_id: ThreadId"
+        ],
+        "relationships": [
+          {"to": "SRC-0007/entity/rollout-file", "rel": "moves", "card": "1:1"}
+        ],
+        "enumerations": null,
+        "data_flows": [
+          {"source": "active rollout (codex_home/sessions/YYYY/MM/DD/rollout-<ts>-<uuid>.jsonl)", "transform": "find_thread_path_by_id_str → scoped_rollout_path (canonicalize, must start_with sessions/) → matching_rollout_file_name (must end with <thread_id>.jsonl) → create_dir_all archived_sessions → rename active→archived → SQLite mark_archived", "sink": "archived rollout (codex_home/archived_sessions/rollout-<ts>-<uuid>.jsonl, flat)"},
+          {"source": "archived rollout", "transform": "find_archived_thread_path_by_id_str → scoped_rollout_path archived → matching_rollout_file_name → rollout_date_parts(filename) → (year, month, day) → create_dir_all sessions/Y/M/D → rename archived→sessions/Y/M/D/... → touch_modified_time → SQLite mark_unarchived → read_thread_item_from_rollout → stored_thread_from_rollout_item", "sink": "restored rollout + StoredThread (archived_at=None)"}
+        ],
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0007/entity/update-thread-metadata-params",
+      "src": "SRC-0007",
+      "composition": "entity",
+      "terms": {
+        "object": "UpdateThreadMetadataParams — параметры патча mutable thread metadata (git info)",
+        "attributes": [
+          "thread_id: ThreadId",
+          "patch: ThreadMetadataPatch { git_info: Option<GitInfoPatch> }",
+          "GitInfoPatch: { sha, branch, origin_url: OptionalStringPatch }",
+          "OptionalStringPatch = Option<Option<String>> — None = no-op, Some(None) = clear, Some(Some(v)) = replace"
+        ],
+        "relationships": [
+          {"to": "SRC-0007/entity/stored-thread", "rel": "patches", "card": "1:1"}
+        ],
+        "enumerations": null,
+        "data_flows": null,
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0007/entity/set-thread-name-params",
+      "src": "SRC-0007",
+      "composition": "entity",
+      "terms": {
+        "object": "SetThreadNameParams — параметры установки user-facing thread name",
+        "attributes": [
+          "thread_id: ThreadId",
+          "name: String (normalized)"
+        ],
+        "relationships": [
+          {"to": "SRC-0007/entity/session-index-entry", "rel": "appends", "card": "1:1"}
+        ],
+        "enumerations": null,
+        "data_flows": null,
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0007/entity/thread-store-error",
+      "src": "SRC-0007",
+      "composition": "entity",
+      "terms": {
+        "object": "ThreadStoreError — доменная ошибка thread-store операций",
+        "attributes": [
+          "ThreadNotFound { thread_id } — 'thread {thread_id} not found'",
+          "InvalidRequest { message } — 'invalid thread-store request: {message}'",
+          "Conflict { message } — 'thread-store conflict: {message}'",
+          "Internal { message } — 'thread-store internal error: {message}'"
+        ],
+        "relationships": [
+          {"to": "SRC-0007/entity/thread-store", "rel": "returned_by", "card": "N:1"}
+        ],
+        "enumerations": {
+          "ThreadStoreError variants": ["ThreadNotFound", "InvalidRequest", "Conflict", "Internal"]
+        },
+        "data_flows": null,
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0007/entity/log-file-info",
+      "src": "SRC-0007",
+      "composition": "entity",
+      "terms": {
+        "object": "LogFileInfo — precomputed info для lazy-материализации rollout-файла (путь + session_id + timestamp)",
+        "attributes": [
+          "path: PathBuf — <codex_home>/sessions/YYYY/MM/DD/rollout-<YYYY-MM-DDThh-mm-ss>-<conversation_id>.jsonl",
+          "conversation_id: ThreadId",
+          "timestamp: OffsetDateTime (from now_local())"
+        ],
+        "relationships": [
+          {"to": "SRC-0007/entity/rollout-writer-state", "rel": "deferred_by", "card": "1:1"}
+        ],
+        "enumerations": null,
+        "data_flows": [
+          {"source": "RolloutConfigView + conversation_id", "transform": "precompute_log_file_info: now_local → year/MM/DD dirs; filename 'rollout-YYYY-MM-DDThh-mm-ss-<conv_id>.jsonl' (дефисы вместо ':' для FS-совместимости)", "sink": "LogFileInfo"}
+        ],
+        "config": null
+      }
+    }
+  ]
+}

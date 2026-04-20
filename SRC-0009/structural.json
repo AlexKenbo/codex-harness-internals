@@ -1,0 +1,935 @@
+{
+  "src": "SRC-0009",
+  "schema_version": "2.0",
+  "lens": "structural",
+  "compositions": [
+    {
+      "id": "SRC-0009/entity/codex",
+      "src": "SRC-0009",
+      "composition": "entity",
+      "terms": {
+        "object": "Codex — высокоуровневый интерфейс к системе: очередь пар submission/event для одного треда (conversation)",
+        "attributes": [
+          "tx_sub: Sender<Submission> — канал отправки submissions в submission_loop",
+          "rx_event: Receiver<Event> — канал получения событий из сессии",
+          "agent_status: watch::Receiver<AgentStatus> — последний известный статус агента (PendingInit и др.)",
+          "session: Arc<Session> — ссылка на полный session state",
+          "session_loop_termination: SessionLoopTermination — Shared<BoxFuture<'static, ()>> для ожидания shutdown submission_loop"
+        ],
+        "relationships": [
+          {"to": "SRC-0009/entity/session", "rel": "owns", "card": "1:1"},
+          {"to": "SRC-0009/entity/submission-loop", "rel": "drives_via_channel", "card": "1:1"},
+          {"to": "SRC-0009/entity/codex-thread", "rel": "wrapped_by", "card": "1:1"},
+          {"to": "SRC-0009/entity/codex-spawn-args", "rel": "constructed_from", "card": "1:1"}
+        ],
+        "enumerations": null,
+        "data_flows": [
+          {"source": "caller (CodexThread / ThreadManager / codex_delegate)", "transform": "submit(op) → Uuid::now_v7() → Submission{id,op,trace}", "sink": "tx_sub channel → submission_loop"},
+          {"source": "submission_loop / run_turn", "transform": "Event produced by Session", "sink": "rx_event → caller next_event()"}
+        ],
+        "config": {
+          "SUBMISSION_CHANNEL_CAPACITY": {"value": 512, "source": "hardcoded const", "default": 512},
+          "INITIAL_SUBMIT_ID": {"value": "\"\"", "source": "hardcoded const (empty string)", "default": "\"\""},
+          "CYBER_VERIFY_URL": {"value": "https://chatgpt.com/cyber", "source": "hardcoded const", "default": "https://chatgpt.com/cyber"},
+          "CYBER_SAFETY_URL": {"value": "https://developers.openai.com/codex/concepts/cyber-safety", "source": "hardcoded const", "default": "https://developers.openai.com/codex/concepts/cyber-safety"}
+        }
+      }
+    },
+    {
+      "id": "SRC-0009/entity/codex-spawn-args",
+      "src": "SRC-0009",
+      "composition": "entity",
+      "terms": {
+        "object": "CodexSpawnArgs — набор входных зависимостей для запуска Codex (все внешние менеджеры + режим)",
+        "attributes": [
+          "config: Config",
+          "auth_manager: Arc<AuthManager>",
+          "models_manager: Arc<ModelsManager>",
+          "environment_manager: Arc<EnvironmentManager>",
+          "skills_manager: Arc<SkillsManager>",
+          "plugins_manager: Arc<PluginsManager>",
+          "mcp_manager: Arc<McpManager>",
+          "skills_watcher: Arc<SkillsWatcher>",
+          "conversation_history: InitialHistory — New/Cleared/Forked/Resumed",
+          "session_source: SessionSource — откуда тред стартовал (cli/vscode/exec/mcp/SubAgent/...)",
+          "agent_control: AgentControl",
+          "dynamic_tools: Vec<DynamicToolSpec>",
+          "persist_extended_history: bool",
+          "metrics_service_name: Option<String>",
+          "inherited_shell_snapshot: Option<Arc<ShellSnapshot>>",
+          "inherited_exec_policy: Option<Arc<ExecPolicyManager>>",
+          "user_shell_override: Option<shell::Shell>",
+          "parent_trace: Option<W3cTraceContext>",
+          "analytics_events_client: Option<AnalyticsEventsClient>"
+        ],
+        "relationships": [
+          {"to": "SRC-0009/entity/codex", "rel": "produces", "card": "1:1"},
+          {"to": "SRC-0009/entity/session-configuration", "rel": "projected_into", "card": "1:1"}
+        ],
+        "enumerations": {
+          "SessionSource": ["VSCode", "Cli", "Exec", "Mcp", "Custom(String)", "SubAgent(SubAgentSource)", "Unknown"],
+          "InitialHistory": ["New", "Cleared", "Forked(Vec<RolloutItem>)", "Resumed(ResumedHistory)"]
+        },
+        "data_flows": null,
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0009/entity/codex-spawn-ok",
+      "src": "SRC-0009",
+      "composition": "entity",
+      "terms": {
+        "object": "CodexSpawnOk — результат Codex::spawn: пара (codex, thread_id)",
+        "attributes": [
+          "codex: Codex",
+          "thread_id: ThreadId — уникальный id треда на весь жизненный цикл"
+        ],
+        "relationships": [
+          {"to": "SRC-0009/entity/codex", "rel": "contains", "card": "1:1"},
+          {"to": "SRC-0009/entity/thread-manager", "rel": "consumed_by_finalize_thread_spawn", "card": "1:1"}
+        ],
+        "enumerations": null,
+        "data_flows": null,
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0009/entity/session",
+      "src": "SRC-0009",
+      "composition": "entity",
+      "terms": {
+        "object": "Session — контекст инициализированного модели-агента: хранит мутабельное состояние треда, каналы событий, сервисы, очередь активного turn. У сессии одновременно не более 1 активного задачи; задачи могут быть прерваны пользователем",
+        "attributes": [
+          "conversation_id: ThreadId — уникальный id треда",
+          "tx_event: Sender<Event> — канал вывода событий подписчику",
+          "agent_status: watch::Sender<AgentStatus> — публикация статуса агента",
+          "out_of_band_elicitation_paused: watch::Sender<bool> — флаг, что сессия на паузе из-за out-of-band запроса",
+          "state: Mutex<SessionState> — мутабельное состояние сессии (history, SessionConfiguration, granted permissions, reference_context_item, previous_turn_settings, prewarm и пр.)",
+          "managed_network_proxy_refresh_lock: Mutex<()> — сериализует rebuild/apply цикл network proxy",
+          "features: ManagedFeatures — enabled features, инвариант на время сессии",
+          "pending_mcp_server_refresh_config: Mutex<Option<McpServerRefreshConfig>>",
+          "conversation: Arc<RealtimeConversationManager> — realtime-диалог",
+          "active_turn: Mutex<Option<ActiveTurn>> — текущий активный turn (задача) или None",
+          "mailbox: Mailbox + mailbox_rx: Mutex<MailboxReceiver> — очередь inter-agent communication сообщений",
+          "idle_pending_input: Mutex<Vec<ResponseInputItem>> — входные items, поставленные когда нет active turn",
+          "guardian_review_session: GuardianReviewSessionManager",
+          "services: SessionServices — все сервисы (rollout, mcp_manager, skills_manager, analytics, hooks, exec_policy, agent_identity_manager и др.)",
+          "js_repl: Arc<JsReplHandle>",
+          "next_internal_sub_id: AtomicU64 — генератор внутренних sub_id"
+        ],
+        "relationships": [
+          {"to": "SRC-0009/entity/codex", "rel": "referenced_by", "card": "1:1"},
+          {"to": "SRC-0009/entity/turn-context", "rel": "creates_per_turn", "card": "1:N"},
+          {"to": "SRC-0009/entity/session-configuration", "rel": "contains_in_state", "card": "1:1"},
+          {"to": "SRC-0009/entity/active-turn", "rel": "owns", "card": "1:0..1"},
+          {"to": "SRC-0009/entity/agent-identity-manager", "rel": "uses_via_services", "card": "1:1"},
+          {"to": "SRC-0009/entity/codex-thread", "rel": "wrapped_by", "card": "1:1"}
+        ],
+        "enumerations": null,
+        "data_flows": [
+          {"source": "Codex.tx_sub (caller submissions)", "transform": "submission_loop dispatch by Op kind → handlers::*", "sink": "Session.state + emit Event via tx_event"},
+          {"source": "Session active_turn + run_turn", "transform": "sampling_request → ResponseEvent stream", "sink": "tx_event → Codex.rx_event"},
+          {"source": "parent Session (для SubAgent)", "transform": "run_codex_thread_interactive forwards events and approvals", "sink": "child Session"}
+        ],
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0009/entity/session-configuration",
+      "src": "SRC-0009",
+      "composition": "entity",
+      "terms": {
+        "object": "SessionConfiguration — клонируемый снимок конфигурации текущей сессии. Обновляется через SessionSettingsUpdate.apply()",
+        "attributes": [
+          "provider: ModelProviderInfo — id провайдера (\"openai\", \"openrouter\", ...)",
+          "collaboration_mode: CollaborationMode — model + reasoning_effort + developer_instructions",
+          "model_reasoning_summary: Option<ReasoningSummaryConfig>",
+          "service_tier: Option<ServiceTier>",
+          "developer_instructions: Option<String> — дополняют base instructions",
+          "user_instructions: Option<String>",
+          "personality: Option<Personality>",
+          "base_instructions: String — базовые инструкции сессии, приоритет: config.base_instructions > session_meta.base_instructions > model default",
+          "compact_prompt: Option<String>",
+          "approval_policy: Constrained<AskForApproval>",
+          "approvals_reviewer: ApprovalsReviewer",
+          "sandbox_policy: Constrained<SandboxPolicy>",
+          "file_system_sandbox_policy: FileSystemSandboxPolicy",
+          "network_sandbox_policy: NetworkSandboxPolicy",
+          "windows_sandbox_level: WindowsSandboxLevel",
+          "cwd: AbsolutePathBuf — корневой рабочий каталог сессии (все относительные пути разрешаются относительно него)",
+          "codex_home: AbsolutePathBuf",
+          "thread_name: Option<String> — пользовательское имя треда, обновляется в сессии",
+          "original_config_do_not_use: Arc<Config>",
+          "metrics_service_name: Option<String>",
+          "app_server_client_name: Option<String>",
+          "app_server_client_version: Option<String>",
+          "session_source: SessionSource",
+          "dynamic_tools: Vec<DynamicToolSpec>",
+          "persist_extended_history: bool",
+          "inherited_shell_snapshot: Option<Arc<ShellSnapshot>>",
+          "user_shell_override: Option<shell::Shell>"
+        ],
+        "relationships": [
+          {"to": "SRC-0009/entity/session", "rel": "held_by_state", "card": "1:1"},
+          {"to": "SRC-0009/entity/thread-config-snapshot", "rel": "projected_to", "card": "1:1"},
+          {"to": "SRC-0009/entity/session-settings-update", "rel": "modified_by", "card": "1:N"}
+        ],
+        "enumerations": {
+          "ApprovalsReviewer": "external (see codex_protocol::config_types::ApprovalsReviewer)",
+          "CollaborationMode.ModeKind": "external (see codex_protocol::config_types::ModeKind; Default is used in codex.rs)"
+        },
+        "data_flows": [
+          {"source": "SessionSettingsUpdate", "transform": "apply() — перестраивает next_configuration; rederive file_system_sandbox_policy если sandbox_policy изменилась или cwd-only update с legacy bridge", "sink": "new SessionConfiguration"}
+        ],
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0009/entity/session-settings-update",
+      "src": "SRC-0009",
+      "composition": "entity",
+      "terms": {
+        "object": "SessionSettingsUpdate — частичный апдейт конфигурации, собираемый из Op::UserTurn/OverrideTurnContext",
+        "attributes": [
+          "cwd: Option<PathBuf>",
+          "approval_policy: Option<AskForApproval>",
+          "approvals_reviewer: Option<ApprovalsReviewer>",
+          "sandbox_policy: Option<SandboxPolicy>",
+          "windows_sandbox_level: Option<WindowsSandboxLevel>",
+          "collaboration_mode: Option<CollaborationMode>",
+          "reasoning_summary: Option<ReasoningSummaryConfig>",
+          "service_tier: Option<Option<ServiceTier>>",
+          "final_output_json_schema: Option<Option<Value>>",
+          "personality: Option<Personality>",
+          "app_server_client_name: Option<String>",
+          "app_server_client_version: Option<String>"
+        ],
+        "relationships": [
+          {"to": "SRC-0009/entity/session-configuration", "rel": "applies_to", "card": "N:1"}
+        ],
+        "enumerations": null,
+        "data_flows": null,
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0009/entity/turn-context",
+      "src": "SRC-0009",
+      "composition": "entity",
+      "terms": {
+        "object": "TurnContext — контекст одного turn треда: неизменная снимок-конфигурация для текущего вызова модели",
+        "attributes": [
+          "sub_id: String — идентификатор turn",
+          "trace_id: Option<String>",
+          "realtime_active: bool",
+          "config: Arc<Config> — per-turn конфиг",
+          "auth_manager: Option<Arc<AuthManager>>",
+          "model_info: ModelInfo",
+          "session_telemetry: SessionTelemetry",
+          "provider: ModelProviderInfo",
+          "reasoning_effort: Option<ReasoningEffortConfig>",
+          "reasoning_summary: ReasoningSummaryConfig",
+          "session_source: SessionSource",
+          "environment: Option<Arc<Environment>>",
+          "cwd: AbsolutePathBuf — абсолютный рабочий каталог",
+          "current_date: Option<String>, timezone: Option<String>",
+          "app_server_client_name: Option<String>",
+          "developer_instructions/user_instructions/compact_prompt: Option<String>",
+          "collaboration_mode: CollaborationMode",
+          "personality: Option<Personality>",
+          "approval_policy: Constrained<AskForApproval>",
+          "sandbox_policy: Constrained<SandboxPolicy>",
+          "file_system_sandbox_policy: FileSystemSandboxPolicy",
+          "network_sandbox_policy: NetworkSandboxPolicy",
+          "network: Option<NetworkProxy>",
+          "windows_sandbox_level: WindowsSandboxLevel",
+          "shell_environment_policy: ShellEnvironmentPolicy",
+          "tools_config: ToolsConfig",
+          "features: ManagedFeatures",
+          "ghost_snapshot: GhostSnapshotConfig",
+          "final_output_json_schema: Option<Value>",
+          "codex_self_exe, codex_linux_sandbox_exe: Option<PathBuf>",
+          "tool_call_gate: Arc<ReadinessFlag>",
+          "truncation_policy: TruncationPolicy",
+          "js_repl: Arc<JsReplHandle>",
+          "dynamic_tools: Vec<DynamicToolSpec>",
+          "turn_metadata_state: Arc<TurnMetadataState>",
+          "turn_skills: TurnSkillsContext",
+          "turn_timing_state: Arc<TurnTimingState>"
+        ],
+        "relationships": [
+          {"to": "SRC-0009/entity/session", "rel": "created_by", "card": "N:1"},
+          {"to": "SRC-0009/entity/turn-skills-context", "rel": "contains", "card": "1:1"},
+          {"to": "SRC-0009/entity/session-configuration", "rel": "derived_from", "card": "N:1"}
+        ],
+        "enumerations": {
+          "AskForApproval": ["Never", "UnlessTrusted", "OnFailure", "OnRequest", "Granular(GranularApprovalConfig)"]
+        },
+        "data_flows": [
+          {"source": "SessionConfiguration + per_turn_config + ModelInfo", "transform": "make_turn_context: собирает tools_config, reasoning_effort, turn_metadata_state; spawn_git_enrichment_task", "sink": "TurnContext"},
+          {"source": "existing TurnContext", "transform": "with_model(model) — пересоздаёт tools_config + reasoning_effort клampнутый по supported_reasoning_levels (median of supported levels)", "sink": "new TurnContext"}
+        ],
+        "config": {
+          "model_context_window": {"value": "context_window * effective_context_window_percent / 100", "source": "computed in TurnContext::model_context_window from model_info", "default": "None"}
+        }
+      }
+    },
+    {
+      "id": "SRC-0009/entity/turn-skills-context",
+      "src": "SRC-0009",
+      "composition": "entity",
+      "terms": {
+        "object": "TurnSkillsContext — skills-контекст одного turn",
+        "attributes": [
+          "outcome: Arc<SkillLoadOutcome>",
+          "implicit_invocation_seen_skills: Arc<Mutex<HashSet<String>>>"
+        ],
+        "relationships": [
+          {"to": "SRC-0009/entity/turn-context", "rel": "contained_by", "card": "1:1"}
+        ],
+        "enumerations": null,
+        "data_flows": null,
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0009/entity/codex-thread",
+      "src": "SRC-0009",
+      "composition": "entity",
+      "terms": {
+        "object": "CodexThread — канал двунаправленного обмена сообщениями, образующими thread (ранее conversation). Публичный фасад над Codex с трекингом rollout path и счётчиком out-of-band elicitations",
+        "attributes": [
+          "codex: Codex",
+          "rollout_path: Option<PathBuf> — путь rollout-файла",
+          "out_of_band_elicitation_count: Mutex<u64> — счётчик активных out-of-band elicitation запросов",
+          "_watch_registration: WatchRegistration — удерживает подписку file watcher на время жизни треда"
+        ],
+        "relationships": [
+          {"to": "SRC-0009/entity/codex", "rel": "wraps", "card": "1:1"},
+          {"to": "SRC-0009/entity/thread-manager", "rel": "stored_in_threads_map", "card": "N:1"},
+          {"to": "SRC-0009/entity/thread-config-snapshot", "rel": "exposes", "card": "1:1"}
+        ],
+        "enumerations": null,
+        "data_flows": [
+          {"source": "caller submit/submit_with_id/submit_with_trace", "transform": "delegate to codex", "sink": "Codex submission pipeline"},
+          {"source": "inject_user_message_without_turn(message)", "transform": "упаковывает в ResponseInputItem → inject_response_items; при ошибке — создаёт new_default_turn и record_conversation_items", "sink": "conversation history без нового user turn boundary"},
+          {"source": "inject_response_items(items)", "transform": "new_default_turn → если нет reference_context_item, record_context_updates_and_set_reference_context_item → record_conversation_items → flush_rollout", "sink": "thread's model-visible history"},
+          {"source": "read_mcp_resource(server, uri)", "transform": "session.read_resource → serde_json::to_value", "sink": "JSON value"},
+          {"source": "call_mcp_tool(server, tool, arguments, meta)", "transform": "session.call_tool", "sink": "CallToolResult"}
+        ],
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0009/entity/thread-config-snapshot",
+      "src": "SRC-0009",
+      "composition": "entity",
+      "terms": {
+        "object": "ThreadConfigSnapshot — клонируемый снимок ключевых параметров треда (для аналитики, передачи родителю и т. п.)",
+        "attributes": [
+          "model: String",
+          "model_provider_id: String",
+          "service_tier: Option<ServiceTier>",
+          "approval_policy: AskForApproval",
+          "approvals_reviewer: ApprovalsReviewer",
+          "sandbox_policy: SandboxPolicy",
+          "cwd: AbsolutePathBuf",
+          "ephemeral: bool",
+          "reasoning_effort: Option<ReasoningEffort>",
+          "personality: Option<Personality>",
+          "session_source: SessionSource"
+        ],
+        "relationships": [
+          {"to": "SRC-0009/entity/session-configuration", "rel": "projected_from", "card": "1:1"}
+        ],
+        "enumerations": null,
+        "data_flows": null,
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0009/entity/thread-manager",
+      "src": "SRC-0009",
+      "composition": "entity",
+      "terms": {
+        "object": "ThreadManager — отвечает за создание тредов и их хранение в памяти. Глобальный сервис: управляет каталогом тредов, auth/models/mcp/plugins/skills/environment менеджерами и сессионным источником",
+        "attributes": [
+          "state: Arc<ThreadManagerState>",
+          "_test_codex_home_guard: Option<TempCodexHomeGuard>"
+        ],
+        "relationships": [
+          {"to": "SRC-0009/entity/thread-manager-state", "rel": "owns", "card": "1:1"},
+          {"to": "SRC-0009/entity/codex-thread", "rel": "creates_and_tracks", "card": "1:N"},
+          {"to": "SRC-0009/entity/new-thread", "rel": "returns", "card": "1:N"}
+        ],
+        "enumerations": null,
+        "data_flows": [
+          {"source": "Config + InitialHistory + параметры вызова (dynamic_tools, persist_extended_history, user_shell_override, parent_trace)", "transform": "spawn_thread → spawn_thread_with_source → Codex::spawn → finalize_thread_spawn → CodexThread::new + вставка в threads map + broadcast thread_created_tx", "sink": "NewThread { thread_id, thread, session_configured }"},
+          {"source": "rollout_path", "transform": "resume_thread_from_rollout → RolloutRecorder::get_rollout_history → spawn_thread", "sink": "возобновлённый CodexThread"},
+          {"source": "ForkSnapshot + rollout_path", "transform": "fork_thread: snapshot_turn_state → TruncateBeforeNthUserMessage или Interrupted → spawn_thread с новой историей", "sink": "новый форк-тред с фиксированным префиксом"},
+          {"source": "thread.state_db + agent_control", "transform": "list_agent_subtree_thread_ids: объединяет persisted descendants (state_db, статусы Open+Closed) с живыми subtree threads от AgentControl", "sink": "Vec<ThreadId> включая корневой"}
+        ],
+        "config": {
+          "THREAD_CREATED_CHANNEL_CAPACITY": {"value": 1024, "source": "hardcoded const", "default": 1024},
+          "FORCE_TEST_THREAD_MANAGER_BEHAVIOR": {"value": "false", "source": "AtomicBool static (test-only override)", "default": "false"}
+        }
+      }
+    },
+    {
+      "id": "SRC-0009/entity/thread-manager-state",
+      "src": "SRC-0009",
+      "composition": "entity",
+      "terms": {
+        "object": "ThreadManagerState — Arc-owned shared state ThreadManager, downgradable по Weak в AgentControl",
+        "attributes": [
+          "threads: Arc<RwLock<HashMap<ThreadId, Arc<CodexThread>>>>",
+          "thread_created_tx: broadcast::Sender<ThreadId>",
+          "auth_manager: Arc<AuthManager>",
+          "models_manager: Arc<ModelsManager>",
+          "environment_manager: Arc<EnvironmentManager>",
+          "skills_manager: Arc<SkillsManager>",
+          "plugins_manager: Arc<PluginsManager>",
+          "mcp_manager: Arc<McpManager>",
+          "skills_watcher: Arc<SkillsWatcher>",
+          "session_source: SessionSource",
+          "analytics_events_client: Option<AnalyticsEventsClient>",
+          "ops_log: Option<SharedCapturedOps> — захват ops в тестовом режиме"
+        ],
+        "relationships": [
+          {"to": "SRC-0009/entity/thread-manager", "rel": "owned_by", "card": "1:1"},
+          {"to": "SRC-0009/entity/codex-thread", "rel": "maps", "card": "1:N"}
+        ],
+        "enumerations": null,
+        "data_flows": [
+          {"source": "Op", "transform": "send_op(thread_id, op): get_thread + ops_log push (если включён тестовый режим) + thread.submit(op)", "sink": "целевой CodexThread"},
+          {"source": "environment_manager.current + skills_watcher + plugins_manager", "transform": "spawn_thread_with_source: register_config → Codex::spawn → finalize_thread_spawn", "sink": "вставка в threads map + notify thread_created"}
+        ],
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0009/entity/new-thread",
+      "src": "SRC-0009",
+      "composition": "entity",
+      "terms": {
+        "object": "NewThread — результат создания Codex thread: thread_id + Arc<CodexThread> + первое событие SessionConfigured",
+        "attributes": [
+          "thread_id: ThreadId",
+          "thread: Arc<CodexThread>",
+          "session_configured: SessionConfiguredEvent"
+        ],
+        "relationships": [
+          {"to": "SRC-0009/entity/thread-manager", "rel": "returned_by", "card": "N:1"},
+          {"to": "SRC-0009/entity/codex-thread", "rel": "wraps", "card": "1:1"}
+        ],
+        "enumerations": null,
+        "data_flows": null,
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0009/entity/fork-snapshot",
+      "src": "SRC-0009",
+      "composition": "entity",
+      "terms": {
+        "object": "ForkSnapshot — режим снимка истории при форке треда",
+        "attributes": null,
+        "relationships": [
+          {"to": "SRC-0009/entity/thread-manager", "rel": "argument_of_fork_thread", "card": "N:1"}
+        ],
+        "enumerations": {
+          "ForkSnapshot": ["TruncateBeforeNthUserMessage(usize)", "Interrupted"]
+        },
+        "data_flows": [
+          {"source": "usize n", "transform": "From<usize> for ForkSnapshot → TruncateBeforeNthUserMessage(n) (legacy API compatibility)", "sink": "ForkSnapshot"}
+        ],
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0009/entity/thread-shutdown-report",
+      "src": "SRC-0009",
+      "composition": "entity",
+      "terms": {
+        "object": "ThreadShutdownReport — итог bulk shutdown тредов в ThreadManager",
+        "attributes": [
+          "completed: Vec<ThreadId>",
+          "submit_failed: Vec<ThreadId>",
+          "timed_out: Vec<ThreadId>"
+        ],
+        "relationships": [
+          {"to": "SRC-0009/entity/thread-manager", "rel": "returned_by_shutdown_all_threads_bounded", "card": "N:1"}
+        ],
+        "enumerations": {
+          "ShutdownOutcome": ["Complete", "SubmitFailed", "TimedOut"]
+        },
+        "data_flows": [
+          {"source": "threads map snapshot", "transform": "для каждого треда: tokio::timeout(timeout, thread.shutdown_and_wait) → ShutdownOutcome → запись в completed/submit_failed/timed_out; completed удаляются из threads map", "sink": "ThreadShutdownReport (отсортированный по ToString)"}
+        ],
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0009/entity/active-turn",
+      "src": "SRC-0009",
+      "composition": "entity",
+      "terms": {
+        "object": "ActiveTurn — активный turn сессии: задачи + shared turn_state с pending input/approvals/elicitations",
+        "attributes": [
+          "tasks: IndexMap<sub_id, TaskHandle> (первый task = активный turn_id; kind: Regular/Review/Compact)",
+          "turn_state: Arc<Mutex<TurnState>> — содержит pending_input, pending_approval, pending_request_permissions, pending_user_input, pending_dynamic_tool, pending_elicitation, granted_permissions, mailbox_delivery_phase"
+        ],
+        "relationships": [
+          {"to": "SRC-0009/entity/session", "rel": "held_by_mutex_option", "card": "0..1:1"}
+        ],
+        "enumerations": {
+          "TaskKind": ["Regular", "Review", "Compact"],
+          "NonSteerableTurnKind": ["Review", "Compact"],
+          "MailboxDeliveryPhase": ["CurrentTurn", "NextTurn"]
+        },
+        "data_flows": null,
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0009/entity/submission-loop",
+      "src": "SRC-0009",
+      "composition": "entity",
+      "terms": {
+        "object": "submission_loop — фоновой цикл в Codex::spawn_internal, читает rx_sub и диспатчит каждый Op в соответствующий handler. Выходит только по Op::Shutdown либо при закрытии канала",
+        "attributes": [
+          "sess: Arc<Session>",
+          "config: Arc<Config>",
+          "rx_sub: Receiver<Submission>"
+        ],
+        "relationships": [
+          {"to": "SRC-0009/entity/codex", "rel": "driven_by_tx_sub_of", "card": "1:1"},
+          {"to": "SRC-0009/entity/session", "rel": "mutates", "card": "1:1"}
+        ],
+        "enumerations": {
+          "Op (dispatched kinds)": [
+            "Interrupt",
+            "CleanBackgroundTerminals",
+            "RealtimeConversationStart",
+            "RealtimeConversationAudio",
+            "RealtimeConversationText",
+            "RealtimeConversationClose",
+            "RealtimeConversationListVoices",
+            "OverrideTurnContext",
+            "UserInput",
+            "UserTurn",
+            "InterAgentCommunication",
+            "ExecApproval",
+            "PatchApproval",
+            "UserInputAnswer",
+            "RequestPermissionsResponse",
+            "DynamicToolResponse",
+            "AddToHistory",
+            "GetHistoryEntryRequest",
+            "ListMcpTools",
+            "RefreshMcpServers",
+            "ReloadUserConfig",
+            "ListSkills",
+            "Undo",
+            "Compact",
+            "DropMemories",
+            "UpdateMemories",
+            "ThreadRollback",
+            "SetThreadName",
+            "SetThreadMemoryMode",
+            "RunUserShellCommand",
+            "ResolveElicitation",
+            "Shutdown",
+            "Review"
+          ]
+        },
+        "data_flows": [
+          {"source": "Submission sub = rx_sub.recv()", "transform": "submission_dispatch_span(sub) + парентинг из sub.trace (W3cTraceContext) если задан; match sub.op.clone() → handlers::<op>(...); unknown ops игнорируются (enum non_exhaustive)", "sink": "Session mutated + Event emitted"},
+          {"source": "Op::Shutdown", "transform": "handlers::shutdown → abort_all_tasks(Interrupted) + conversation.shutdown + unified_exec_manager.terminate_all + guardian_review_session.shutdown + count turn_count + rollout.shutdown + emit ShutdownComplete", "sink": "submission_loop exits; final draining guardian state"}
+        ],
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0009/entity/run-turn",
+      "src": "SRC-0009",
+      "composition": "entity",
+      "terms": {
+        "object": "run_turn — цикл одного turn агента: для каждого sampling request модель отвечает либо function calls либо assistant message; функция-вызовы исполняются и отправляются назад модели, пока turn не завершится",
+        "attributes": [
+          "sess: Arc<Session>",
+          "turn_context: Arc<TurnContext>",
+          "input: Vec<UserInput>",
+          "prewarmed_client_session: Option<ModelClientSession>",
+          "cancellation_token: CancellationToken",
+          "turn_diff_tracker: Arc<Mutex<TurnDiffTracker>> — накапливает diff за весь task (у пользователя = 1 turn)",
+          "auto_compact_limit: i64 = model_info.auto_compact_token_limit().unwrap_or(i64::MAX)"
+        ],
+        "relationships": [
+          {"to": "SRC-0009/entity/turn-context", "rel": "consumes", "card": "1:1"},
+          {"to": "SRC-0009/entity/session", "rel": "drives", "card": "N:1"},
+          {"to": "SRC-0009/entity/sampling-request-result", "rel": "produces_per_iteration", "card": "1:N"}
+        ],
+        "enumerations": {
+          "CompactionPhase": ["PreTurn", "MidTurn"],
+          "CompactionReason": ["ContextLimit", "ModelDownshift"],
+          "InitialContextInjection": ["DoNotInject", "BeforeLastUserMessage"]
+        },
+        "data_flows": [
+          {"source": "input: Vec<UserInput>", "transform": "run_pre_sampling_compact (maybe_run_previous_model_inline_compact + auto_compact если total_usage_tokens >= auto_compact_limit) → record_context_updates → plugins_manager.plugins_for_config → mcp_connection_manager.list_all_tools (если apps_enabled или plugin mention) → connectors/skills/plugins mention collection → run_user_prompt_submit_hooks → record_user_prompt_and_emit_turn_item → skill_items + plugin_items в history", "sink": "prepared sampling loop"},
+          {"source": "sampling_request_input", "transform": "loop: get_pending_input (+ mailbox drain) → inspect_pending_input → blocked vs accepted → clone_history.for_prompt → run_sampling_request → SamplingRequestResult", "sink": "needs_follow_up decides whether to continue"},
+          {"source": "total_usage_tokens >= auto_compact_limit && needs_follow_up", "transform": "run_auto_compact(ContextLimit, MidTurn) + client_session.reset_websocket_session + continue", "sink": "compacted history"},
+          {"source": "!needs_follow_up", "transform": "запускает Stop/AfterAgent hooks, может прервать с abort_message; build_hook_prompt_message добавляет continuation fragments как новый user turn; если stop_outcome.should_stop → break", "sink": "last_agent_message"}
+        ],
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0009/entity/sampling-request-result",
+      "src": "SRC-0009",
+      "composition": "entity",
+      "terms": {
+        "object": "SamplingRequestResult — результат одного sampling-вызова модели в run_turn",
+        "attributes": [
+          "needs_follow_up: bool — модель запросила дальнейший цикл (tool_call) либо есть pending input",
+          "last_agent_message: Option<String>"
+        ],
+        "relationships": [
+          {"to": "SRC-0009/entity/run-turn", "rel": "produced_in_loop_by", "card": "N:1"}
+        ],
+        "enumerations": null,
+        "data_flows": null,
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0009/entity/steer-input-error",
+      "src": "SRC-0009",
+      "composition": "entity",
+      "terms": {
+        "object": "SteerInputError — ошибка steer_input (пуш input в активный turn)",
+        "attributes": [
+          "variants carry data: NoActiveTurn(Vec<UserInput>) сохраняет items для последующего spawn regular task; ExpectedTurnMismatch{expected, actual}; ActiveTurnNotSteerable{turn_kind: NonSteerableTurnKind}; EmptyInput"
+        ],
+        "relationships": [
+          {"to": "SRC-0009/entity/session", "rel": "returned_by_steer_input", "card": "N:1"}
+        ],
+        "enumerations": {
+          "SteerInputError": ["NoActiveTurn(Vec<UserInput>)", "ExpectedTurnMismatch { expected, actual }", "ActiveTurnNotSteerable { turn_kind: NonSteerableTurnKind }", "EmptyInput"],
+          "CodexErrorInfo (mapped)": ["BadRequest", "ActiveTurnNotSteerable { turn_kind }"]
+        },
+        "data_flows": [
+          {"source": "SteerInputError", "transform": "to_error_event() → ErrorEvent{message, codex_error_info}; message задаётся текстом: 'no active turn to steer', 'expected active turn id `X` but found `Y`', 'cannot steer a review|compact turn', 'input must not be empty'", "sink": "EventMsg::Error"}
+        ],
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0009/entity/previous-turn-settings",
+      "src": "SRC-0009",
+      "composition": "entity",
+      "terms": {
+        "object": "PreviousTurnSettings — заметки о предыдущем real user turn, нужны для построения state-change diff и полного переинжекта контекста (смена модели, переход realtime_active с true на false)",
+        "attributes": [
+          "model: String",
+          "realtime_active: Option<bool>"
+        ],
+        "relationships": [
+          {"to": "SRC-0009/entity/session", "rel": "stored_in_state", "card": "1:1"},
+          {"to": "SRC-0009/entity/run-turn", "rel": "updated_by_regular_user_turn_only", "card": "N:1"}
+        ],
+        "enumerations": null,
+        "data_flows": [
+          {"source": "PreviousTurnSettings", "transform": "maybe_run_previous_model_inline_compact: если previous.model != current.model && previous.context_window > current.context_window && total_usage_tokens > new_auto_compact_limit → run_auto_compact(ModelDownshift, PreTurn) на previous_model_turn_context", "sink": "compacted history перед sampling"}
+        ],
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0009/entity/agent-identity-manager",
+      "src": "SRC-0009",
+      "composition": "entity",
+      "terms": {
+        "object": "AgentIdentityManager — регистрирует и кеширует криптографическую agent identity (ed25519 ключ + agent_runtime_id) в ChatGPT-backend, чтобы Codex мог аутентифицироваться как агент от имени пользователя",
+        "attributes": [
+          "auth_manager: Arc<AuthManager>",
+          "chatgpt_base_url: String — из config.chatgpt_base_url",
+          "feature_enabled: bool — config.features.enabled(Feature::UseAgentIdentity)",
+          "abom: AgentBillOfMaterials — build_abom(session_source)",
+          "ensure_lock: Arc<Mutex<()>> — сериализует ensure_registered_identity"
+        ],
+        "relationships": [
+          {"to": "SRC-0009/entity/session", "rel": "used_via_services", "card": "1:1"},
+          {"to": "SRC-0009/entity/stored-agent-identity", "rel": "produces_and_caches", "card": "1:1"},
+          {"to": "SRC-0009/entity/agent-bill-of-materials", "rel": "embeds", "card": "1:1"},
+          {"to": "SRC-0009/entity/agent-identity-binding", "rel": "uses", "card": "1:N"}
+        ],
+        "enumerations": null,
+        "data_flows": [
+          {"source": "config.chatgpt_base_url + auth.is_chatgpt_auth + AgentIdentityBinding::from_auth(auth, forced_chatgpt_workspace_id)", "transform": "ensure_registered_identity: если !feature_enabled → None; если нет auth или binding не ChatGPT → None; под ensure_lock: load_stored_identity (валидирует workspace_id, matches_binding, validate_key_material; при провале — auth.remove_agent_identity) → если нет валидной — register_agent_identity", "sink": "Option<StoredAgentIdentity>"},
+          {"source": "POST {chatgpt_base_url}/v1/agent/register с X-OpenAI-Authorization = human_biscuit и body {abom, agent_public_key, capabilities=[]}", "transform": "mint_human_biscuit (GET /authenticate_app_v2 с bearer_auth(access_token) + X-Request-Id + X-Original-Method + X-Original-Url; ответ берёт header x-openai-authorization) → register_agent_identity; таймауты: AGENT_REGISTRATION_TIMEOUT=15s, AGENT_IDENTITY_BISCUIT_TIMEOUT=15s", "sink": "StoredAgentIdentity → auth.set_agent_identity(to_auth_record)"}
+        ],
+        "config": {
+          "AGENT_REGISTRATION_TIMEOUT": {"value": "15s (Duration::from_secs(15))", "source": "hardcoded const", "default": "15s"},
+          "AGENT_IDENTITY_BISCUIT_TIMEOUT": {"value": "15s (Duration::from_secs(15))", "source": "hardcoded const", "default": "15s"},
+          "chatgpt_base_url": {"value": "runtime-defined", "source": "config.chatgpt_base_url", "default": "нет значения по умолчанию в данном файле"},
+          "Feature::UseAgentIdentity": {"value": "boolean flag", "source": "config.features", "default": "управляется feature flags"}
+        }
+      }
+    },
+    {
+      "id": "SRC-0009/entity/stored-agent-identity",
+      "src": "SRC-0009",
+      "composition": "entity",
+      "terms": {
+        "object": "StoredAgentIdentity — сохранённая идентичность агента (ключи + runtime id), сериализуется/десериализуется для кеша в auth storage",
+        "attributes": [
+          "binding_id: String — формата \"chatgpt-account-{account_id}\"",
+          "chatgpt_account_id: String",
+          "chatgpt_user_id: Option<String>",
+          "agent_runtime_id: String — выдаётся сервером при регистрации",
+          "private_key_pkcs8_base64: String — ed25519 private key в PKCS#8, base64-STANDARD",
+          "public_key_ssh: String — \"ssh-ed25519 {base64}\"",
+          "registered_at: String — Utc::now() RFC3339 с SecondsFormat::Secs",
+          "abom: AgentBillOfMaterials"
+        ],
+        "relationships": [
+          {"to": "SRC-0009/entity/agent-identity-manager", "rel": "produced_and_validated_by", "card": "N:1"},
+          {"to": "SRC-0009/entity/agent-identity-binding", "rel": "matched_against", "card": "1:N"}
+        ],
+        "enumerations": null,
+        "data_flows": [
+          {"source": "AgentIdentityAuthRecord (stored) + binding + abom", "transform": "from_auth_record: проверяет workspace_id == binding.chatgpt_account_id (иначе bail); signing_key_from_private_key_pkcs8_base64; public_key_ssh = encode_ssh_ed25519_public_key(verifying_key)", "sink": "StoredAgentIdentity"},
+          {"source": "StoredAgentIdentity", "transform": "to_auth_record: собирает AgentIdentityAuthRecord{workspace_id, chatgpt_user_id, agent_runtime_id, agent_private_key, registered_at}", "sink": "persisted в auth"},
+          {"source": "self", "transform": "validate_key_material: sign_key.verifying_key() → encode_ssh_ed25519_public_key → равенство с self.public_key_ssh (иначе ошибка 'stored public key does not match the private key')", "sink": "Result<()>"}
+        ],
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0009/entity/agent-bill-of-materials",
+      "src": "SRC-0009",
+      "composition": "entity",
+      "terms": {
+        "object": "AgentBillOfMaterials — ABOM: метаданные агента, отправляемые серверу при регистрации и кешируемые в StoredAgentIdentity",
+        "attributes": [
+          "agent_version: String — env!(\"CARGO_PKG_VERSION\")",
+          "agent_harness_id: String — \"codex-app\" для SessionSource::VSCode; иначе \"codex-cli\" для Cli/Exec/Mcp/Custom/SubAgent/Unknown",
+          "running_location: String — \"{session_source}-{std::env::consts::OS}\""
+        ],
+        "relationships": [
+          {"to": "SRC-0009/entity/agent-identity-manager", "rel": "built_by_build_abom", "card": "1:1"},
+          {"to": "SRC-0009/entity/stored-agent-identity", "rel": "embedded_in", "card": "1:1"}
+        ],
+        "enumerations": {
+          "agent_harness_id": ["codex-app (VSCode)", "codex-cli (Cli/Exec/Mcp/Custom/SubAgent/Unknown)"]
+        },
+        "data_flows": null,
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0009/entity/agent-identity-binding",
+      "src": "SRC-0009",
+      "composition": "entity",
+      "terms": {
+        "object": "AgentIdentityBinding — привязка кеша agent identity к текущему ChatGPT-аккаунту/пользователю/токену (без этого повторное использование ключа запрещено)",
+        "attributes": [
+          "binding_id: String = \"chatgpt-account-{resolved_account_id}\"",
+          "chatgpt_account_id: String — либо forced_chatgpt_workspace_id (из AuthManager) либо token_data.account_id",
+          "chatgpt_user_id: Option<String> — token_data.id_token.chatgpt_user_id (только если непустой)",
+          "access_token: String — token_data.access_token"
+        ],
+        "relationships": [
+          {"to": "SRC-0009/entity/agent-identity-manager", "rel": "derived_in", "card": "N:1"},
+          {"to": "SRC-0009/entity/stored-agent-identity", "rel": "validates", "card": "1:N"}
+        ],
+        "enumerations": null,
+        "data_flows": [
+          {"source": "CodexAuth + forced_workspace_id: Option<String>", "transform": "from_auth: если !auth.is_chatgpt_auth → None; token_data = auth.get_token_data().ok()?; resolved_account_id = forced_workspace_id (если непустой) иначе token_data.account_id (если непустой); иначе None", "sink": "Option<AgentIdentityBinding>"}
+        ],
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0009/entity/generated-agent-key-material",
+      "src": "SRC-0009",
+      "composition": "entity",
+      "terms": {
+        "object": "GeneratedAgentKeyMaterial — свежая пара ключей agent identity, генерируемая локально при регистрации",
+        "attributes": [
+          "private_key_pkcs8_base64: String — PKCS#8 DER, base64-STANDARD",
+          "public_key_ssh: String — \"ssh-ed25519 {base64}\""
+        ],
+        "relationships": [
+          {"to": "SRC-0009/entity/stored-agent-identity", "rel": "source_of_keys", "card": "1:1"}
+        ],
+        "enumerations": null,
+        "data_flows": [
+          {"source": "OsRng.try_fill_bytes(&mut [0u8;32])", "transform": "SigningKey::from_bytes → to_pkcs8_der → BASE64_STANDARD.encode; encode_ssh_ed25519_public_key: SSH wire format \"ssh-ed25519\" (11 bytes) + 32-byte key, обёрнутый в 4-byte big-endian длины, всё base64", "sink": "GeneratedAgentKeyMaterial"}
+        ],
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0009/entity/register-agent-messages",
+      "src": "SRC-0009",
+      "composition": "entity",
+      "terms": {
+        "object": "RegisterAgentRequest / RegisterAgentResponse — контракт HTTP взаимодействия агента с ChatGPT backend при регистрации",
+        "attributes": [
+          "RegisterAgentRequest.abom: AgentBillOfMaterials",
+          "RegisterAgentRequest.agent_public_key: String",
+          "RegisterAgentRequest.capabilities: Vec<String> (на момент регистрации — пустой)",
+          "RegisterAgentResponse.agent_runtime_id: String"
+        ],
+        "relationships": [
+          {"to": "SRC-0009/entity/agent-identity-manager", "rel": "produced_consumed_by", "card": "1:1"}
+        ],
+        "enumerations": null,
+        "data_flows": [
+          {"source": "RegisterAgentRequest", "transform": "POST {chatgpt_base_url}/v1/agent/register (trim trailing '/') с header X-OpenAI-Authorization = human-biscuit; AGENT_REGISTRATION_TIMEOUT=15s", "sink": "RegisterAgentResponse.agent_runtime_id"},
+          {"source": "request_id_bytes: [u8;16] ← OsRng.try_fill_bytes", "transform": "agent_identity_request_id: \"codex-agent-identity-{URL_SAFE_NO_PAD.encode(bytes)}\"", "sink": "X-Request-Id header для biscuit"}
+        ],
+        "config": {
+          "agent_registration_url": {"value": "{trimmed_chatgpt_base_url}/v1/agent/register", "source": "hardcoded path in agent_registration_url()", "default": "/v1/agent/register"},
+          "agent_identity_biscuit_url": {"value": "{trimmed_chatgpt_base_url}/authenticate_app_v2", "source": "hardcoded path in agent_identity_biscuit_url()", "default": "/authenticate_app_v2"}
+        }
+      }
+    },
+    {
+      "id": "SRC-0009/entity/codex-delegate-channels",
+      "src": "SRC-0009",
+      "composition": "entity",
+      "terms": {
+        "object": "Codex delegate (run_codex_thread_interactive / run_codex_thread_one_shot) — запуск саб-Codex треда и мост между ним и parent session: форвардит события, ловит approval-запросы и отвечает от имени parent session",
+        "attributes": [
+          "возвращает Codex с tx_sub=tx_ops и rx_event=rx_sub для консюмера",
+          "pending_mcp_invocations: Arc<Mutex<HashMap<String, McpInvocation>>> — кеш McpToolCallBegin для восстановления контекста при delegated approval-elicitation",
+          "cancel_token_events / cancel_token_ops — дочерние токены parent cancel_token"
+        ],
+        "relationships": [
+          {"to": "SRC-0009/entity/codex", "rel": "spawns_child", "card": "1:1"},
+          {"to": "SRC-0009/entity/session", "rel": "forwards_approvals_to_parent", "card": "1:1"},
+          {"to": "SRC-0009/entity/turn-context", "rel": "uses_parent_ctx_for_approvals", "card": "1:1"}
+        ],
+        "enumerations": {
+          "filtered_out_events_to_consumer": ["AgentMessageDelta", "AgentReasoningDelta", "TokenCount", "SessionConfigured", "ThreadNameUpdated"],
+          "approval_events_routed_to_parent": ["ExecApprovalRequest", "ApplyPatchApprovalRequest", "RequestPermissions", "RequestUserInput"],
+          "mcp_tracking_events": ["McpToolCallBegin (caches invocation)", "McpToolCallEnd (removes invocation)"]
+        },
+        "data_flows": [
+          {"source": "Codex::spawn с CodexSpawnArgs{session_source = SessionSource::SubAgent(subagent_source), skills/plugins/mcp/skills_watcher и agent_control наследуются от parent_session.services; persist_extended_history=false; dynamic_tools=empty; analytics_events_client=parent}", "transform": "spawn + если Feature::GeneralAnalytics включён — emit_subagent_session_started(thread_id, parent_thread_id, thread_config, subagent_source)", "sink": "child Codex"},
+          {"source": "child codex.next_event()", "transform": "forward_events: filter delta/token/session-level + ExecApprovalRequest/ApplyPatchApprovalRequest/RequestUserInput/RequestPermissions — обрабатываются handle_*_approval (routes через guardian если routes_approval_to_guardian(parent_ctx) иначе через parent_session.request_*), результат отправляется child через Op::ExecApproval/PatchApproval/UserInputAnswer/RequestPermissionsResponse", "sink": "tx_sub → consumer"},
+          {"source": "one-shot variant: input: Vec<UserInput>", "transform": "run_codex_thread_one_shot: child_cancel=parent.child_token; interactive + submit Op::UserInput{items, final_output_json_schema, responsesapi_client_metadata=None}; bridge task наблюдает TurnComplete/TurnAborted → Op::Shutdown + child_cancel.cancel; возвращает Codex с закрытым tx_sub (drop rx_closed)", "sink": "одноразовый Codex, автозавершается после turn"}
+        ],
+        "config": {
+          "shutdown_delegate_drain_timeout": {"value": "500ms (Duration::from_millis(500))", "source": "hardcoded in shutdown_delegate", "default": "500ms"}
+        }
+      }
+    },
+    {
+      "id": "SRC-0009/entity/rollout-truncation",
+      "src": "SRC-0009",
+      "composition": "entity",
+      "terms": {
+        "object": "thread_rollout_truncation — хелперы вычисления границ user turn в rollout и обрезки истории при fork/rollback",
+        "attributes": [
+          "user_message_positions_in_rollout: применяет ThreadRolledBack маркеры (truncate на saturating_sub(num_turns))",
+          "fork_turn_positions_in_rollout: отдельно ведёт rollback_turn_positions (для отката) и fork_turn_positions (user message либо assistant trigger_turn envelope); ThreadRolledBack num_turns=0 игнорируется; при num_turns>0 удаляется rollback-префикс и все fork_positions >= rollback_start_idx"
+        ],
+        "relationships": [
+          {"to": "SRC-0009/entity/fork-snapshot", "rel": "supports", "card": "N:1"},
+          {"to": "SRC-0009/entity/thread-manager", "rel": "used_by_fork_thread", "card": "N:1"}
+        ],
+        "enumerations": {
+          "trigger_turn_boundary": "assistant role + InterAgentCommunication::from_message_content(content).trigger_turn == true"
+        },
+        "data_flows": [
+          {"source": "items: &[RolloutItem], n: usize", "transform": "truncate_rollout_before_nth_user_message_from_start: если n == usize::MAX → вернуть все items; user_positions = user_message_positions_in_rollout(items); если user_positions.len() <= n → вернуть все; иначе cut_idx = user_positions[n] и items[..cut_idx]", "sink": "Vec<RolloutItem> префикс перед n-ым user message"},
+          {"source": "items: &[RolloutItem], n_from_end: usize", "transform": "truncate_rollout_to_last_n_fork_turns: n_from_end == 0 → пустой вектор; fork_turn_positions; если len <= n_from_end → все items; иначе keep_idx = fork_turn_positions[len - n_from_end]; items[keep_idx..]", "sink": "Vec<RolloutItem> суффикс из последних n_from_end fork turns"},
+          {"source": "InitialHistory", "transform": "initial_history_has_prior_user_turns: scan_rollout_items(rollout_item_is_user_turn_boundary) — true если есть ResponseItem с is_user_turn_boundary", "sink": "bool"}
+        ],
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0009/entity/snapshot-turn-state",
+      "src": "SRC-0009",
+      "composition": "entity",
+      "terms": {
+        "object": "SnapshotTurnState — состояние текущего активного turn на границе форка/прерывания, выводится из rollout items через ThreadHistoryBuilder",
+        "attributes": [
+          "ends_mid_turn: bool — источник: builder.has_active_turn() && active_turn_id.is_some() && active_turn_snapshot.status == InProgress; или нет терминатора TurnComplete/TurnAborted после последнего user message",
+          "active_turn_id: Option<String>",
+          "active_turn_start_index: Option<usize>"
+        ],
+        "relationships": [
+          {"to": "SRC-0009/entity/fork-snapshot", "rel": "drives", "card": "1:1"},
+          {"to": "SRC-0009/entity/thread-manager", "rel": "computed_by_fork_thread", "card": "N:1"}
+        ],
+        "enumerations": null,
+        "data_flows": [
+          {"source": "InitialHistory.get_rollout_items()", "transform": "snapshot_turn_state: ThreadHistoryBuilder прокручивает items; если активный turn и status != InProgress → ends_mid_turn=false; иначе ends_mid_turn=true + active_turn_id + active_turn_start_index; если явного turn нет — по последнему user message: ends_mid_turn = !есть TurnComplete|TurnAborted после него", "sink": "SnapshotTurnState"},
+          {"source": "ForkSnapshot::Interrupted + ends_mid_turn + active_turn_id", "transform": "append_interrupted_boundary: добавляет ResponseItem::interrupted_turn_history_marker() + RolloutItem::EventMsg(TurnAborted{turn_id, reason: Interrupted, completed_at: None, duration_ms: None})", "sink": "InitialHistory::Forked с маркером прерывания"}
+        ],
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0009/entity/lib-reexports",
+      "src": "SRC-0009",
+      "composition": "entity",
+      "terms": {
+        "object": "codex-core lib.rs — публичный фасад крейта: модульная иерархия и набор pub use экспортов. deny(clippy::print_stdout, print_stderr): запрещает прямой вывод в stdout/stderr из library кода; весь user-visible output — через TUI или tracing",
+        "attributes": [
+          "модули: agent_identity, apply_patch, apps, arc_monitor, client, client_common, codex, codex_thread, compact_remote, agent, codex_delegate, command_canonicalization, commit_attribution, config, config_loader, connectors, context_manager, contextual_user_message, environment_context, exec, exec_env, exec_policy, external_agent_config, file_watcher, flags, git_info_tests (test only), guardian, hook_runtime, installation_id, instructions, landlock, mcp, mcp_skill_dependencies, mcp_tool_approval_templates, mcp_tool_exposure, network_policy_decision, network_proxy_loader, original_image_detail, mcp_openai_file, mcp_tool_call, memories, mention_syntax, message_history, utils, personality_migration, plugins, prompt_debug, mentions (внутренний реэкспорт), sandbox_tags, sandboxing, session_prefix, session_startup_prewarm, shell_detect, skills, skills_watcher, stream_events_utils, test_support, unified_exec, windows_sandbox, event_mapping, review_format, review_prompts, thread_manager, web_search, windows_sandbox_read_grants, project_doc, rollout, safety, session_rollout_init_error, shell, shell_snapshot, spawn, state_db_bridge, thread_rollout_truncation, tools, turn_diff_tracker, turn_metadata, turn_timing, unavailable_tool, function_tool, state, tasks, user_shell_command, util, compact, memory_trace, otel_init, realtime_context, realtime_conversation, realtime_prompt, realtime_conversation и др.",
+          "deprecated type aliases: ConversationManager=ThreadManager, NewConversation=NewThread, CodexConversation=CodexThread, find_conversation_path_by_id_str (use find_thread_path_by_id_str)"
+        ],
+        "relationships": [
+          {"to": "SRC-0009/entity/codex", "rel": "exposes_SteerInputError", "card": "1:1"},
+          {"to": "SRC-0009/entity/codex-thread", "rel": "exposes_CodexThread_ThreadConfigSnapshot", "card": "1:2"},
+          {"to": "SRC-0009/entity/thread-manager", "rel": "exposes_ThreadManager_NewThread_ForkSnapshot", "card": "1:3"}
+        ],
+        "enumerations": {
+          "публичные reexports (селективный список)": [
+            "codex::SteerInputError",
+            "codex_thread::CodexThread",
+            "codex_thread::ThreadConfigSnapshot",
+            "thread_manager::ThreadManager",
+            "thread_manager::NewThread",
+            "thread_manager::ForkSnapshot",
+            "client::ModelClient",
+            "client::ModelClientSession",
+            "client::X_CODEX_INSTALLATION_ID_HEADER",
+            "client::X_CODEX_TURN_METADATA_HEADER",
+            "client::X_RESPONSESAPI_INCLUDE_TIMING_METRICS_HEADER",
+            "rollout::* (RolloutRecorder/ThreadsPage/Cursor/ThreadItem/SESSIONS_SUBDIR/ARCHIVED_SESSIONS_SUBDIR/INTERACTIVE_SESSION_SOURCES/EventPersistenceMode/SessionMeta/ThreadSortKey/append_thread_name/find_thread_path_by_id_str/find_archived_thread_path_by_id_str/find_thread_name_by_id/find_thread_meta_by_name_str/find_thread_names_by_ids/parse_cursor/read_head_for_summary/read_session_meta_line/rollout_date_parts)",
+            "exec_policy::(ExecPolicyError/check_execpolicy_for_warnings/format_exec_policy_error_with_source/load_exec_policy)",
+            "compact::content_items_to_text",
+            "event_mapping::parse_turn_item",
+            "turn_metadata::build_turn_metadata_header",
+            "memory_trace::(BuiltMemory/build_memories_from_trace_files)",
+            "memories::clear_memory_roots_contents",
+            "project_doc::(DEFAULT_PROJECT_DOC_FILENAME/LOCAL_PROJECT_DOC_FILENAME/discover_project_doc_paths/read_project_docs)",
+            "file_watcher::FileWatcherEvent",
+            "mcp::McpManager",
+            "network_proxy_loader::(MtimeConfigReloader/build_network_proxy_state/build_network_proxy_state_and_reloader)",
+            "codex_mcp::SandboxState",
+            "mention_syntax::(PLUGIN_TEXT_MENTION_SIGIL/TOOL_MENTION_SIGIL)",
+            "message_history::(HistoryEntry/append_entry/history_metadata/lookup)",
+            "utils::path_utils",
+            "prompt_debug::build_prompt_input",
+            "state_db_bridge::(StateDbHandle/get_state_db)",
+            "web_search::(web_search_action_detail/web_search_detail)",
+            "windows_sandbox_read_grants::grant_read_root_non_elevated",
+            "landlock::spawn_command_under_linux_sandbox",
+            "codex_protocol::config_types::ModelProviderAuthInfo"
+          ]
+        },
+        "data_flows": null,
+        "config": null
+      }
+    }
+  ]
+}

@@ -1,0 +1,1128 @@
+{
+  "src": "SRC-0001",
+  "schema_version": "2.0",
+  "lens": "rule",
+  "compositions": [
+    {
+      "id": "SRC-0001/rule/context-window-baseline-tokens",
+      "src": "SRC-0001",
+      "composition": "rule",
+      "terms": {
+        "condition": "Оценка оставшегося user-controllable окна вычитает baseline (постоянный системный prompt + tools). При context_window ≤ BASELINE_TOKENS возвращается 0 — модель не имеет user space",
+        "numbers": [
+          {"value": 12000, "kind": "threshold", "name": "BASELINE_TOKENS"}
+        ],
+        "formula": "effective_window = context_window - BASELINE_TOKENS; used = max(tokens_in_context_window - BASELINE_TOKENS, 0); remaining = max(effective_window - used, 0); percent = round((remaining / effective_window) * 100) clamp 0..100",
+        "gwt": {
+          "given": "context_window = 12000, total_tokens = 12000 (BASELINE_TOKENS == context_window)",
+          "when": "percent_of_context_window_remaining(12000) вызывается",
+          "then": "возврат 0 (ранний exit — нет effective space)"
+        }
+      }
+    },
+    {
+      "id": "SRC-0001/rule/context-window-remaining-full",
+      "src": "SRC-0001",
+      "composition": "rule",
+      "terms": {
+        "condition": "После первого prompt при total_tokens ≈ BASELINE_TOKENS UI показывает ~100% remaining",
+        "numbers": [
+          {"value": 12000, "kind": "threshold", "name": "BASELINE_TOKENS"}
+        ],
+        "formula": "percent = round((effective_window - 0) / effective_window * 100) = 100 clamp 0..100",
+        "gwt": {
+          "given": "context_window = 200000, total_tokens = 12000 (только baseline)",
+          "when": "percent_of_context_window_remaining(200000)",
+          "then": "effective=188000, used=0, remaining=188000 → percent=100"
+        }
+      }
+    },
+    {
+      "id": "SRC-0001/rule/readonly-policy-default",
+      "src": "SRC-0001",
+      "composition": "rule",
+      "terms": {
+        "condition": "new_read_only_policy: ReadOnly с FullAccess чтения и без network",
+        "numbers": null,
+        "formula": "SandboxPolicy::ReadOnly { access: ReadOnlyAccess::FullAccess, network_access: false }",
+        "gwt": {
+          "given": "SandboxPolicy::new_read_only_policy()",
+          "when": "проверяется has_full_disk_read_access() и has_full_network_access()",
+          "then": "has_full_disk_read_access = true (FullAccess), has_full_network_access = false"
+        }
+      }
+    },
+    {
+      "id": "SRC-0001/rule/workspace-write-policy-default",
+      "src": "SRC-0001",
+      "composition": "rule",
+      "terms": {
+        "condition": "new_workspace_write_policy: WorkspaceWrite без explicit writable_roots, с FullAccess read, без network, с включёнными /tmp и TMPDIR (exclude_* = false)",
+        "numbers": null,
+        "formula": "SandboxPolicy::WorkspaceWrite { writable_roots: [], read_only_access: FullAccess, network_access: false, exclude_tmpdir_env_var: false, exclude_slash_tmp: false }",
+        "gwt": {
+          "given": "SandboxPolicy::new_workspace_write_policy() на Unix с существующим /tmp и установленным TMPDIR",
+          "when": "get_writable_roots_with_cwd(cwd) вызывается",
+          "then": "roots включают cwd + /tmp + $TMPDIR; has_full_disk_write_access = false (ограничено WorkspaceWrite)"
+        }
+      }
+    },
+    {
+      "id": "SRC-0001/rule/workspace-write-readable-includes-writable",
+      "src": "SRC-0001",
+      "composition": "rule",
+      "terms": {
+        "condition": "В WorkspaceWrite каждый writable root обязательно также входит в readable roots — писать можно только туда, куда можно читать",
+        "numbers": null,
+        "formula": "readable_roots ⊇ writable_roots (root-пути, после dedup)",
+        "gwt": {
+          "given": "SandboxPolicy::WorkspaceWrite { writable_roots: [], read_only_access: Restricted { include_platform_defaults: false, readable_roots: [] }, network_access: false, exclude_tmpdir_env_var: true, exclude_slash_tmp: false }, cwd=/tmp/workspace",
+          "when": "policy.get_readable_roots_with_cwd(cwd) и policy.get_writable_roots_with_cwd(cwd) сравниваются",
+          "then": "каждый writable_root.root присутствует в readable_roots (protocol.rs test workspace_write_restricted_read_access_includes_effective_writable_roots)"
+        }
+      }
+    },
+    {
+      "id": "SRC-0001/rule/writable-root-path-check",
+      "src": "SRC-0001",
+      "composition": "rule",
+      "terms": {
+        "condition": "WritableRoot.is_path_writable разрешает запись если path под root И не под любым read_only_subpath",
+        "numbers": null,
+        "formula": "is_path_writable(path) = path.starts_with(root) && !any(path.starts_with(subpath) for subpath in read_only_subpaths)",
+        "gwt": {
+          "given": "WritableRoot{root: /workspace, read_only_subpaths: [/workspace/.git, /workspace/.codex]}",
+          "when": "is_path_writable(/workspace/src/main.rs) vs is_path_writable(/workspace/.git/HEAD)",
+          "then": "/workspace/src/main.rs → true; /workspace/.git/HEAD → false (под read_only subpath)"
+        }
+      }
+    },
+    {
+      "id": "SRC-0001/rule/read-only-subpaths-protect-infra",
+      "src": "SRC-0001",
+      "composition": "rule",
+      "terms": {
+        "condition": "Под каждым writable root защищаются: .git (+ resolved gitdir при worktree/pointer), .agents (если is_dir), .codex (если is_dir или writable_root == cwd)",
+        "numbers": null,
+        "formula": "subpaths = [.git? +gitdir?] ∪ [.agents if dir] ∪ [.codex if dir or (writable_root == cwd and protect_missing_dot_codex)]; dedup",
+        "gwt": {
+          "given": "writable_root = cwd, cwd не содержит .codex, .agents отсутствует, .git — обычная директория",
+          "when": "default_read_only_subpaths_for_writable_root(writable_root, protect_missing_dot_codex=true)",
+          "then": "subpaths = [.git, .codex] (.codex включён несмотря на отсутствие — protect_missing; .agents пропущен — не dir)"
+        }
+      }
+    },
+    {
+      "id": "SRC-0001/rule/gitdir-pointer-resolution",
+      "src": "SRC-0001",
+      "composition": "rule",
+      "terms": {
+        "condition": "Если .git — файл (worktree/submodule), он читается как pointer формата 'gitdir: <path>'. Resolved path обязан существовать, иначе pointer игнорируется",
+        "numbers": null,
+        "formula": "resolve_gitdir(.git_file) = read → trim → split_once(':') → trim gitdir → AbsolutePathBuf::resolve_path_against_base(raw, parent(.git)); None если !exists или раз парсинга",
+        "gwt": {
+          "given": ".git — файл с содержимым 'gitdir: ../.git/worktrees/foo', cwd parent существует, resolved path ../.git/worktrees/foo существует",
+          "when": "resolve_gitdir_from_file(.git)",
+          "then": "Some(AbsolutePathBuf резолвированный относительно parent(.git))"
+        }
+      }
+    },
+    {
+      "id": "SRC-0001/rule/slash-tmp-only-on-unix",
+      "src": "SRC-0001",
+      "composition": "rule",
+      "terms": {
+        "condition": "/tmp добавляется в writable roots только на Unix и при exclude_slash_tmp=false и если /tmp является директорией",
+        "numbers": null,
+        "formula": "include_slash_tmp = cfg!(unix) && !exclude_slash_tmp && /tmp.is_dir()",
+        "gwt": {
+          "given": "WorkspaceWrite с exclude_slash_tmp=false на Unix; /tmp существует как dir",
+          "when": "get_writable_roots_with_cwd(cwd)",
+          "then": "/tmp присутствует в результирующем Vec<WritableRoot>"
+        }
+      }
+    },
+    {
+      "id": "SRC-0001/rule/tmpdir-env-inclusion",
+      "src": "SRC-0001",
+      "composition": "rule",
+      "terms": {
+        "condition": "$TMPDIR включается в writable roots только при exclude_tmpdir_env_var=false, если переменная задана и не пуста",
+        "numbers": null,
+        "formula": "include_tmpdir = !exclude_tmpdir_env_var && std::env::var_os(TMPDIR).is_some() && !tmpdir.is_empty()",
+        "gwt": {
+          "given": "WorkspaceWrite с exclude_tmpdir_env_var=false; TMPDIR=/var/folders/xyz (macOS per-user tmp)",
+          "when": "get_writable_roots_with_cwd(cwd)",
+          "then": "/var/folders/xyz присутствует как writable root"
+        }
+      }
+    },
+    {
+      "id": "SRC-0001/rule/danger-full-access-flags",
+      "src": "SRC-0001",
+      "composition": "rule",
+      "terms": {
+        "condition": "DangerFullAccess и ExternalSandbox считаются имеющими full disk read и write доступ",
+        "numbers": null,
+        "formula": "has_full_disk_read_access() = DangerFullAccess OR ExternalSandbox OR delegate; has_full_disk_write_access() = DangerFullAccess OR ExternalSandbox",
+        "gwt": {
+          "given": "SandboxPolicy::ExternalSandbox{network_access: Restricted}",
+          "when": "has_full_disk_write_access() и has_full_network_access() проверяются",
+          "then": "has_full_disk_write_access = true, has_full_network_access = false (protocol.rs test external_sandbox_reports_full_access_flags)"
+        }
+      }
+    },
+    {
+      "id": "SRC-0001/rule/readonly-network-access-flag",
+      "src": "SRC-0001",
+      "composition": "rule",
+      "terms": {
+        "condition": "В ReadOnly network_access — bool (не NetworkAccess enum), явно контролирует is outbound сеть разрешена",
+        "numbers": null,
+        "formula": "has_full_network_access(ReadOnly{network_access}) = network_access (bool)",
+        "gwt": {
+          "given": "SandboxPolicy::ReadOnly{access: FullAccess, network_access: true}",
+          "when": "has_full_network_access()",
+          "then": "true (protocol.rs test read_only_reports_network_access_flags)"
+        }
+      }
+    },
+    {
+      "id": "SRC-0001/rule/sandbox-permissions-semantics",
+      "src": "SRC-0001",
+      "composition": "rule",
+      "terms": {
+        "condition": "SandboxPermissions имеет три варианта: UseDefault (keep session), RequireEscalated (run outside sandbox), WithAdditionalPermissions (stay in sandbox, widen per-command). Helpers: requires_escalated_permissions (только RequireEscalated), requests_sandbox_override (!UseDefault), uses_additional_permissions (только WithAdditionalPermissions)",
+        "numbers": null,
+        "formula": "requires_escalated = matches RequireEscalated; requests_override = !matches UseDefault; uses_additional = matches WithAdditionalPermissions",
+        "gwt": {
+          "given": "матрица: (UseDefault → 0,0,0), (RequireEscalated → 1,1,0), (WithAdditionalPermissions → 0,1,1) — (escalated, override, additional)",
+          "when": "каждый helper вызывается",
+          "then": "значения соответствуют таблице (models.rs test sandbox_permissions_helpers_match_documented_semantics)"
+        }
+      }
+    },
+    {
+      "id": "SRC-0001/rule/granular-mcp-elicitation-flag",
+      "src": "SRC-0001",
+      "composition": "rule",
+      "terms": {
+        "condition": "GranularApprovalConfig.allows_mcp_elicitations() возвращает значение поля mcp_elicitations",
+        "numbers": null,
+        "formula": "allows_mcp_elicitations = self.mcp_elicitations",
+        "gwt": {
+          "given": "GranularApprovalConfig{sandbox_approval: false, rules: false, skill_approval: false, request_permissions: false, mcp_elicitations: true}",
+          "when": "allows_mcp_elicitations()",
+          "then": "true (protocol.rs test granular_approval_config_mcp_elicitation_flag_is_field_driven)"
+        }
+      }
+    },
+    {
+      "id": "SRC-0001/rule/granular-default-skill-and-request-perms",
+      "src": "SRC-0001",
+      "composition": "rule",
+      "terms": {
+        "condition": "При десериализации GranularApprovalConfig поля skill_approval и request_permissions имеют serde default=false — опущены в JSON означают отключены",
+        "numbers": null,
+        "formula": "skill_approval: bool (serde default=false); request_permissions: bool (serde default=false)",
+        "gwt": {
+          "given": "JSON {sandbox_approval: true, rules: false, mcp_elicitations: true} без skill_approval/request_permissions",
+          "when": "serde_json::from_value::<GranularApprovalConfig>",
+          "then": "decoded.skill_approval = false, decoded.request_permissions = false (protocol.rs test granular_approval_config_defaults_missing_optional_flags_to_false)"
+        }
+      }
+    },
+    {
+      "id": "SRC-0001/rule/granular-sandbox-requires-approval-category",
+      "src": "SRC-0001",
+      "composition": "rule",
+      "terms": {
+        "condition": "В developer instructions для Granular политики command permission instructions (APPROVAL_POLICY_ON_REQUEST_RULE_REQUEST_PERMISSION) включаются только когда exec_permission_approvals_enabled=true И granular_config.allows_sandbox_approval()=true",
+        "numbers": null,
+        "formula": "shell_permission_requests_available = exec_permission_approvals_enabled && granular_config.allows_sandbox_approval()",
+        "gwt": {
+          "given": "Granular {sandbox_approval: true, ...}, exec_permission_approvals_enabled=true, request_permissions_tool_enabled=false",
+          "when": "DeveloperInstructions::from(...) строит текст",
+          "then": "текст включает with_additional_permissions инструкции (models.rs test granular_policy_includes_command_permission_instructions_when_sandbox_approval_can_prompt)"
+        }
+      }
+    },
+    {
+      "id": "SRC-0001/rule/granular-request-permissions-tool-gating",
+      "src": "SRC-0001",
+      "composition": "rule",
+      "terms": {
+        "condition": "Granular секция '# request_permissions Tool' включается только когда request_permissions_tool_enabled=true И granular_config.allows_request_permissions()=true",
+        "numbers": null,
+        "formula": "request_permissions_tool_prompts_allowed = request_permissions_tool_enabled && allows_request_permissions()",
+        "gwt": {
+          "given": "Granular {request_permissions: false, ...} и request_permissions_tool_enabled=true",
+          "when": "DeveloperInstructions::from(...)",
+          "then": "текст НЕ содержит '# request_permissions Tool' (models.rs test granular_policy_includes_request_permissions_tool_only_when_that_prompt_can_still_fire)"
+        }
+      }
+    },
+    {
+      "id": "SRC-0001/rule/guardian-subagent-suffix-applicability",
+      "src": "SRC-0001",
+      "composition": "rule",
+      "terms": {
+        "condition": "GUARDIAN_SUBAGENT_APPROVAL_SUFFIX присоединяется к developer instructions только когда approvals_reviewer=GuardianSubagent И approval_policy != Never",
+        "numbers": null,
+        "formula": "append_guardian_suffix = approvals_reviewer == GuardianSubagent && approval_policy != Never",
+        "gwt": {
+          "given": "DeveloperInstructions::from(OnRequest, GuardianSubagent, Policy::empty(), false, false)",
+          "when": "текст анализируется",
+          "then": "содержит 'approvals_reviewer is guardian_subagent' и 'materially safer alternative' (models.rs test guardian_subagent_approvals_append_guardian_specific_guidance); для Never тот же вызов НЕ содержит guardian guidance"
+        }
+      }
+    },
+    {
+      "id": "SRC-0001/rule/prefix-list-rendering-limits",
+      "src": "SRC-0001",
+      "composition": "rule",
+      "terms": {
+        "condition": "Approved command prefixes рендерятся не более MAX_RENDERED_PREFIXES (=100) элементов и ограничиваются MAX_ALLOW_PREFIX_TEXT_BYTES (=5000) байт; при превышении хотя бы одного лимита добавляется TRUNCATED_MARKER '...[Some commands were truncated]'",
+        "numbers": [
+          {"value": 100, "kind": "limit", "name": "MAX_RENDERED_PREFIXES"},
+          {"value": 5000, "kind": "limit_bytes", "name": "MAX_ALLOW_PREFIX_TEXT_BYTES"}
+        ],
+        "formula": "truncated = prefixes.len() > 100 OR output.len() > MAX_ALLOW_PREFIX_TEXT_BYTES",
+        "gwt": {
+          "given": "200 prefix rules в Policy",
+          "when": "format_allow_prefixes(policy.get_allowed_prefixes())",
+          "then": "output оканчивается на TRUNCATED_MARKER; lines().count() == 101 (100 prefix lines + TRUNCATED_MARKER line) (models.rs test render_command_prefix_list_limits_output_to_max_prefixes)"
+        }
+      }
+    },
+    {
+      "id": "SRC-0001/rule/prefix-list-sort-order",
+      "src": "SRC-0001",
+      "composition": "rule",
+      "terms": {
+        "condition": "Prefix list сортируется сначала по количеству сегментов (len), затем по суммарной длине строк, затем алфавитно",
+        "numbers": null,
+        "formula": "sort_key(prefix) = (prefix.len(), sum(segment.len() for segment in prefix), prefix)",
+        "gwt": {
+          "given": "prefixes = [[b, zz], [aa], [b], [a, b, c], [a], [b, a]]",
+          "when": "format_allow_prefixes",
+          "then": "результат в порядке: [a], [b], [aa], [b, a], [b, zz], [a, b, c] (models.rs test render_command_prefix_list_sorts_by_len_then_total_len_then_alphabetical)"
+        }
+      }
+    },
+    {
+      "id": "SRC-0001/rule/op-kind-taxonomy",
+      "src": "SRC-0001",
+      "composition": "rule",
+      "terms": {
+        "condition": "Каждый вариант Op отображается в стабильный snake_case kind (&'static str) — inventory всех поддерживаемых операций протокола. Список вариантов ровно 32 (из match в Op::kind)",
+        "numbers": [
+          {"value": 34, "kind": "count", "name": "Op::kind variants (включая UserInput и UserTurn как отдельные)"}
+        ],
+        "formula": "Op::kind() сопоставляет вариант ↔ wire snake_case строка: Interrupt→interrupt, CleanBackgroundTerminals→clean_background_terminals, RealtimeConversationStart/Audio/Text/Close/ListVoices→realtime_conversation_*, UserInput→user_input, UserTurn→user_turn, InterAgentCommunication→inter_agent_communication, OverrideTurnContext→override_turn_context, ExecApproval→exec_approval, PatchApproval→patch_approval, ResolveElicitation→resolve_elicitation, UserInputAnswer→user_input_answer, RequestPermissionsResponse→request_permissions_response, DynamicToolResponse→dynamic_tool_response, AddToHistory→add_to_history, GetHistoryEntryRequest→get_history_entry_request, ListMcpTools→list_mcp_tools, RefreshMcpServers→refresh_mcp_servers, ReloadUserConfig→reload_user_config, ListSkills→list_skills, Compact→compact, DropMemories→drop_memories, UpdateMemories→update_memories, SetThreadName→set_thread_name, SetThreadMemoryMode→set_thread_memory_mode, Undo→undo, ThreadRollback→thread_rollback, Review→review, Shutdown→shutdown, RunUserShellCommand→run_user_shell_command, ListModels→list_models",
+        "gwt": {
+          "given": "Op::Interrupt",
+          "when": "op.kind()",
+          "then": "'interrupt'"
+        }
+      }
+    },
+    {
+      "id": "SRC-0001/rule/user-input-answer-serde-alias",
+      "src": "SRC-0001",
+      "composition": "rule",
+      "terms": {
+        "condition": "Op::UserInputAnswer имеет wire-имя 'user_input_answer' и принимает legacy alias 'request_user_input_response' на десериализации",
+        "numbers": null,
+        "formula": "#[serde(rename = \"user_input_answer\", alias = \"request_user_input_response\")]",
+        "gwt": null
+      }
+    },
+    {
+      "id": "SRC-0001/rule/turn-started-complete-wire-aliases",
+      "src": "SRC-0001",
+      "composition": "rule",
+      "terms": {
+        "condition": "EventMsg::TurnStarted выходит как 'task_started' (v1 wire), принимает 'turn_started' alias на v2; TurnComplete — 'task_complete' выход, alias 'turn_complete'",
+        "numbers": null,
+        "formula": "#[serde(rename = \"task_started\", alias = \"turn_started\")] для TurnStarted; #[serde(rename = \"task_complete\", alias = \"turn_complete\")] для TurnComplete",
+        "gwt": null
+      }
+    },
+    {
+      "id": "SRC-0001/rule/function-call-output-wire-shape",
+      "src": "SRC-0001",
+      "composition": "rule",
+      "terms": {
+        "condition": "FunctionCallOutputPayload.body сериализуется на wire либо как plain JSON string (Text), либо как JSON array (ContentItems). Поле success не попадает в wire — это internal metadata",
+        "numbers": null,
+        "formula": "wire = match body { Text(s) → JSON string; ContentItems(items) → JSON array of {type: input_text|input_image, ...} }",
+        "gwt": {
+          "given": "ResponseInputItem::FunctionCallOutput{call_id: 'call1', output: FunctionCallOutputPayload::from_text('ok')}",
+          "when": "serde_json::to_string → parse как Value",
+          "then": "v.get('output').as_str() == 'ok' (models.rs test serializes_success_as_plain_string)"
+        }
+      }
+    },
+    {
+      "id": "SRC-0001/rule/function-call-output-image-array-shape",
+      "src": "SRC-0001",
+      "composition": "rule",
+      "terms": {
+        "condition": "Если CallToolResult содержит image content, FunctionCallOutputPayload сериализуется как array content items с InputImage (успешные также показывают success=true в internal)",
+        "numbers": null,
+        "formula": "items = [InputText{text}, InputImage{image_url: 'data:{mime};base64,{data}'}]; wire = JSON array",
+        "gwt": {
+          "given": "CallToolResult{content: [{type: text, text: caption}, {type: image, data: BASE64, mimeType: image/png}], is_error: Some(false)}",
+          "when": "into_function_call_output_payload → serialize в JSON",
+          "then": "output — JSON array с двумя items; payload.success = Some(true) (models.rs test serializes_image_outputs_as_array)"
+        }
+      }
+    },
+    {
+      "id": "SRC-0001/rule/data-url-preservation",
+      "src": "SRC-0001",
+      "composition": "rule",
+      "terms": {
+        "condition": "Если MCP image data уже в формате data: URL, оно передаётся as-is; иначе конструируется 'data:{mime_type};base64,{data}' (mime_type по умолчанию 'application/octet-stream')",
+        "numbers": null,
+        "formula": "image_url = if data.starts_with('data:') { data } else { format!('data:{mime};base64,{data}') where mime = mime_type.unwrap_or('application/octet-stream') }",
+        "gwt": {
+          "given": "MCP content: [{type: image, data: 'data:image/png;base64,Zm9v', mimeType: 'image/png'}]",
+          "when": "convert_mcp_content_to_items",
+          "then": "image_url = 'data:image/png;base64,Zm9v' (preserved, models.rs test convert_mcp_content_to_items_preserves_data_urls)"
+        }
+      }
+    },
+    {
+      "id": "SRC-0001/rule/data-url-construction",
+      "src": "SRC-0001",
+      "composition": "rule",
+      "terms": {
+        "condition": "Если MCP data не начинается с 'data:', строится data-URL через 'data:{mime};base64,{data}'",
+        "numbers": null,
+        "formula": "image_url = format!('data:{mime_type};base64,{data}')",
+        "gwt": {
+          "given": "MCP content: [{type: image, data: 'Zm9v', mimeType: 'image/png'}]",
+          "when": "convert_mcp_content_to_items",
+          "then": "image_url = 'data:image/png;base64,Zm9v' (models.rs test convert_mcp_content_to_items_builds_data_urls_when_missing_prefix)"
+        }
+      }
+    },
+    {
+      "id": "SRC-0001/rule/image-detail-original-only",
+      "src": "SRC-0001",
+      "composition": "rule",
+      "terms": {
+        "condition": "ImageDetail поле конструируется из MCP _meta.codex/imageDetail: только значение 'original' приводит к Some(Original); все остальные ('high', 'low', 'auto' и т.п.) игнорируются и дают None",
+        "numbers": null,
+        "formula": "detail = meta._meta['codex/imageDetail'].as_str() match { Some('original') → Some(ImageDetail::Original), _ → None }",
+        "gwt": {
+          "given": "MCP content с _meta: {codex/imageDetail: 'high'}",
+          "when": "convert_mcp_content_to_items",
+          "then": "detail = None (models.rs test ignores_unknown_mcp_image_detail_metadata)"
+        }
+      }
+    },
+    {
+      "id": "SRC-0001/rule/convert-mcp-content-no-images-returns-none",
+      "src": "SRC-0001",
+      "composition": "rule",
+      "terms": {
+        "condition": "convert_mcp_content_to_items возвращает None, когда saw_image=false — то есть среди content нет image элементов (callers используют serialized JSON как Text)",
+        "numbers": null,
+        "formula": "if saw_image { Some(items) } else { None }",
+        "gwt": {
+          "given": "contents = [{type: text, text: 'hello'}]",
+          "when": "convert_mcp_content_to_items(&contents)",
+          "then": "None (models.rs test convert_mcp_content_to_items_returns_none_without_images)"
+        }
+      }
+    },
+    {
+      "id": "SRC-0001/rule/function-call-output-text-drops-images",
+      "src": "SRC-0001",
+      "composition": "rule",
+      "terms": {
+        "condition": "При конверсии FunctionCallOutputPayload в plain text (to_text / function_call_output_content_items_to_text) учитываются только InputText с non-blank содержимым; InputImage и blank text игнорируются. Если нет non-blank text — возвращается None",
+        "numbers": null,
+        "formula": "text_segments = [text for item in items if matches InputText{text} and !text.trim().is_empty()]; None if empty else join('\\n')",
+        "gwt": {
+          "given": "items = [InputText{'line 1'}, InputImage{...}, InputText{'line 2'}]",
+          "when": "function_call_output_content_items_to_text(&items)",
+          "then": "Some('line 1\\nline 2') (models.rs test function_call_output_content_items_to_text_joins_text_segments)"
+        }
+      }
+    },
+    {
+      "id": "SRC-0001/rule/function-call-output-text-blank-only-none",
+      "src": "SRC-0001",
+      "composition": "rule",
+      "terms": {
+        "condition": "Если FunctionCallOutputBody содержит только blank (whitespace) text items и/или images → to_text возвращает None",
+        "numbers": null,
+        "formula": "if all text_segments blank or empty → None",
+        "gwt": {
+          "given": "items = [InputText{'   '}, InputImage{...}]",
+          "when": "function_call_output_content_items_to_text",
+          "then": "None (models.rs test function_call_output_content_items_to_text_ignores_blank_text_and_images)"
+        }
+      }
+    },
+    {
+      "id": "SRC-0001/rule/response-item-compaction-alias",
+      "src": "SRC-0001",
+      "composition": "rule",
+      "terms": {
+        "condition": "ResponseItem::Compaction десериализуется также из wire тега 'compaction_summary' (legacy)",
+        "numbers": null,
+        "formula": "#[serde(alias = \"compaction_summary\")] Compaction { encrypted_content: String }",
+        "gwt": {
+          "given": "JSON {type: 'compaction_summary', encrypted_content: 'abc'}",
+          "when": "serde_json::from_str::<ResponseItem>",
+          "then": "ResponseItem::Compaction { encrypted_content: 'abc' } (models.rs test deserializes_compaction_alias)"
+        }
+      }
+    },
+    {
+      "id": "SRC-0001/rule/image-gen-call-revised-prompt-optional",
+      "src": "SRC-0001",
+      "composition": "rule",
+      "terms": {
+        "condition": "ResponseItem::ImageGenerationCall поле revised_prompt опционально (skip_if_none); десериализация без поля даёт None",
+        "numbers": null,
+        "formula": "revised_prompt: Option<String> (serde default + skip_if_none)",
+        "gwt": {
+          "given": "JSON {id: 'ig_123', type: 'image_generation_call', status: 'completed', result: 'Zm9v'}",
+          "when": "serde_json::from_value::<ResponseItem>",
+          "then": "ResponseItem::ImageGenerationCall{id: 'ig_123', status: 'completed', revised_prompt: None, result: 'Zm9v'} (models.rs test response_item_parses_image_generation_call_without_revised_prompt)"
+        }
+      }
+    },
+    {
+      "id": "SRC-0001/rule/permission-profile-empty-semantics",
+      "src": "SRC-0001",
+      "composition": "rule",
+      "terms": {
+        "condition": "PermissionProfile::is_empty() = оба поля None. Если одно из полей задано — is_empty=false даже когда его nested содержимое пусто",
+        "numbers": null,
+        "formula": "is_empty() = self.network.is_none() && self.file_system.is_none()",
+        "gwt": {
+          "given": "PermissionProfile{network: Some(NetworkPermissions{enabled: None}), file_system: None}",
+          "when": "permission_profile.is_empty()",
+          "then": "false (models.rs test permission_profile_is_not_empty_when_field_is_present_but_nested_empty)"
+        }
+      }
+    },
+    {
+      "id": "SRC-0001/rule/thread-id-default-not-nil",
+      "src": "SRC-0001",
+      "composition": "rule",
+      "terms": {
+        "condition": "ThreadId::default() никогда не равен Uuid::nil() — используется Uuid::now_v7() (time-based v7)",
+        "numbers": null,
+        "formula": "ThreadId::default() → Self::new() → Self{uuid: Uuid::now_v7()}",
+        "gwt": {
+          "given": "ThreadId::default()",
+          "when": "id.uuid сравнивается с Uuid::nil()",
+          "then": "assert_ne! (thread_id.rs test test_thread_id_default_is_not_zeroes)"
+        }
+      }
+    },
+    {
+      "id": "SRC-0001/rule/thread-id-wire-is-string",
+      "src": "SRC-0001",
+      "composition": "rule",
+      "terms": {
+        "condition": "ThreadId сериализуется как UUID-строка на wire и имеет JsonSchema как String. Невалидная UUID-строка на десериализации даёт кастом ошибку serde::de::Error::custom",
+        "numbers": null,
+        "formula": "serialize: collect_str(&self.uuid); deserialize: String::deserialize → Uuid::parse_str → err.map(serde::de::Error::custom); json_schema: <String>::json_schema(generator)",
+        "gwt": null
+      }
+    },
+    {
+      "id": "SRC-0001/rule/mcp-auth-display-strings",
+      "src": "SRC-0001",
+      "composition": "rule",
+      "terms": {
+        "condition": "McpAuthStatus::Display mapping (user-facing): Unsupported→'Unsupported', NotLoggedIn→'Not logged in', BearerToken→'Bearer token', OAuth→'OAuth'",
+        "numbers": null,
+        "formula": "fmt: McpAuthStatus::Unsupported → 'Unsupported', NotLoggedIn → 'Not logged in', BearerToken → 'Bearer token', OAuth → 'OAuth'",
+        "gwt": {
+          "given": "McpAuthStatus::NotLoggedIn",
+          "when": "format!('{}', status)",
+          "then": "'Not logged in'"
+        }
+      }
+    },
+    {
+      "id": "SRC-0001/rule/op-from-vec-user-input-defaults",
+      "src": "SRC-0001",
+      "composition": "rule",
+      "terms": {
+        "condition": "From<Vec<UserInput>> for Op конструирует Op::UserInput с final_output_json_schema=None и responsesapi_client_metadata=None",
+        "numbers": null,
+        "formula": "Op::UserInput { items: value, final_output_json_schema: None, responsesapi_client_metadata: None }",
+        "gwt": {
+          "given": "vec::<UserInput>::new()",
+          "when": "Op::from(vec)",
+          "then": "Op::UserInput{items: [], final_output_json_schema: None, responsesapi_client_metadata: None}"
+        }
+      }
+    },
+    {
+      "id": "SRC-0001/rule/user-input-empty-items-wire-shape",
+      "src": "SRC-0001",
+      "composition": "rule",
+      "terms": {
+        "condition": "Op::UserInput с final_output_json_schema=None сериализуется без этого поля; опущенное поле при десериализации даёт None",
+        "numbers": null,
+        "formula": "#[serde(skip_serializing_if = \"Option::is_none\")] final_output_json_schema",
+        "gwt": {
+          "given": "Op::UserInput{items: [], final_output_json_schema: None, responsesapi_client_metadata: None}",
+          "when": "serde_json::to_value",
+          "then": "{type: 'user_input', items: []} (protocol.rs test user_input_serialization_omits_final_output_json_schema_when_none)"
+        }
+      }
+    },
+    {
+      "id": "SRC-0001/rule/user-input-with-schema-wire-shape",
+      "src": "SRC-0001",
+      "composition": "rule",
+      "terms": {
+        "condition": "Op::UserInput с final_output_json_schema=Some(schema) сериализует поле как json-object на wire",
+        "numbers": null,
+        "formula": "serialize включает final_output_json_schema только при Some",
+        "gwt": {
+          "given": "Op::UserInput{items: [], final_output_json_schema: Some({type: object, properties: {answer: {type: string}}, required: [answer], additionalProperties: false}), responsesapi_client_metadata: None}",
+          "when": "serde_json::to_value",
+          "then": "JSON включает поле final_output_json_schema со схемой (protocol.rs test user_input_serialization_includes_final_output_json_schema_when_some)"
+        }
+      }
+    },
+    {
+      "id": "SRC-0001/rule/realtime-voice-wire-names",
+      "src": "SRC-0001",
+      "composition": "rule",
+      "terms": {
+        "condition": "Каждый RealtimeVoice имеет строго определённое wire_name() — lowercase ASCII имя голоса для протокола",
+        "numbers": null,
+        "formula": "wire_name: Alloy→alloy, Arbor→arbor, Ash→ash, Ballad→ballad, Breeze→breeze, Cedar→cedar, Coral→coral, Cove→cove, Echo→echo, Ember→ember, Juniper→juniper, Maple→maple, Marin→marin, Sage→sage, Shimmer→shimmer, Sol→sol, Spruce→spruce, Vale→vale, Verse→verse",
+        "gwt": {
+          "given": "RealtimeVoice::Cove",
+          "when": "voice.wire_name()",
+          "then": "'cove'"
+        }
+      }
+    },
+    {
+      "id": "SRC-0001/rule/realtime-voice-list-builtin",
+      "src": "SRC-0001",
+      "composition": "rule",
+      "terms": {
+        "condition": "Встроенные списки голосов v1 и v2 фиксированы и стабильны (9 и 10 элементов); default_v1 = Cove, default_v2 = Marin",
+        "numbers": [
+          {"value": 9, "kind": "count", "name": "v1 builtin voices"},
+          {"value": 10, "kind": "count", "name": "v2 builtin voices"}
+        ],
+        "formula": "v1 = [Juniper, Maple, Spruce, Ember, Vale, Breeze, Arbor, Sol, Cove]; v2 = [Alloy, Ash, Ballad, Coral, Echo, Sage, Shimmer, Verse, Marin, Cedar]; default_v1=Cove; default_v2=Marin",
+        "gwt": {
+          "given": "RealtimeVoicesList::builtin()",
+          "when": "сравнение с ожидаемым",
+          "then": "v1 = 9 голосов (Juniper..Cove), v2 = 10 голосов (Alloy..Cedar), default_v1=Cove, default_v2=Marin (protocol.rs test realtime_voice_list_is_stable)"
+        }
+      }
+    },
+    {
+      "id": "SRC-0001/rule/conversation-start-prompt-double-option",
+      "src": "SRC-0001",
+      "composition": "rule",
+      "terms": {
+        "condition": "ConversationStartParams.prompt использует double_option serde: None = поле опущено; Some(None) = 'null' на wire; Some(Some(string)) = строка",
+        "numbers": null,
+        "formula": "prompt: Option<Option<String>> с serde_with::rust::double_option",
+        "gwt": {
+          "given": "ConversationStartParams{output_modality: Audio, prompt: Some(None), ...}",
+          "when": "serde_json::to_value",
+          "then": "JSON содержит 'prompt': null; при prompt=None → поле опускается; при prompt=Some(Some('be helpful')) → 'prompt': 'be helpful' (protocol.rs test conversation_op_serializes_as_unnested_variants)"
+        }
+      }
+    },
+    {
+      "id": "SRC-0001/rule/review-decision-opaque-labels",
+      "src": "SRC-0001",
+      "composition": "rule",
+      "terms": {
+        "condition": "ReviewDecision.to_opaque_string возвращает анонимные строки без PII для логирования; включая вариацию для NetworkPolicyAmendment по action (Allow/Deny)",
+        "numbers": null,
+        "formula": "to_opaque_string: Approved→'approved'; ApprovedExecpolicyAmendment→'approved_with_amendment'; ApprovedForSession→'approved_for_session'; NetworkPolicyAmendment{Allow}→'approved_with_network_policy_allow'; NetworkPolicyAmendment{Deny}→'denied_with_network_policy_deny'; Denied→'denied'; TimedOut→'timed_out'; Abort→'abort'",
+        "gwt": null
+      }
+    },
+    {
+      "id": "SRC-0001/rule/review-decision-default-denied",
+      "src": "SRC-0001",
+      "composition": "rule",
+      "terms": {
+        "condition": "ReviewDecision::default() = Denied — по умолчанию approval считается отклонённым, требует явного подтверждения",
+        "numbers": null,
+        "formula": "#[default] Denied",
+        "gwt": null
+      }
+    },
+    {
+      "id": "SRC-0001/rule/session-source-default-vscode",
+      "src": "SRC-0001",
+      "composition": "rule",
+      "terms": {
+        "condition": "SessionSource::default() = VSCode — при отсутствии явного startup источника сессия считается VSCode",
+        "numbers": null,
+        "formula": "#[default] VSCode",
+        "gwt": null
+      }
+    },
+    {
+      "id": "SRC-0001/rule/session-source-parse-aliases",
+      "src": "SRC-0001",
+      "composition": "rule",
+      "terms": {
+        "condition": "from_startup_arg принимает алиасы для Mcp: 'mcp', 'appserver', 'app-server', 'app_server' — все дают Mcp; неизвестные значения нормализуются (trim + lowercase) и сохраняются как Custom",
+        "numbers": null,
+        "formula": "normalized = trim + lowercase; match {cli, vscode, exec, (mcp|appserver|app-server|app_server), unknown} → enum; _ → Custom(normalized)",
+        "gwt": {
+          "given": "'app-server', ' Atlas ', 'atlas'",
+          "when": "from_startup_arg",
+          "then": "Mcp, Custom('atlas'), Custom('atlas') (protocol.rs test session_source_from_startup_arg_maps_known_values + normalizes_custom_values)"
+        }
+      }
+    },
+    {
+      "id": "SRC-0001/rule/session-source-thread-name",
+      "src": "SRC-0001",
+      "composition": "rule",
+      "terms": {
+        "condition": "Для аналитики low-cardinality имён: Cli/VSCode/Exec→'user'; SubAgent(_)→'subagent'; Mcp/Custom/Unknown→None",
+        "numbers": null,
+        "formula": "thread_source_name: Cli|VSCode|Exec → Some('user'); SubAgent(_) → Some('subagent'); Mcp|Custom|Unknown → None",
+        "gwt": {
+          "given": "SessionSource::Cli, SessionSource::SubAgent(Review), SessionSource::Mcp, SessionSource::Custom('atlas'), SessionSource::Unknown",
+          "when": "thread_source_name()",
+          "then": "Some('user'), Some('subagent'), None, None, None (protocol.rs test session_source_thread_source_name_classifies_user_and_subagent_sources)"
+        }
+      }
+    },
+    {
+      "id": "SRC-0001/rule/session-source-restriction-product",
+      "src": "SRC-0001",
+      "composition": "rule",
+      "terms": {
+        "condition": "Cli/VSCode/Exec/Mcp/Unknown по умолчанию ограничиваются Product::Codex; SubAgent не имеет product (None); Custom матчит только известные продукты (chatgpt/codex/atlas), иначе None",
+        "numbers": null,
+        "formula": "restriction_product: Custom(s) → Product::from_session_source_name(s); (Cli|VSCode|Exec|Mcp|Unknown) → Some(Product::Codex); SubAgent(_) → None",
+        "gwt": {
+          "given": "SessionSource::Cli, SessionSource::SubAgent(Review), SessionSource::Custom('atlas'), SessionSource::Custom('atlas-dev')",
+          "when": "restriction_product()",
+          "then": "Some(Codex), None, Some(Atlas), None (protocol.rs tests session_source_restriction_product_* + matches_product_restriction)"
+        }
+      }
+    },
+    {
+      "id": "SRC-0001/rule/product-case-insensitive-from-session",
+      "src": "SRC-0001",
+      "composition": "rule",
+      "terms": {
+        "condition": "Product::from_session_source_name нормализует входную строку через trim + ascii_lowercase; допускает CHATGPT/Codex/ATLAS но не 'atlas-dev'",
+        "numbers": null,
+        "formula": "normalized = value.trim().to_ascii_lowercase(); chatgpt→Some(Chatgpt); codex→Some(Codex); atlas→Some(Atlas); _→None",
+        "gwt": {
+          "given": "'chatgpt', 'ATLAS', 'atlas-dev'",
+          "when": "from_session_source_name",
+          "then": "Some(Chatgpt), Some(Atlas), None"
+        }
+      }
+    },
+    {
+      "id": "SRC-0001/rule/product-match-empty-products-allows",
+      "src": "SRC-0001",
+      "composition": "rule",
+      "terms": {
+        "condition": "matches_product_restriction при пустом списке products разрешает любой источник (empty = no restriction)",
+        "numbers": null,
+        "formula": "matches = products.is_empty() || products.contains(self) (Product); SessionSource: is_empty || restriction_product.is_some_and(matches)",
+        "gwt": {
+          "given": "SessionSource::Custom('atlas-dev'), products=[]",
+          "when": "matches_product_restriction",
+          "then": "true (protocol.rs test session_source_matches_product_restriction)"
+        }
+      }
+    },
+    {
+      "id": "SRC-0001/rule/ask-for-approval-default-on-request",
+      "src": "SRC-0001",
+      "composition": "rule",
+      "terms": {
+        "condition": "AskForApproval::default() = OnRequest — модель решает когда спрашивать",
+        "numbers": null,
+        "formula": "#[default] OnRequest",
+        "gwt": null
+      }
+    },
+    {
+      "id": "SRC-0001/rule/ask-for-approval-untrusted-wire",
+      "src": "SRC-0001",
+      "composition": "rule",
+      "terms": {
+        "condition": "AskForApproval::UnlessTrusted имеет wire-имя 'untrusted' (serde rename и strum serialize) — разрыв между enum-именем и wire",
+        "numbers": null,
+        "formula": "#[serde(rename = \"untrusted\")] #[strum(serialize = \"untrusted\")] UnlessTrusted",
+        "gwt": null
+      }
+    },
+    {
+      "id": "SRC-0001/rule/sandbox-policy-danger-full-access-wire",
+      "src": "SRC-0001",
+      "composition": "rule",
+      "terms": {
+        "condition": "SandboxPolicy варианты имеют кастомные wire имена: danger-full-access, read-only, external-sandbox, workspace-write — все через kebab-case + explicit rename",
+        "numbers": null,
+        "formula": "DangerFullAccess → 'danger-full-access', ReadOnly → 'read-only', ExternalSandbox → 'external-sandbox', WorkspaceWrite → 'workspace-write'",
+        "gwt": null
+      }
+    },
+    {
+      "id": "SRC-0001/rule/collab-event-into-event-msg",
+      "src": "SRC-0001",
+      "composition": "rule",
+      "terms": {
+        "condition": "Все 10 типов collab lifecycle событий (SpawnBegin/End, InteractionBegin/End, WaitingBegin/End, CloseBegin/End, ResumeBegin/End) имеют From<Event> for EventMsg — автоматически конвертируются в соответствующий вариант EventMsg",
+        "numbers": [
+          {"value": 10, "kind": "count", "name": "collab event types with From<Event> for EventMsg impl"}
+        ],
+        "formula": "impl From<Collab*Event> for EventMsg { fn from(event) → EventMsg::Collab*(event) } для 10 типов",
+        "gwt": null
+      }
+    },
+    {
+      "id": "SRC-0001/rule/mcp-tool-call-is-success",
+      "src": "SRC-0001",
+      "composition": "rule",
+      "terms": {
+        "condition": "McpToolCallEndEvent.is_success: Ok без is_error=true → true; Err → false; is_error=None трактуется как false (успех)",
+        "numbers": null,
+        "formula": "is_success = match result { Ok(r) → !r.is_error.unwrap_or(false); Err(_) → false }",
+        "gwt": {
+          "given": "McpToolCallEndEvent{result: Ok(CallToolResult{is_error: None, ...}), ...}",
+          "when": "is_success()",
+          "then": "true (is_error.unwrap_or(false) = false, !false = true)"
+        }
+      }
+    },
+    {
+      "id": "SRC-0001/rule/codex-error-not-affects-turn-status",
+      "src": "SRC-0001",
+      "composition": "rule",
+      "terms": {
+        "condition": "ThreadRollbackFailed и ActiveTurnNotSteerable не помечают turn как failed при replay (affects_turn_status = false). Все остальные варианты CodexErrorInfo → true",
+        "numbers": null,
+        "formula": "affects_turn_status: ThreadRollbackFailed | ActiveTurnNotSteerable{..} → false; иначе → true",
+        "gwt": {
+          "given": "ErrorEvent{codex_error_info: Some(CodexErrorInfo::ThreadRollbackFailed)} и ErrorEvent{codex_error_info: Some(CodexErrorInfo::ActiveTurnNotSteerable{turn_kind: Review})}",
+          "when": "affects_turn_status()",
+          "then": "false для обоих (protocol.rs tests rollback_failed_error_does_not_affect_turn_status + active_turn_not_steerable_error_does_not_affect_turn_status)"
+        }
+      }
+    },
+    {
+      "id": "SRC-0001/rule/error-event-default-affects-turn",
+      "src": "SRC-0001",
+      "composition": "rule",
+      "terms": {
+        "condition": "ErrorEvent без codex_error_info (legacy) по умолчанию affects turn status — is_none_or на Option даёт true",
+        "numbers": null,
+        "formula": "ErrorEvent.affects_turn_status() = self.codex_error_info.is_none_or(CodexErrorInfo::affects_turn_status)",
+        "gwt": {
+          "given": "ErrorEvent{codex_error_info: Some(CodexErrorInfo::Other)}",
+          "when": "affects_turn_status()",
+          "then": "true (protocol.rs test generic_error_affects_turn_status)"
+        }
+      }
+    },
+    {
+      "id": "SRC-0001/rule/function-call-namespace-optional",
+      "src": "SRC-0001",
+      "composition": "rule",
+      "terms": {
+        "condition": "ResponseItem::FunctionCall имеет опциональный namespace для различения MCP/обычных tools; десериализация без поля даёт None",
+        "numbers": null,
+        "formula": "namespace: Option<String> с serde default + skip_serializing_if = Option::is_none",
+        "gwt": {
+          "given": "JSON {type: 'function_call', name: 'mcp__codex_apps__gmail_get_recent_emails', namespace: 'mcp__codex_apps__gmail', arguments: '{\"top_k\":5}', call_id: 'call-1'}",
+          "when": "serde_json::from_value::<ResponseItem>",
+          "then": "FunctionCall{id: None, name: '...get_recent_emails', namespace: Some('mcp__codex_apps__gmail'), arguments: '{\"top_k\":5}', call_id: 'call-1'} (models.rs test function_call_deserializes_optional_namespace)"
+        }
+      }
+    },
+    {
+      "id": "SRC-0001/rule/tool-search-server-allow-null-call-id",
+      "src": "SRC-0001",
+      "composition": "rule",
+      "terms": {
+        "condition": "ResponseItem::ToolSearchCall и ToolSearchOutput для execution='server' позволяют call_id=null на wire — server-side tool поиск без client-side call id",
+        "numbers": null,
+        "formula": "call_id: Option<String> (ToolSearchCall) / Option<String> (ToolSearchOutput); null допустим",
+        "gwt": {
+          "given": "JSON {type: 'tool_search_call', execution: 'server', call_id: null, status: 'completed', arguments: {paths: [crm]}}",
+          "when": "serde_json::from_str::<ResponseItem>",
+          "then": "ToolSearchCall{id: None, call_id: None, status: Some('completed'), execution: 'server', arguments: {paths: [crm]}} (protocol.rs test tool_search_server_items_allow_null_call_id)"
+        }
+      }
+    },
+    {
+      "id": "SRC-0001/rule/shell-tool-call-timeout-alias",
+      "src": "SRC-0001",
+      "composition": "rule",
+      "terms": {
+        "condition": "ShellToolCallParams и ShellCommandToolCallParams допускают alias 'timeout' для поля timeout_ms — legacy имя поля",
+        "numbers": null,
+        "formula": "#[serde(alias = \"timeout\")] pub timeout_ms: Option<u64>",
+        "gwt": {
+          "given": "JSON {command: [ls, -l], workdir: '/tmp', timeout: 1000}",
+          "when": "serde_json::from_str::<ShellToolCallParams>",
+          "then": "ShellToolCallParams{command: [ls, -l], workdir: Some('/tmp'), timeout_ms: Some(1000), ...} (models.rs test deserialize_shell_tool_call_params)"
+        }
+      }
+    },
+    {
+      "id": "SRC-0001/rule/message-phase-none-is-legacy",
+      "src": "SRC-0001",
+      "composition": "rule",
+      "terms": {
+        "condition": "MessagePhase опционален в ResponseItem::Message и AgentMessageItem. None = phase unknown — consumers обязаны сохранять legacy completion semantics (не считать автоматически final)",
+        "numbers": null,
+        "formula": "phase: Option<MessagePhase> (serde default + skip_if_none + ts optional)",
+        "gwt": null
+      }
+    },
+    {
+      "id": "SRC-0001/rule/turn-item-hook-prompt-plan-no-legacy",
+      "src": "SRC-0001",
+      "composition": "rule",
+      "terms": {
+        "condition": "TurnItem варианты HookPrompt и Plan не производят legacy EventMsg (as_legacy_events возвращает пустой Vec)",
+        "numbers": null,
+        "formula": "TurnItem::as_legacy_events: HookPrompt(_) | Plan(_) → Vec::new()",
+        "gwt": null
+      }
+    },
+    {
+      "id": "SRC-0001/rule/reasoning-raw-content-gated",
+      "src": "SRC-0001",
+      "composition": "rule",
+      "terms": {
+        "condition": "ReasoningItem.as_legacy_events emit'ит AgentReasoningRawContent для каждого raw_content entry только когда show_raw_agent_reasoning=true",
+        "numbers": null,
+        "formula": "if show_raw_agent_reasoning { emit AgentReasoningRawContent per raw_content entry }",
+        "gwt": null
+      }
+    },
+    {
+      "id": "SRC-0001/rule/hook-prompt-empty-hook-run-id",
+      "src": "SRC-0001",
+      "composition": "rule",
+      "terms": {
+        "condition": "Фрагменты HookPromptFragment с пустым hook_run_id (после trim) отбрасываются как при построении ResponseItem через build_hook_prompt_message, так и при парсинге через parse_hook_prompt_fragment",
+        "numbers": null,
+        "formula": "filter (и serialize_hook_prompt_fragment/parse_hook_prompt_fragment): if hook_run_id.trim().is_empty() { skip/None }",
+        "gwt": {
+          "given": "build_hook_prompt_message(&[HookPromptFragment{text: 'x', hook_run_id: '  '}])",
+          "when": "вызов",
+          "then": "content после filter пуст → возвращается None"
+        }
+      }
+    },
+    {
+      "id": "SRC-0001/rule/hook-prompt-roundtrip",
+      "src": "SRC-0001",
+      "composition": "rule",
+      "terms": {
+        "condition": "Множественные hook prompt фрагменты roundtrip: build_hook_prompt_message → parse_hook_prompt_message восстанавливает исходный список fragments",
+        "numbers": null,
+        "formula": "parse(build(fragments)).fragments == fragments (при условии all hook_run_id непусты)",
+        "gwt": {
+          "given": "fragments = [HookPromptFragment{'Retry with care & joy.', 'hook-run-1'}, HookPromptFragment{'Then summarize cleanly.', 'hook-run-2'}]",
+          "when": "message=build_hook_prompt_message(&fragments); parsed=parse_hook_prompt_message(None, &message.content)",
+          "then": "parsed.fragments == fragments (items.rs test hook_prompt_roundtrips_multiple_fragments)"
+        }
+      }
+    },
+    {
+      "id": "SRC-0001/rule/hook-prompt-legacy-single-hook",
+      "src": "SRC-0001",
+      "composition": "rule",
+      "terms": {
+        "condition": "parse_hook_prompt_fragment принимает legacy формат XML '<hook_prompt hook_run_id=\"...\">text</hook_prompt>' как один фрагмент",
+        "numbers": null,
+        "formula": "XML HookPromptXml { @hook_run_id, $text } → HookPromptFragment",
+        "gwt": {
+          "given": "r#\"<hook_prompt hook_run_id=\"hook-run-1\">Retry with tests.</hook_prompt>\"#",
+          "when": "parse_hook_prompt_fragment",
+          "then": "HookPromptFragment{text: 'Retry with tests.', hook_run_id: 'hook-run-1'} (items.rs test hook_prompt_parses_legacy_single_hook_run_id)"
+        }
+      }
+    },
+    {
+      "id": "SRC-0001/rule/user-input-image-wrap-tags",
+      "src": "SRC-0001",
+      "composition": "rule",
+      "terms": {
+        "condition": "UserInput::Image при конверсии в ResponseInputItem оборачивается тегами: ContentItem[InputText('<image>'), InputImage{image_url}, InputText('</image>')]. Image index увеличивается даже если не используется label number (image tags не содержат label для remote images)",
+        "numbers": null,
+        "formula": "[InputText(image_open_tag_text()), InputImage{image_url}, InputText(image_close_tag_text())]",
+        "gwt": {
+          "given": "vec![UserInput::Image{image_url: 'data:image/png;base64,abc'}]",
+          "when": "ResponseInputItem::from(inputs)",
+          "then": "Message{content: [InputText('<image>'), InputImage{'data:image/png;base64,abc'}, InputText('</image>')]} (models.rs test wraps_image_user_input_with_tags)"
+        }
+      }
+    },
+    {
+      "id": "SRC-0001/rule/mixed-images-share-label-sequence",
+      "src": "SRC-0001",
+      "composition": "rule",
+      "terms": {
+        "condition": "Remote Image и LocalImage разделяют единый image_index счётчик. Remote image не получает label_number (обёрнут только tags), LocalImage получает label_number через local_image_open_tag_text(<image name=[Image #N]>)",
+        "numbers": null,
+        "formula": "image_index++ на каждый UserInput::Image или LocalImage; remote → tags без label; local → open_tag с label_number=Some(image_index)",
+        "gwt": {
+          "given": "vec![Image{url}, LocalImage{valid_path}]",
+          "when": "ResponseInputItem::from(inputs)",
+          "then": "content[0..3] = remote wrapped (no label); content[3] = InputText(local_image_open_tag_text(2)) — label_number=2 (models.rs test mixed_remote_and_local_images_share_label_sequence)"
+        }
+      }
+    },
+    {
+      "id": "SRC-0001/rule/local-image-read-error-placeholder",
+      "src": "SRC-0001",
+      "composition": "rule",
+      "terms": {
+        "condition": "LocalImage с отсутствующим файлом даёт ContentItem::InputText placeholder с сообщением 'Codex could not read the local image at `{path}`: {error}'",
+        "numbers": null,
+        "formula": "local_image_error_placeholder(path, error) → InputText{text: format!('Codex could not read the local image at `{path}`: {error}')}",
+        "gwt": {
+          "given": "LocalImage{path: /tmp/missing-image.png} (файл не существует)",
+          "when": "ResponseInputItem::from(inputs)",
+          "then": "content имеет один InputText, содержащий display(path) и 'could not read' (models.rs test local_image_read_error_adds_placeholder)"
+        }
+      }
+    },
+    {
+      "id": "SRC-0001/rule/local-image-unsupported-format-placeholder",
+      "src": "SRC-0001",
+      "composition": "rule",
+      "terms": {
+        "condition": "LocalImage с unsupported MIME (например svg) даёт placeholder 'Codex cannot attach image at `{path}`: unsupported image `{mime}`.'",
+        "numbers": null,
+        "formula": "unsupported_image_error_placeholder(path, mime) → InputText{text: format!('Codex cannot attach image at `{path}`: unsupported image `{mime}`.')}",
+        "gwt": {
+          "given": "LocalImage{path: /tmp/example.svg с содержимым SVG}",
+          "when": "ResponseInputItem::from(inputs)",
+          "then": "content[0] = InputText с точным текстом 'Codex cannot attach image at `{path}`: unsupported image `image/svg+xml`.' (models.rs test local_image_unsupported_image_format_adds_placeholder)"
+        }
+      }
+    },
+    {
+      "id": "SRC-0001/rule/local-image-non-image-placeholder",
+      "src": "SRC-0001",
+      "composition": "rule",
+      "terms": {
+        "condition": "LocalImage указывающий на не-image файл (application/json) даёт placeholder 'unsupported image `application/json`'",
+        "numbers": null,
+        "formula": "placeholder сообщает unsupported MIME определённый по содержимому",
+        "gwt": {
+          "given": "LocalImage{path: /tmp/example.json с JSON содержимым}",
+          "when": "ResponseInputItem::from(inputs)",
+          "then": "placeholder содержит 'unsupported image `application/json`' и display(path) (models.rs test local_image_non_image_adds_placeholder)"
+        }
+      }
+    },
+    {
+      "id": "SRC-0001/rule/user-input-skill-mention-empty",
+      "src": "SRC-0001",
+      "composition": "rule",
+      "terms": {
+        "condition": "UserInput::Skill и UserInput::Mention при конверсии в ResponseInputItem дают пустой Vec<ContentItem> — tool bodies инъецируются позже в core",
+        "numbers": null,
+        "formula": "UserInput::Skill { .. } | UserInput::Mention { .. } → Vec::new()",
+        "gwt": null
+      }
+    },
+    {
+      "id": "SRC-0001/rule/compacted-item-to-assistant-message",
+      "src": "SRC-0001",
+      "composition": "rule",
+      "terms": {
+        "condition": "CompactedItem конвертируется в ResponseItem::Message с ролью 'assistant' и одним OutputText с текстом компакции; id=None, end_turn=None, phase=None",
+        "numbers": null,
+        "formula": "From<CompactedItem>: Message{id: None, role: 'assistant', content: [OutputText{text: value.message}], end_turn: None, phase: None}",
+        "gwt": null
+      }
+    },
+    {
+      "id": "SRC-0001/rule/inter-agent-communication-serde-roundtrip",
+      "src": "SRC-0001",
+      "composition": "rule",
+      "terms": {
+        "condition": "InterAgentCommunication.to_response_input_item сериализует структуру как JSON и оборачивает в Message{role: 'assistant', content: [OutputText{text: json_string}]}. from_message_content пытается десериализовать обратно из одиночного InputText или OutputText",
+        "numbers": null,
+        "formula": "serialize: OutputText{text: serde_json::to_string(self).unwrap_or_default()}; deserialize: match content { [InputText{text}] | [OutputText{text}] → serde_json::from_str(text).ok(); _ → None }",
+        "gwt": null
+      }
+    },
+    {
+      "id": "SRC-0001/rule/truncation-policy-multiplier-ceil",
+      "src": "SRC-0001",
+      "composition": "rule",
+      "terms": {
+        "condition": "TruncationPolicy * f64 применяет умножение с ceil для каждого варианта — округление вверх",
+        "numbers": null,
+        "formula": "Mul<f64>: Bytes(b) → Bytes(ceil(b as f64 * multiplier) as usize); Tokens(t) → Tokens(ceil(t as f64 * multiplier) as usize)",
+        "gwt": null
+      }
+    },
+    {
+      "id": "SRC-0001/rule/truncation-policy-token-budget-fallback",
+      "src": "SRC-0001",
+      "composition": "rule",
+      "terms": {
+        "condition": "TruncationPolicy::token_budget при Bytes использует approx_tokens_from_byte_count; если результат > usize::MAX → usize::try_from fallback на usize::MAX",
+        "numbers": null,
+        "formula": "token_budget: Bytes(b) → usize::try_from(approx_tokens_from_byte_count(b)).unwrap_or(usize::MAX); Tokens(t) → t",
+        "gwt": null
+      }
+    },
+    {
+      "id": "SRC-0001/rule/turn-context-item-persist-timing",
+      "src": "SRC-0001",
+      "composition": "rule",
+      "terms": {
+        "condition": "TurnContextItem persist'ится ровно один раз на user turn после computation model-visible context updates, и второй раз после mid-turn компакции когда replacement history восстанавливает full context — для resume/fork replay",
+        "numbers": [
+          {"value": 1, "kind": "count", "name": "per real user turn"}
+        ],
+        "formula": "persist: (at turn start after context computed) + (after mid-turn compaction with replacement_history)",
+        "gwt": null
+      }
+    },
+    {
+      "id": "SRC-0001/rule/realtime-voices-order-sorted",
+      "src": "SRC-0001",
+      "composition": "rule",
+      "terms": {
+        "condition": "RealtimeVoice is Ord + PartialOrd — variants упорядочены алфавитно как объявлены, что позволяет использовать их как BTreeSet/HashMap ключ",
+        "numbers": null,
+        "formula": "#[derive(Ord, PartialOrd)] для RealtimeVoice",
+        "gwt": null
+      }
+    }
+  ]
+}

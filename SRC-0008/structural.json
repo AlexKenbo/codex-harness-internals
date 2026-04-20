@@ -1,0 +1,491 @@
+{
+  "src": "SRC-0008",
+  "schema_version": "2.0",
+  "lens": "structural",
+  "compositions": [
+    {
+      "id": "SRC-0008/entity/agent-registry",
+      "src": "SRC-0008",
+      "composition": "entity",
+      "terms": {
+        "object": "AgentRegistry — реестр активных агентов в пределах одной пользовательской сессии, ограничивает общее число sub-агентов (threads) и резервирует nickname'ы и agent_path",
+        "attributes": [
+          "active_agents: ActiveAgents (под Mutex) — дерево активных агентов",
+          "total_count: AtomicUsize — счётчик активных spawned-threads",
+          "ActiveAgents.agent_tree: HashMap<String, AgentMetadata> — ключ = agent_path или 'thread:{thread_id}'",
+          "ActiveAgents.used_agent_nicknames: HashSet<String> — занятые имена",
+          "ActiveAgents.nickname_reset_count: usize — сколько раз пул имён исчерпан и сброшен"
+        ],
+        "relationships": [
+          {"to": "SRC-0008/entity/agent-metadata", "rel": "contains", "card": "1:N"},
+          {"to": "SRC-0008/entity/spawn-reservation", "rel": "issues", "card": "1:N"},
+          {"to": "SRC-0008/entity/agent-control", "rel": "owned_by", "card": "1:1"}
+        ],
+        "enumerations": null,
+        "data_flows": [
+          {"source": "AgentControl.spawn_agent_internal", "transform": "reserve_spawn_slot проверяет max_threads, инкрементит total_count", "sink": "SpawnReservation"},
+          {"source": "SpawnReservation.commit(AgentMetadata)", "transform": "register_spawned_thread вставляет в agent_tree по ключу agent_path или thread:{id}", "sink": "AgentRegistry.active_agents"},
+          {"source": "shutdown_live_agent / close_agent", "transform": "release_spawned_thread ищет по thread_id, удаляет из agent_tree, декрементит total_count если не root", "sink": "AgentRegistry.active_agents"}
+        ],
+        "config": {
+          "max_threads": {"value": "config.agent_max_threads", "source": "Config (runtime setting)", "default": "None (неограниченно если не задан)"}
+        }
+      }
+    },
+    {
+      "id": "SRC-0008/entity/agent-metadata",
+      "src": "SRC-0008",
+      "composition": "entity",
+      "terms": {
+        "object": "AgentMetadata — идентификация агента внутри реестра: id, path, nickname, role, последнее сообщение задачи",
+        "attributes": [
+          "agent_id: Option<ThreadId> — идентификатор thread'а (None пока agent зарезервирован, но не запущен)",
+          "agent_path: Option<AgentPath> — иерархический путь агента в дереве (напр. /root/worker)",
+          "agent_nickname: Option<String> — человекочитаемое имя из пула",
+          "agent_role: Option<String> — имя роли (default/explorer/worker или пользовательская)",
+          "last_task_message: Option<String> — последний user input / inter-agent message, сохранённый через update_last_task_message"
+        ],
+        "relationships": [
+          {"to": "SRC-0008/entity/agent-registry", "rel": "stored_in", "card": "N:1"},
+          {"to": "SRC-0008/entity/agent-role", "rel": "references", "card": "N:1"}
+        ],
+        "enumerations": null,
+        "data_flows": [
+          {"source": "prepare_thread_spawn", "transform": "формирует AgentMetadata с agent_path + agent_nickname + agent_role, agent_id=None", "sink": "SpawnReservation"},
+          {"source": "spawn_agent_internal/resume_single_agent_from_rollout", "transform": "проставляет agent_id = new_thread.thread_id после spawn", "sink": "AgentRegistry.agent_tree"},
+          {"source": "send_input / send_inter_agent_communication", "transform": "update_last_task_message пишет preview/content", "sink": "AgentMetadata.last_task_message"}
+        ],
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0008/entity/spawn-reservation",
+      "src": "SRC-0008",
+      "composition": "entity",
+      "terms": {
+        "object": "SpawnReservation — RAII-держатель зарезервированного слота в AgentRegistry: держит инкремент total_count и забронированные nickname/agent_path до commit или drop",
+        "attributes": [
+          "state: Arc<AgentRegistry> — родительский реестр",
+          "active: bool — флаг активной резервации (false после commit)",
+          "reserved_agent_nickname: Option<String>",
+          "reserved_agent_path: Option<AgentPath>"
+        ],
+        "relationships": [
+          {"to": "SRC-0008/entity/agent-registry", "rel": "holds_slot_in", "card": "N:1"},
+          {"to": "SRC-0008/entity/agent-metadata", "rel": "commits", "card": "1:1"}
+        ],
+        "enumerations": null,
+        "data_flows": [
+          {"source": "AgentRegistry.reserve_spawn_slot", "transform": "проверяет max_threads, инкрементит счётчик, создаёт SpawnReservation{active:true}", "sink": "SpawnReservation"},
+          {"source": "SpawnReservation.commit(agent_metadata)", "transform": "register_spawned_thread в registry, active=false, снимает reserved_agent_path/nickname", "sink": "AgentRegistry.agent_tree"},
+          {"source": "SpawnReservation.drop (при ошибке/panics)", "transform": "если active: release_reserved_agent_path + total_count.fetch_sub(1)", "sink": "AgentRegistry"}
+        ],
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0008/entity/agent-control",
+      "src": "SRC-0008",
+      "composition": "entity",
+      "terms": {
+        "object": "AgentControl — control-plane handle для мульти-агентных операций: спавнит агентов, шлёт ввод/межагентные сообщения, отслеживает статус, строит дерево spawn'ов. Создаётся один раз на root-thread дерева и разделяется всеми суб-агентами",
+        "attributes": [
+          "manager: Weak<ThreadManagerState> — слабая ссылка на глобальный thread manager (Weak чтобы избежать циклов ThreadManagerState → CodexThread → Session → SessionServices → ThreadManagerState)",
+          "state: Arc<AgentRegistry> — общий реестр для всего root-дерева"
+        ],
+        "relationships": [
+          {"to": "SRC-0008/entity/agent-registry", "rel": "owns", "card": "1:1"},
+          {"to": "SRC-0008/entity/agent-metadata", "rel": "reads_writes_via_registry", "card": "1:N"},
+          {"to": "SRC-0008/entity/live-agent", "rel": "produces", "card": "1:N"},
+          {"to": "SRC-0008/entity/listed-agent", "rel": "produces", "card": "1:N"}
+        ],
+        "enumerations": null,
+        "data_flows": [
+          {"source": "spawn_agent(config, initial_operation, session_source)", "transform": "reserve slot → prepare_thread_spawn (nickname+path+role+session_source) → spawn_new_thread / fork_thread / spawn_forked_thread → commit → persist spawn edge → send_input(initial_operation) → start completion watcher (если не MultiAgentV2)", "sink": "LiveAgent (thread_id + metadata + status)"},
+          {"source": "resume_agent_from_rollout(config, thread_id, session_source)", "transform": "resume_single_agent_from_rollout + BFS по persisted thread-spawn children (Open edges) для поднятия всего поддерева", "sink": "Thread tree in ThreadManagerState"},
+          {"source": "send_input(agent_id, initial_operation)", "transform": "render_input_preview → send_op → update_last_task_message (при успехе) → handle_thread_request_result (удаляет thread при InternalAgentDied)", "sink": "ThreadManagerState + AgentMetadata.last_task_message"},
+          {"source": "send_inter_agent_communication(agent_id, communication)", "transform": "Op::InterAgentCommunication → send_op → update_last_task_message с communication.content", "sink": "ThreadManagerState"},
+          {"source": "close_agent(agent_id)", "transform": "set_thread_spawn_edge_status=Closed в state_db → shutdown_agent_tree", "sink": "state_db + ThreadManagerState"},
+          {"source": "shutdown_agent_tree(agent_id)", "transform": "live_thread_spawn_descendants (DFS) → shutdown_live_agent для каждого", "sink": "ThreadManagerState"},
+          {"source": "shutdown_live_agent(agent_id)", "transform": "flush_rollout → Op::Shutdown (если не уже Shutdown) → remove_thread → release_spawned_thread", "sink": "AgentRegistry + ThreadManagerState"},
+          {"source": "resolve_agent_reference(current_thread_id, current_session_source, agent_reference)", "transform": "current_agent_path.resolve(agent_reference) → agent_id_for_path", "sink": "ThreadId | UnsupportedOperation"},
+          {"source": "list_agents(current_session_source, path_prefix)", "transform": "live_agents из registry + root из agent_tree, сортировка по agent_path затем thread_id, фильтр agent_matches_prefix", "sink": "Vec<ListedAgent>"},
+          {"source": "format_environment_context_subagents(parent_thread_id)", "transform": "open_thread_spawn_children → format_subagent_context_line для каждого", "sink": "String (environment context)"},
+          {"source": "subscribe_status(agent_id)", "transform": "state.get_thread → thread.subscribe_status", "sink": "watch::Receiver<AgentStatus>"},
+          {"source": "get_total_token_usage(agent_id)", "transform": "thread.total_token_usage", "sink": "Option<TokenUsage>"},
+          {"source": "maybe_start_completion_watcher (spawned task)", "transform": "ждёт is_final(status); если MultiAgentV2+agent_path: send_inter_agent_communication от child → parent; иначе inject_user_message_without_turn в parent_thread", "sink": "parent thread"}
+        ],
+        "config": {
+          "MultiAgentV2": {"value": "Feature::MultiAgentV2", "source": "codex_features::Feature flag", "default": "не задан (читаемо через thread.enabled)"},
+          "GeneralAnalytics": {"value": "Feature::GeneralAnalytics", "source": "codex_features::Feature flag", "default": "не задан"}
+        }
+      }
+    },
+    {
+      "id": "SRC-0008/entity/live-agent",
+      "src": "SRC-0008",
+      "composition": "entity",
+      "terms": {
+        "object": "LiveAgent — снимок только что запущенного/возобновлённого агента: thread_id + metadata + текущий статус",
+        "attributes": [
+          "thread_id: ThreadId",
+          "metadata: AgentMetadata",
+          "status: AgentStatus"
+        ],
+        "relationships": [
+          {"to": "SRC-0008/entity/agent-metadata", "rel": "contains", "card": "1:1"},
+          {"to": "SRC-0008/entity/agent-control", "rel": "returned_by", "card": "N:1"}
+        ],
+        "enumerations": null,
+        "data_flows": [
+          {"source": "spawn_agent_with_metadata / spawn_agent_internal", "transform": "собирает LiveAgent: thread_id из NewThread, metadata после commit, status через get_status", "sink": "caller (multi-agent tool handler)"}
+        ],
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0008/entity/listed-agent",
+      "src": "SRC-0008",
+      "composition": "entity",
+      "terms": {
+        "object": "ListedAgent — представление агента в ответе list_agents для UI/инструментов",
+        "attributes": [
+          "agent_name: String — agent_path в строке или thread_id если пути нет",
+          "agent_status: AgentStatus",
+          "last_task_message: Option<String>"
+        ],
+        "relationships": [
+          {"to": "SRC-0008/entity/agent-metadata", "rel": "derived_from", "card": "1:1"},
+          {"to": "SRC-0008/entity/agent-control", "rel": "returned_by", "card": "N:1"}
+        ],
+        "enumerations": null,
+        "data_flows": [
+          {"source": "AgentControl.list_agents", "transform": "для root: agent_name=root_path, last_task_message='Main thread'; для остальных: agent_name=agent_path.to_string() или thread_id.to_string(), last_task_message из metadata", "sink": "Vec<ListedAgent>"}
+        ],
+        "config": {
+          "ROOT_LAST_TASK_MESSAGE": {"value": "\"Main thread\"", "source": "hardcoded const in control.rs", "default": "\"Main thread\""}
+        }
+      }
+    },
+    {
+      "id": "SRC-0008/entity/mailbox",
+      "src": "SRC-0008",
+      "composition": "entity",
+      "terms": {
+        "object": "Mailbox — передатчик межагентных сообщений (InterAgentCommunication) с монотонными sequence-номерами и подпиской на обновления sequence",
+        "attributes": [
+          "tx: mpsc::UnboundedSender<InterAgentCommunication> — канал отправки",
+          "next_seq: AtomicU64 — счётчик sequence номеров",
+          "seq_tx: watch::Sender<u64> — публикация текущего sequence подписчикам"
+        ],
+        "relationships": [
+          {"to": "SRC-0008/entity/mailbox-receiver", "rel": "paired_with", "card": "1:1"}
+        ],
+        "enumerations": null,
+        "data_flows": [
+          {"source": "Mailbox::new()", "transform": "создаёт mpsc::unbounded_channel и watch::channel(0), возвращает (Mailbox, MailboxReceiver)", "sink": "пара Mailbox+Receiver"},
+          {"source": "Mailbox.send(communication)", "transform": "seq = next_seq.fetch_add(1, Relaxed) + 1 → tx.send → seq_tx.send_replace(seq)", "sink": "mpsc + watch + return seq"},
+          {"source": "Mailbox.subscribe()", "transform": "seq_tx.subscribe()", "sink": "watch::Receiver<u64>"}
+        ],
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0008/entity/mailbox-receiver",
+      "src": "SRC-0008",
+      "composition": "entity",
+      "terms": {
+        "object": "MailboxReceiver — приёмник межагентных сообщений с буфером pending_mails, позволяет проверять наличие pending (в т.ч. trigger_turn) и дренировать все накопленные сообщения",
+        "attributes": [
+          "rx: mpsc::UnboundedReceiver<InterAgentCommunication>",
+          "pending_mails: VecDeque<InterAgentCommunication> — буфер синхронизированных сообщений"
+        ],
+        "relationships": [
+          {"to": "SRC-0008/entity/mailbox", "rel": "paired_with", "card": "1:1"}
+        ],
+        "enumerations": null,
+        "data_flows": [
+          {"source": "rx канал (try_recv)", "transform": "sync_pending_mails: try_recv в цикле → push_back в pending_mails", "sink": "pending_mails: VecDeque"},
+          {"source": "has_pending()", "transform": "sync_pending_mails → !pending_mails.is_empty()", "sink": "bool"},
+          {"source": "has_pending_trigger_turn()", "transform": "sync_pending_mails → any(mail.trigger_turn)", "sink": "bool"},
+          {"source": "drain()", "transform": "sync_pending_mails → pending_mails.drain(..).collect()", "sink": "Vec<InterAgentCommunication>"}
+        ],
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0008/entity/agent-role",
+      "src": "SRC-0008",
+      "composition": "entity",
+      "terms": {
+        "object": "AgentRole — конфигурация роли агента (описание, опциональный config_file, список кандидатных имён). Разделена на built-in (из встроенных констант) и user-defined (из config.agent_roles). Используется spawn-tool для описания доступных ролей и apply_role_to_config для применения слоя",
+        "attributes": [
+          "description: Option<String> — описание роли для tool-spec",
+          "config_file: Option<PathBuf> — путь к TOML с настройками слоя (напр. 'explorer.toml')",
+          "nickname_candidates: Option<Vec<String>> — список имён для nickname pool роли"
+        ],
+        "relationships": [
+          {"to": "SRC-0008/entity/agent-metadata", "rel": "referenced_by", "card": "1:N"},
+          {"to": "SRC-0008/entity/config-layer-stack", "rel": "contributes_layer_to", "card": "1:1"}
+        ],
+        "enumerations": {
+          "built_in_role_names": ["default", "explorer", "worker"]
+        },
+        "data_flows": [
+          {"source": "apply_role_to_config(config, role_name)", "transform": "resolve_role_config → load_role_layer_toml (built-in: embedded content; user: file read + parse_agent_role_file_contents) → preservation_policy → reload::build_next_config (вставляет role layer + optional resolved profile layer + rebuild config)", "sink": "Config (обновлённый)"},
+          {"source": "resolve_role_config(config, role_name)", "transform": "config.agent_roles.get(role_name).or_else(built_in::configs().get(role_name))", "sink": "Option<&AgentRoleConfig>"},
+          {"source": "spawn_tool_spec::build(user_defined_agent_roles)", "transform": "объединяет user_defined + built_in (user first), форматирует описания + locked_settings_note (model, reasoning_effort)", "sink": "String (spawn-agent tool description)"},
+          {"source": "agent_nickname_candidates(config, role_name)", "transform": "resolve_role_config → role.nickname_candidates или fallback на AGENT_NAMES из agent_names.txt", "sink": "Vec<String>"}
+        ],
+        "config": {
+          "DEFAULT_ROLE_NAME": {"value": "\"default\"", "source": "hardcoded pub const in role.rs", "default": "\"default\""},
+          "AGENT_TYPE_UNAVAILABLE_ERROR": {"value": "\"agent type is currently not available\"", "source": "hardcoded const in role.rs", "default": "\"agent type is currently not available\""},
+          "built_in.explorer.config_file": {"value": "explorer.toml", "source": "hardcoded в built_in::configs()", "default": "explorer.toml (embedded through include_str!)"},
+          "built_in.worker.config_file": {"value": "None", "source": "hardcoded в built_in::configs()", "default": "None"},
+          "AGENT_NAMES": {"value": "содержимое agent_names.txt", "source": "include_str! в control.rs (compile-time)", "default": "embedded"}
+        }
+      }
+    },
+    {
+      "id": "SRC-0008/entity/role-preservation-policy",
+      "src": "SRC-0008",
+      "composition": "entity",
+      "terms": {
+        "object": "RolePreservationPolicy — правило сохранения текущего profile и model_provider при наложении role layer. Цель: роль не должна молча сбрасывать spawned agent на default provider, если caller явно выбрал profile/provider",
+        "attributes": [
+          "preserve_current_profile: bool",
+          "preserve_current_provider: bool",
+          "role_selects_provider: bool — роль задаёт model_provider на верхнем уровне TOML",
+          "role_selects_profile: bool — роль задаёт profile на верхнем уровне",
+          "role_updates_active_profile_provider: bool — роль переопределяет model_provider внутри активного профиля"
+        ],
+        "relationships": [
+          {"to": "SRC-0008/entity/agent-role", "rel": "computed_from", "card": "1:1"}
+        ],
+        "enumerations": null,
+        "data_flows": [
+          {"source": "role_layer_toml", "transform": "проверки: get('model_provider'), get('profile'), get('profiles').as_table.get(active_profile).as_table.contains_key('model_provider')", "sink": "(preserve_current_profile, preserve_current_provider)"},
+          {"source": "(preserve_current_profile, preserve_current_provider)", "transform": "preserve_current_profile = !role_selects_provider && !role_selects_profile; preserve_current_provider = preserve_current_profile && !role_updates_active_profile_provider", "sink": "reload::build_next_config решает оставлять ли active_profile и model_provider"}
+        ],
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0008/entity/thread-spawn-edge",
+      "src": "SRC-0008",
+      "composition": "entity",
+      "terms": {
+        "object": "ThreadSpawnEdge — запись о связи родительский thread → дочерний thread, персистентная в state_db, позволяет восстанавливать дерево агентов при resume и различать Open/Closed состояния для корректного завершения",
+        "attributes": [
+          "parent_thread_id: ThreadId",
+          "child_thread_id: ThreadId",
+          "status: DirectionalThreadSpawnEdgeStatus (Open | Closed)"
+        ],
+        "relationships": [
+          {"to": "SRC-0008/entity/agent-metadata", "rel": "describes_link_of", "card": "1:N"},
+          {"to": "SRC-0008/entity/agent-control", "rel": "managed_by", "card": "N:1"}
+        ],
+        "enumerations": {
+          "DirectionalThreadSpawnEdgeStatus": ["Open", "Closed"]
+        },
+        "data_flows": [
+          {"source": "persist_thread_spawn_edge_for_source (после spawn/resume)", "transform": "thread_spawn_parent_thread_id из session_source → state_db.upsert_thread_spawn_edge(parent, child, Open)", "sink": "state_db"},
+          {"source": "close_agent(agent_id)", "transform": "state_db.set_thread_spawn_edge_status(agent_id, Closed)", "sink": "state_db"},
+          {"source": "resume_agent_from_rollout", "transform": "BFS: state_db.list_thread_spawn_children_with_status(parent, Open) → resume_single_agent_from_rollout для каждого ребёнка", "sink": "восстановленное дерево агентов"}
+        ],
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0008/entity/agent-status",
+      "src": "SRC-0008",
+      "composition": "entity",
+      "terms": {
+        "object": "AgentStatus — состояние жизненного цикла агента (импортируется из codex_protocol::protocol::AgentStatus). Статус выводится из событий thread'а и различает финальные/не-финальные состояния",
+        "attributes": [
+          "status: один из AgentStatus вариантов"
+        ],
+        "relationships": [
+          {"to": "SRC-0008/entity/live-agent", "rel": "part_of", "card": "1:1"},
+          {"to": "SRC-0008/entity/listed-agent", "rel": "part_of", "card": "1:1"}
+        ],
+        "enumerations": {
+          "AgentStatus": ["PendingInit", "Running", "Completed(last_agent_message)", "Interrupted", "Errored(message)", "Shutdown", "NotFound"],
+          "non_final_statuses": ["PendingInit", "Running", "Interrupted"]
+        },
+        "data_flows": [
+          {"source": "EventMsg::TurnStarted", "transform": "agent_status_from_event", "sink": "AgentStatus::Running"},
+          {"source": "EventMsg::TurnComplete(ev)", "transform": "agent_status_from_event", "sink": "AgentStatus::Completed(ev.last_agent_message)"},
+          {"source": "EventMsg::TurnAborted(ev) с reason=Interrupted", "transform": "agent_status_from_event", "sink": "AgentStatus::Interrupted"},
+          {"source": "EventMsg::TurnAborted(ev) с другим reason", "transform": "agent_status_from_event — formatted debug reason", "sink": "AgentStatus::Errored(format!(\"{:?}\", ev.reason))"},
+          {"source": "EventMsg::Error(ev)", "transform": "agent_status_from_event", "sink": "AgentStatus::Errored(ev.message)"},
+          {"source": "EventMsg::ShutdownComplete", "transform": "agent_status_from_event", "sink": "AgentStatus::Shutdown"},
+          {"source": "другие EventMsg", "transform": "agent_status_from_event возвращает None (статус не меняется)", "sink": "None"},
+          {"source": "AgentControl.get_status(agent_id)", "transform": "upgrade manager → get_thread → thread.agent_status; если upgrade или get_thread упал — NotFound", "sink": "AgentStatus"},
+          {"source": "is_final(status)", "transform": "!matches(PendingInit | Running | Interrupted)", "sink": "bool"}
+        ],
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0008/entity/spawn-agent-options",
+      "src": "SRC-0008",
+      "composition": "entity",
+      "terms": {
+        "object": "SpawnAgentOptions — параметры spawn_agent: форк родителя (или новый thread), режим форка (полная история или последние N turns)",
+        "attributes": [
+          "fork_parent_spawn_call_id: Option<String> — id родительского spawn-вызова, обязателен если fork_mode задан",
+          "fork_mode: Option<SpawnAgentForkMode>"
+        ],
+        "relationships": [
+          {"to": "SRC-0008/entity/agent-control", "rel": "input_to", "card": "N:1"}
+        ],
+        "enumerations": {
+          "SpawnAgentForkMode": ["FullHistory", "LastNTurns(usize)"]
+        },
+        "data_flows": [
+          {"source": "spawn_forked_thread(options)", "transform": "проверки fork_parent_spawn_call_id.is_some + fork_mode.is_some + session_source=ThreadSpawn → get_rollout_history → truncate_rollout_to_last_n_fork_turns (если LastNTurns) → retain(keep_forked_rollout_item) → fork_thread_with_source", "sink": "NewThread (форк родителя)"},
+          {"source": "keep_forked_rollout_item(item)", "transform": "role: system/developer/user → true; assistant → phase==FinalAnswer; другие ResponseItem → false; Compacted/EventMsg/SessionMeta/TurnContext → true", "sink": "bool (оставить в fork)"}
+        ],
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0008/entity/thread-spawn-source",
+      "src": "SRC-0008",
+      "composition": "entity",
+      "terms": {
+        "object": "ThreadSpawn (SubAgentSource::ThreadSpawn) — описание происхождения sub-agent thread'а: родитель, глубина в дереве, agent_path, nickname, role. Используется в SessionSource для различения root / sub-agent threads",
+        "attributes": [
+          "parent_thread_id: ThreadId",
+          "depth: i32 — глубина в дереве (0 у root, +1 у каждого spawn'а)",
+          "agent_path: Option<AgentPath>",
+          "agent_nickname: Option<String>",
+          "agent_role: Option<String>"
+        ],
+        "relationships": [
+          {"to": "SRC-0008/entity/agent-metadata", "rel": "provides_identity_for", "card": "1:1"},
+          {"to": "SRC-0008/entity/thread-spawn-edge", "rel": "persisted_as", "card": "1:1"}
+        ],
+        "enumerations": null,
+        "data_flows": [
+          {"source": "session_depth(session_source)", "transform": "match SubAgent(ThreadSpawn{depth,..}) → depth; иначе 0", "sink": "i32"},
+          {"source": "next_thread_spawn_depth(session_source)", "transform": "session_depth.saturating_add(1)", "sink": "i32 (глубина для нового spawn'а)"},
+          {"source": "exceeds_thread_spawn_depth_limit(depth, max_depth)", "transform": "depth > max_depth", "sink": "bool"},
+          {"source": "resume_single_agent_from_rollout", "transform": "если depth >= agent_max_depth: features.disable(SpawnCsv) и features.disable(Collab) у resumed agent (ограничение на дальнейший spawn)", "sink": "config.features"},
+          {"source": "thread_spawn_parent_thread_id(session_source)", "transform": "match SubAgent(ThreadSpawn{parent_thread_id,..}) → Some(id); иначе None", "sink": "Option<ThreadId>"}
+        ],
+        "config": {
+          "agent_max_depth": {"value": "config.agent_max_depth", "source": "Config (runtime setting)", "default": "значение из config по умолчанию — в этом SRC не определено"}
+        }
+      }
+    },
+    {
+      "id": "SRC-0008/entity/inter-agent-communication",
+      "src": "SRC-0008",
+      "composition": "entity",
+      "terms": {
+        "object": "InterAgentCommunication — сообщение между агентами (импортируется из codex_protocol). Содержит автора, адресата, контент и флаг trigger_turn (нужно ли разбудить получателя для выполнения turn)",
+        "attributes": [
+          "author: AgentPath",
+          "recipient: AgentPath",
+          "content: String — текст сообщения",
+          "trigger_turn: bool — будить ли получателя"
+        ],
+        "relationships": [
+          {"to": "SRC-0008/entity/mailbox", "rel": "transported_through", "card": "N:1"},
+          {"to": "SRC-0008/entity/agent-control", "rel": "routed_by", "card": "N:1"}
+        ],
+        "enumerations": null,
+        "data_flows": [
+          {"source": "maybe_start_completion_watcher (final status, MultiAgentV2+agent_path)", "transform": "строит InterAgentCommunication(author=child_agent_path, recipient=parent_agent_path из rsplit_once('/'), content=format_subagent_notification_message(child_reference, status), trigger_turn=false)", "sink": "AgentControl.send_inter_agent_communication(parent_thread_id, communication)"},
+          {"source": "AgentControl.send_inter_agent_communication", "transform": "Op::InterAgentCommunication → send_op → update_last_task_message с communication.content", "sink": "целевой thread"}
+        ],
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0008/entity/agent-resolver",
+      "src": "SRC-0008",
+      "composition": "entity",
+      "terms": {
+        "object": "AgentTargetResolver — резолвер строкового target (имя или ThreadId в виде строки) в ThreadId для tool-facing вызовов. Регистрирует session root перед разрешением",
+        "attributes": null,
+        "relationships": [
+          {"to": "SRC-0008/entity/agent-control", "rel": "uses", "card": "N:1"},
+          {"to": "SRC-0008/entity/agent-metadata", "rel": "resolves_to", "card": "1:1"}
+        ],
+        "enumerations": null,
+        "data_flows": [
+          {"source": "resolve_agent_target(session, turn, target)", "transform": "register_session_root(session.conversation_id, turn.session_source) → если target парсится как ThreadId — вернуть; иначе agent_control.resolve_agent_reference(conversation_id, session_source, target) → маппинг CodexErr::UnsupportedOperation → FunctionCallError::RespondToModel", "sink": "Result<ThreadId, FunctionCallError>"},
+          {"source": "register_session_root(session, turn)", "transform": "agent_control.register_session_root(session.conversation_id, &turn.session_source)", "sink": "AgentRegistry.agent_tree[root]"}
+        ],
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0008/entity/agent-nickname-pool",
+      "src": "SRC-0008",
+      "composition": "entity",
+      "terms": {
+        "object": "AgentNicknamePool — пул кандидатных имён для sub-агентов. Каждое имя бронируется в ActiveAgents.used_agent_nicknames. При исчерпании пул сбрасывается и nickname_reset_count инкрементится, формируя суффиксы вида 'the 2nd', 'the 3rd', 'the 4th', ..., '11th'..'13th'",
+        "attributes": [
+          "names: &[&str] — список кандидатов (из role.nickname_candidates или AGENT_NAMES)",
+          "used_agent_nicknames: HashSet<String> — уже выданные имена",
+          "nickname_reset_count: usize — сколько раз пул был исчерпан"
+        ],
+        "relationships": [
+          {"to": "SRC-0008/entity/agent-registry", "rel": "part_of", "card": "1:1"},
+          {"to": "SRC-0008/entity/agent-role", "rel": "sourced_from", "card": "N:1"}
+        ],
+        "enumerations": {
+          "ordinal_suffixes": {
+            "11..=13": "th",
+            "mod 10 == 1": "st",
+            "mod 10 == 2": "nd",
+            "mod 10 == 3": "rd",
+            "else": "th"
+          }
+        },
+        "data_flows": [
+          {"source": "reserve_agent_nickname(names, preferred)", "transform": "если preferred — использовать; иначе сформировать available_names = names через format_agent_nickname(name, reset_count), отфильтровать used, random-choose; если все заняты — clear used, reset_count+=1, отправить метрику codex.multi_agent.nickname_pool_reset, выбрать random из names с новым reset_count; в конце — used_agent_nicknames.insert(agent_nickname)", "sink": "Option<String>"},
+          {"source": "format_agent_nickname(name, reset_count)", "transform": "reset_count=0 → name; иначе value=reset_count+1, suffix по правилам ordinal, формат 'name the {value}{suffix}'", "sink": "String"},
+          {"source": "reserve_agent_nickname_with_preference через SpawnReservation", "transform": "state.reserve_agent_nickname → если None → CodexErr::UnsupportedOperation('no available agent nicknames')", "sink": "Result<String>"}
+        ],
+        "config": {
+          "AGENT_NAMES": {"value": "строки из agent_names.txt (фильтруются trim+non-empty)", "source": "include_str!(\"agent_names.txt\") в control.rs", "default": "embedded at compile time"},
+          "metric_nickname_pool_reset": {"value": "codex.multi_agent.nickname_pool_reset", "source": "codex_otel::global() counter", "default": "инкремент=1"}
+        }
+      }
+    },
+    {
+      "id": "SRC-0008/entity/config-layer-stack",
+      "src": "SRC-0008",
+      "composition": "entity",
+      "terms": {
+        "object": "ConfigLayerStack с role layer — стек конфигурационных слоёв, в который вставляются role layer (при precedence SessionFlags) и опциональный resolved profile layer. Role не владеет выбором модели, если не задал provider/profile явно",
+        "attributes": [
+          "layers: Vec<ConfigLayerEntry> — отсортированы по name, вставка через partition_point",
+          "requirements + requirements_toml — переносятся из исходного стека",
+          "role_layer: ConfigLayerEntry с source=ConfigLayerSource::SessionFlags",
+          "resolved_profile_layer: Option<ConfigLayerEntry> — с source=SessionFlags, value=TomlValue::try_from(resolved_profile)"
+        ],
+        "relationships": [
+          {"to": "SRC-0008/entity/agent-role", "rel": "builds_from", "card": "N:1"},
+          {"to": "SRC-0008/entity/role-preservation-policy", "rel": "applies", "card": "1:1"}
+        ],
+        "enumerations": {
+          "ConfigLayerStackOrdering_used": ["LowestPrecedenceFirst (include_disabled=true)"]
+        },
+        "data_flows": [
+          {"source": "existing_layers(config)", "transform": "config.config_layer_stack.get_layers(LowestPrecedenceFirst, include_disabled=true).cloned", "sink": "Vec<ConfigLayerEntry>"},
+          {"source": "build_config_layer_stack", "transform": "existing_layers → insert_layer(resolved_profile_layer если есть) → insert_layer(role_layer) → ConfigLayerStack::new с прежними requirements", "sink": "ConfigLayerStack"},
+          {"source": "insert_layer(layers, layer)", "transform": "partition_point по name → layers.insert(insertion_index, layer)", "sink": "обновлённый Vec"},
+          {"source": "deserialize_effective_config", "transform": "deserialize_config_toml_with_base(layer_stack.effective_config(), codex_home)", "sink": "ConfigToml"},
+          {"source": "reload_overrides", "transform": "ConfigOverrides{cwd=config.cwd, model_provider=if preserve_current_provider then Some(config.model_provider_id) else None, sandbox/execve/node_path из config}", "sink": "ConfigOverrides для Config::load_config_with_layer_stack"}
+        ],
+        "config": null
+      }
+    }
+  ]
+}

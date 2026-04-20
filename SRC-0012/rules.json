@@ -1,0 +1,562 @@
+{
+  "src": "SRC-0012",
+  "schema_version": "2.0",
+  "lens": "rule",
+  "compositions": [
+    {
+      "id": "SRC-0012/rule/contextual-developer-prefixes",
+      "src": "SRC-0012",
+      "composition": "rule",
+      "terms": {
+        "condition": "ContentItem::InputText считается контекстуальным (rollback-trimmable) developer-фрагментом IF trim_start(text) начинается с любого префикса из CONTEXTUAL_DEVELOPER_PREFIXES при case-insensitive сравнении (eq_ignore_ascii_case). Для ContentItem не InputText condition всегда false",
+        "numbers": [
+          {"value": 5, "kind": "количество префиксов в CONTEXTUAL_DEVELOPER_PREFIXES (event_mapping.rs:27-33)"}
+        ],
+        "formula": "is_contextual_dev_fragment(content_item) = (ContentItem::InputText{text} matches) AND exists prefix in ['<permissions instructions>', '<model_switch>', COLLABORATION_MODE_OPEN_TAG, REALTIME_CONVERSATION_OPEN_TAG, '<personality_spec>'] such that text.trim_start().get(..prefix.len()) is_some_and candidate.eq_ignore_ascii_case(prefix)",
+        "gwt": {
+          "given": "ContentItem::InputText { text: '   <PERMISSIONS INSTRUCTIONS>\\nfoo bar' }",
+          "when": "вызов is_contextual_dev_fragment",
+          "then": "trim_start → '<PERMISSIONS INSTRUCTIONS>\\nfoo bar'; get(0..26) → '<PERMISSIONS INSTRUCTIONS>'; candidate.eq_ignore_ascii_case('<permissions instructions>') = true → вернуть true (фрагмент контекстуальный)"
+        }
+      }
+    },
+    {
+      "id": "SRC-0012/rule/dev-message-contextuality-pairing",
+      "src": "SRC-0012",
+      "composition": "rule",
+      "terms": {
+        "condition": "Реferrence baseline для stored developer message должен инвалидироваться только если сообщение содержит хотя бы один contextual фрагмент И не содержит ни одного non-contextual фрагмента. Поэтому вызывающий код ОБЯЗАН комбинировать is_contextual_dev_message_content(message) AND NOT has_non_contextual_dev_message_content(message). Причина: build_initial_context может склеить rollback-trimmable фрагменты с persistent developer text в одно сообщение",
+        "numbers": null,
+        "formula": "should_invalidate_baseline(message) = is_contextual_dev_message_content(message) AND NOT has_non_contextual_dev_message_content(message); где is_contextual_dev_message_content = message.iter().any(is_contextual_dev_fragment); has_non_contextual_dev_message_content = message.iter().any(|ci| !is_contextual_dev_fragment(ci))",
+        "gwt": {
+          "given": "developer message = [InputText('<permissions instructions>...'), InputText('persistent dev rules')]",
+          "when": "проверка should_invalidate_baseline",
+          "then": "is_contextual = true (первый фрагмент совпадает) AND has_non_contextual = true (второй — нет) → NOT invalidate baseline (сообщение содержит persistent текст наряду с контекстуальным)"
+        }
+      }
+    },
+    {
+      "id": "SRC-0012/rule/user-message-image-tag-stripping",
+      "src": "SRC-0012",
+      "composition": "rule",
+      "terms": {
+        "condition": "При парсинге user message ContentItem::InputText с текстом image open/close tag пропускается (НЕ добавляется в UserInput), если соответствующая соседняя позиция содержит InputImage. Open tag пропускается если следующий элемент (idx+1) — InputImage. Close tag пропускается если idx>0 и предыдущий элемент (idx-1) — InputImage. Проверяются оба варианта тегов: local image (is_local_image_open/close_tag_text) и remote image (is_image_open/close_tag_text)",
+        "numbers": null,
+        "formula": "skip_text_tag = ((is_local_image_open_tag_text(text) OR is_image_open_tag_text(text)) AND matches!(message.get(idx+1), Some(ContentItem::InputImage{..}))) OR (idx > 0 AND (is_local_image_close_tag_text(text) OR is_image_close_tag_text(text)) AND matches!(message.get(idx-1), Some(ContentItem::InputImage{..})))",
+        "gwt": {
+          "given": "message = [InputText('<image>'), InputImage{url='..'}, InputText('</image>')]",
+          "when": "parse_user_message итерирует",
+          "then": "idx=0 InputText: idx+1 = InputImage, is_image_open_tag_text('<image>')=true → continue (skip); idx=1 InputImage → push UserInput::Image; idx=2 InputText: idx-1 = InputImage, is_image_close_tag_text('</image>')=true → continue (skip); результат: один UserInput::Image без обёрток"
+        }
+      }
+    },
+    {
+      "id": "SRC-0012/rule/user-message-contextual-exclusion",
+      "src": "SRC-0012",
+      "composition": "rule",
+      "terms": {
+        "condition": "parse_user_message возвращает None IF is_contextual_user_message_content(message) = true (любой ContentItem в message является contextual_user_fragment). Такие сообщения не становятся UserMessageItem — они rollback-trimmable",
+        "numbers": null,
+        "formula": "parse_user_message(message) = if is_contextual_user_message_content(message) { None } else { Some(UserMessageItem::new(content)) }; где is_contextual_user_message_content = message.iter().any(is_contextual_user_fragment)",
+        "gwt": {
+          "given": "message = [ContentItem, который делегируется в is_contextual_user_fragment и возвращает true]",
+          "when": "parse_user_message(message)",
+          "then": "вернуть None — сообщение не превращается в UserMessageItem (TurnItem::HookPrompt ветка может отработать отдельно)"
+        }
+      }
+    },
+    {
+      "id": "SRC-0012/rule/agent-message-id-default",
+      "src": "SRC-0012",
+      "composition": "rule",
+      "terms": {
+        "condition": "При парсинге assistant message (parse_agent_message) если id отсутствует (None) — id генерируется как Uuid::new_v4().to_string(). Это гарантирует каждому AgentMessageItem уникальный id",
+        "numbers": null,
+        "formula": "agent_message.id = id.cloned().unwrap_or_else(|| Uuid::new_v4().to_string())",
+        "gwt": {
+          "given": "ResponseItem::Message { role: 'assistant', id: None, content: [...], phase: None }",
+          "when": "parse_agent_message(None, content, None)",
+          "then": "agent_message.id = случайный uuid v4 (например '550e8400-e29b-41d4-a716-446655440000'); memory_citation = None (заполнится позже в strip_hidden_assistant_markup_and_parse_memory_citation)"
+        }
+      }
+    },
+    {
+      "id": "SRC-0012/rule/web-search-action-defaults",
+      "src": "SRC-0012",
+      "composition": "rule",
+      "terms": {
+        "condition": "Для ResponseItem::WebSearchCall: если action = None — результирующий action = WebSearchAction::Other и query = пустая строка. Если id = None — результирующий id = пустая строка (String::default через unwrap_or_default)",
+        "numbers": null,
+        "formula": "(action, query) = match action { Some(a) => (a.clone(), web_search_action_detail(a)), None => (WebSearchAction::Other, String::new()) }; id = id.clone().unwrap_or_default()",
+        "gwt": {
+          "given": "ResponseItem::WebSearchCall { id: None, action: None }",
+          "when": "parse_turn_item",
+          "then": "TurnItem::WebSearch(WebSearchItem { id: '', query: '', action: WebSearchAction::Other })"
+        }
+      }
+    },
+    {
+      "id": "SRC-0012/rule/image-artifact-path-formula",
+      "src": "SRC-0012",
+      "composition": "rule",
+      "terms": {
+        "condition": "Путь файла сгенерированного изображения строится как codex_home / 'generated_images' / sanitize(session_id) / '{sanitize(call_id)}.png'. Каждая из двух sanitize() операций применяется отдельно к session_id и call_id. Расширение файла всегда '.png'",
+        "numbers": [
+          {"value": "generated_images", "kind": "имя директории артефактов (GENERATED_IMAGE_ARTIFACTS_DIR const, stream_events_utils.rs:34)"},
+          {"value": ".png", "kind": "расширение файла изображения"}
+        ],
+        "formula": "image_generation_artifact_path(codex_home, session_id, call_id) = codex_home.join('generated_images').join(sanitize(session_id)).join(format!('{}.png', sanitize(call_id)))",
+        "gwt": {
+          "given": "codex_home='/home/u/.codex', session_id='sess-42', call_id='img/007'",
+          "when": "image_generation_artifact_path",
+          "then": "sanitize('sess-42') = 'sess-42' (alphanumeric, - разрешены); sanitize('img/007') = 'img_007' ('/' заменён на '_'); путь = '/home/u/.codex/generated_images/sess-42/img_007.png'"
+        }
+      }
+    },
+    {
+      "id": "SRC-0012/rule/image-path-sanitization",
+      "src": "SRC-0012",
+      "composition": "rule",
+      "terms": {
+        "condition": "sanitize(value) сохраняет только ASCII alphanumeric символы, '-' и '_'; все остальные символы (включая '/', '\\', '.', unicode) заменяются на '_'. IF sanitized result пуст (исходная строка не содержала разрешённых символов) — использовать дефолт 'generated_image'",
+        "numbers": [
+          {"value": "generated_image", "kind": "дефолт при пустом sanitized результате (stream_events_utils.rs:53)"}
+        ],
+        "formula": "sanitize(value) = { let s = value.chars().map(|ch| if ch.is_ascii_alphanumeric() || ch=='-' || ch=='_' { ch } else { '_' }).collect::<String>(); if s.is_empty() { 'generated_image'.to_string() } else { s } }",
+        "gwt": {
+          "given": "value='////'",
+          "when": "sanitize(value)",
+          "then": "map each char: '/' → '_' четыре раза → '____'; is_empty=false → вернуть '____' (не дефолт). Если value='' → is_empty=true → вернуть 'generated_image'"
+        }
+      }
+    },
+    {
+      "id": "SRC-0012/rule/ttft-response-event-eligibility",
+      "src": "SRC-0012",
+      "composition": "rule",
+      "terms": {
+        "condition": "ResponseEvent квалифицируется как first-token-indicator IF (event = OutputItemDone(item) OR OutputItemAdded(item)) AND response_item_records_turn_ttft(item) = true, OR event ∈ {OutputTextDelta, ReasoningSummaryDelta, ReasoningContentDelta}. НЕ квалифицируются: Created, ServerModel, ServerReasoningIncluded, Completed, ReasoningSummaryPartAdded, RateLimits, ModelsEtag",
+        "numbers": null,
+        "formula": "response_event_records_turn_ttft(event) = match event { OutputItemDone(item) | OutputItemAdded(item) => response_item_records_turn_ttft(item), OutputTextDelta(_) | ReasoningSummaryDelta{..} | ReasoningContentDelta{..} => true, Created | ServerModel(_) | ServerReasoningIncluded(_) | Completed{..} | ReasoningSummaryPartAdded{..} | RateLimits(_) | ModelsEtag(_) => false }",
+        "gwt": {
+          "given": "event = ResponseEvent::OutputTextDelta(\"Hello\")",
+          "when": "response_event_records_turn_ttft(event)",
+          "then": "вернуть true → если first_token_at=None, record_turn_ttft захватывает Instant::now() и возвращает Some(Duration с started_at)"
+        }
+      }
+    },
+    {
+      "id": "SRC-0012/rule/ttft-response-item-eligibility",
+      "src": "SRC-0012",
+      "composition": "rule",
+      "terms": {
+        "condition": "ResponseItem (внутри OutputItemDone/Added) квалифицируется для TTFT IF: Message AND raw_assistant_output_text_from_item не пуст; OR Reasoning AND (хотя бы один SummaryText.text не пуст OR хотя бы один ReasoningText/Text элемент в content не пуст); OR variant ∈ {LocalShellCall, FunctionCall, CustomToolCall, ToolSearchCall, WebSearchCall, ImageGenerationCall, GhostSnapshot, Compaction} (always true). НЕ квалифицируются: FunctionCallOutput, CustomToolCallOutput, ToolSearchOutput, Other",
+        "numbers": null,
+        "formula": "response_item_records_turn_ttft(item) = match item { Message{..} => raw_assistant_output_text_from_item(item).is_some_and(|text| !text.is_empty()), Reasoning{summary, content,..} => summary.iter().any(|entry| !text.is_empty()) OR content.as_ref().is_some_and(|entries| entries.iter().any(|entry| !text.is_empty())), LocalShellCall|FunctionCall|CustomToolCall|ToolSearchCall|WebSearchCall|ImageGenerationCall|GhostSnapshot|Compaction => true, FunctionCallOutput|CustomToolCallOutput|ToolSearchOutput|Other => false }",
+        "gwt": {
+          "given": "item = Message { role: 'assistant', content: [OutputText{text: 'Hi'}] }",
+          "when": "response_item_records_turn_ttft(item)",
+          "then": "raw_assistant_output_text_from_item возвращает Some('Hi'); is_some_and(|t| !t.is_empty())=true → вернуть true"
+        }
+      }
+    },
+    {
+      "id": "SRC-0012/rule/ttfm-agent-message-only",
+      "src": "SRC-0012",
+      "composition": "rule",
+      "terms": {
+        "condition": "TTFM (time to first message) записывается ТОЛЬКО для TurnItem::AgentMessage. Для любого другого варианта TurnItem (UserMessage, Reasoning, WebSearch, ImageGeneration, HookPrompt) record_ttfm_for_turn_item возвращает None (метрика не эмитится)",
+        "numbers": null,
+        "formula": "record_ttfm_for_turn_item(item) = if matches!(item, TurnItem::AgentMessage(_)) { state.lock().await.record_turn_ttfm() } else { None }",
+        "gwt": {
+          "given": "item = TurnItem::Reasoning(ReasoningItem{..})",
+          "when": "record_ttfm_for_turn_item",
+          "then": "matches! = false → вернуть None; TURN_TTFM_DURATION_METRIC не эмитится"
+        }
+      }
+    },
+    {
+      "id": "SRC-0012/rule/ttft-ttfm-idempotency",
+      "src": "SRC-0012",
+      "composition": "rule",
+      "terms": {
+        "condition": "record_turn_ttft и record_turn_ttfm идемпотентны: возвращают Some(Duration) только при первом успешном срабатывании. При повторном вызове — если first_token_at (соответственно first_message_at) уже Some — ранний return None. Кроме того, оба требуют started_at = Some (mark_turn_started был вызван); иначе — None",
+        "numbers": null,
+        "formula": "record_turn_ttft(&mut self) = { if self.first_token_at.is_some() { return None; } let started_at = self.started_at?; let now = Instant::now(); self.first_token_at = Some(now); Some(now.duration_since(started_at)) }; record_turn_ttfm — симметрично для first_message_at",
+        "gwt": {
+          "given": "started_at = Some(T0); first_token_at уже Some(T1) после ранее записанного события",
+          "when": "record_turn_ttft(&mut) ещё раз",
+          "then": "first_token_at.is_some() → вернуть None (повторная запись игнорируется); TURN_TTFT_DURATION_METRIC не эмитится дважды"
+        }
+      }
+    },
+    {
+      "id": "SRC-0012/rule/timing-unix-overflow",
+      "src": "SRC-0012",
+      "composition": "rule",
+      "terms": {
+        "condition": "now_unix_timestamp_secs: если SystemTime::now().duration_since(UNIX_EPOCH) вернул Err (время до эпохи) — использовать Duration::default(); если duration.as_secs() не помещается в i64 — i64::MAX. completed_at_and_duration_ms: если started_at.elapsed().as_millis() не помещается в i64 — i64::MAX",
+        "numbers": [
+          {"value": "i64::MAX", "kind": "fallback значение при переполнении для unix secs и duration_ms"},
+          {"value": 0, "kind": "fallback now_unix_timestamp_secs при ошибке duration_since (Duration::default() = 0 секунд)"}
+        ],
+        "formula": "now_unix_timestamp_secs() = i64::try_from(SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs()).unwrap_or(i64::MAX); duration_ms = started_at.map(|s| i64::try_from(s.elapsed().as_millis()).unwrap_or(i64::MAX))",
+        "gwt": {
+          "given": "elapsed.as_millis() возвращает u128 значение большее i64::MAX (например очень долгий процесс или испорченные часы)",
+          "when": "completed_at_and_duration_ms",
+          "then": "i64::try_from возвращает Err → duration_ms = Some(i64::MAX)"
+        }
+      }
+    },
+    {
+      "id": "SRC-0012/rule/mailbox-deferral",
+      "src": "SRC-0012",
+      "composition": "rule",
+      "terms": {
+        "condition": "ResponseItem откладывает mailbox delivery до следующего turn IF: (Message AND role='assistant' AND phase ≠ Some(Commentary) AND last_assistant_message_from_item(item, plan_mode) is_some), OR item = ImageGenerationCall. В остальных случаях — не откладывается. Untagged провайдер (phase = None) трактуется как финальный ответ (безопасный дефолт 'defer')",
+        "numbers": null,
+        "formula": "completed_item_defers_mailbox_delivery_to_next_turn(item, plan_mode) = match item { Message{role, phase,..} => if role != 'assistant' OR matches!(phase, Some(MessagePhase::Commentary)) { false } else { last_assistant_message_from_item(item, plan_mode).is_some() }, ImageGenerationCall{..} => true, _ => false }",
+        "gwt": {
+          "given": "item = Message { role: 'assistant', phase: None, content: [OutputText{text: 'final answer'}] }, plan_mode=false",
+          "when": "completed_item_defers_mailbox_delivery_to_next_turn",
+          "then": "role='assistant' AND phase не Commentary → проверка last_assistant_message_from_item: raw='final answer', stripped (не пуст после strip) → Some(..) → вернуть true → mailbox delivery откладывается"
+        }
+      }
+    },
+    {
+      "id": "SRC-0012/rule/last-assistant-message-stripping",
+      "src": "SRC-0012",
+      "composition": "rule",
+      "terms": {
+        "condition": "last_assistant_message_from_item возвращает Some(stripped) только если: raw_assistant_output_text_from_item дал Some(combined) AND combined не пуст AND strip_hidden_assistant_markup(combined, plan_mode).trim() не пуст. Иначе — None",
+        "numbers": null,
+        "formula": "last_assistant_message_from_item(item, plan_mode) = raw_assistant_output_text_from_item(item).and_then(|combined| { if combined.is_empty() { None } else { let stripped = strip_hidden_assistant_markup(&combined, plan_mode); if stripped.trim().is_empty() { None } else { Some(stripped) } } }); strip_hidden_assistant_markup(text, plan_mode) = { let (wo_cite, _) = strip_citations(text); if plan_mode { strip_proposed_plan_blocks(&wo_cite) } else { wo_cite } }",
+        "gwt": {
+          "given": "item = Message{role:'assistant', content:[OutputText{text:'<memory_citation>..</memory_citation>'}]}, plan_mode=false",
+          "when": "last_assistant_message_from_item",
+          "then": "combined = '<memory_citation>..</memory_citation>'; strip_citations удаляет citation → stripped = ''; stripped.trim().is_empty()=true → вернуть None (сообщение считается пустым после стриппинга)"
+        }
+      }
+    },
+    {
+      "id": "SRC-0012/rule/thread-memory-pollution",
+      "src": "SRC-0012",
+      "composition": "rule",
+      "terms": {
+        "condition": "thread memory помечается как polluted IF turn_context.config.memories.no_memories_if_mcp_or_web_search = true AND response_item_may_include_external_context(item) = true (item ∈ {ToolSearchCall, ToolSearchOutput, WebSearchCall}). В ином случае pollution не устанавливается",
+        "numbers": null,
+        "formula": "mark_thread_memory_mode_polluted_if_external_context = IF !turn_context.config.memories.no_memories_if_mcp_or_web_search OR !response_item_may_include_external_context(item) THEN return (no-op) ELSE state_db::mark_thread_memory_mode_polluted(services.state_db, conversation_id, reason='record_completed_response_item'); response_item_may_include_external_context(item) = matches!(item, ToolSearchCall{..} | ToolSearchOutput{..} | WebSearchCall{..})",
+        "gwt": {
+          "given": "memories.no_memories_if_mcp_or_web_search=true; item = ResponseItem::WebSearchCall{..}",
+          "when": "mark_thread_memory_mode_polluted_if_external_context",
+          "then": "оба условия прошли → вызов state_db::mark_thread_memory_mode_polluted с reason='record_completed_response_item' → thread помечен polluted в state_db"
+        }
+      }
+    },
+    {
+      "id": "SRC-0012/rule/stage1-output-usage-skip-conditions",
+      "src": "SRC-0012",
+      "composition": "rule",
+      "terms": {
+        "condition": "record_stage1_output_usage_for_completed_item пропускает запись IF: raw_assistant_output_text_from_item(item) = None (item не assistant Message); OR after strip_citations thread_ids (из get_thread_id_from_citations) пуст; OR state_db::get_state_db(config) вернул None. Только при прохождении всех проверок — db.record_stage1_output_usage(thread_ids)",
+        "numbers": null,
+        "formula": "record_stage1_output_usage = { let raw = raw_assistant_output_text_from_item(item)?; let (_, citations) = strip_citations(&raw); let thread_ids = get_thread_id_from_citations(citations); if thread_ids.is_empty() { return; } if let Some(db) = state_db::get_state_db(config).await { let _ = db.record_stage1_output_usage(&thread_ids).await; } }",
+        "gwt": {
+          "given": "item = assistant Message с текстом '... <memory_citation>thread_abc</memory_citation> ...'; state_db доступна",
+          "when": "record_stage1_output_usage_for_completed_item",
+          "then": "raw_text получен; strip_citations извлекает citations; get_thread_id_from_citations возвращает ['thread_abc']; thread_ids не пуст; db.record_stage1_output_usage(['thread_abc']) вызывается"
+        }
+      }
+    },
+    {
+      "id": "SRC-0012/rule/git-blob-sha1-formula",
+      "src": "SRC-0012",
+      "composition": "rule",
+      "terms": {
+        "condition": "Локальный git blob OID вычисляется как SHA-1 от префикса 'blob {len}\\0{data}' где len = длина data в байтах и \\0 — NUL-байт разделитель. Используется как fallback когда git hash-object недоступен и always для Symlink (потому что symlink content — байты target, не файл на диске)",
+        "numbers": [
+          {"value": "'blob '", "kind": "git blob header prefix"},
+          {"value": "'\\0'", "kind": "NUL byte separator между header и data"}
+        ],
+        "formula": "git_blob_sha1_hex_bytes(data) = { let header = format!('blob {}\\0', data.len()); let mut hasher = sha1::Sha1::new(); hasher.update(header.as_bytes()); hasher.update(data); hasher.finalize() }",
+        "gwt": {
+          "given": "data = b'hello world' (11 байт)",
+          "when": "git_blob_sha1_hex_bytes(data)",
+          "then": "header = 'blob 11\\0' (8 байт); hasher.update обновляется header затем data; finalize даёт 20 байт SHA-1; hex = '95d09f2b10159347eece71399a7e2e907ea3df4f' (стандартный git hash-object результат для 'hello world' без newline)"
+        }
+      }
+    },
+    {
+      "id": "SRC-0012/rule/git-hash-object-validation",
+      "src": "SRC-0012",
+      "composition": "rule",
+      "terms": {
+        "condition": "git_blob_oid_for_path принимает вывод 'git -C {root} hash-object -- {rel}' IF status.success() = true AND len(trimmed stdout) == 40 (стандартная длина SHA-1 hex). Иначе — вернуть None (используется fallback git_blob_sha1_hex_bytes)",
+        "numbers": [
+          {"value": 40, "kind": "длина SHA-1 hex строки (20 байт = 40 hex символов), turn_diff_tracker.rs:219"}
+        ],
+        "formula": "git_blob_oid_for_path(&self, path) = { let root = self.find_git_root_cached(path)?; let rel = path.strip_prefix(&root).unwrap_or(path); let output = Command::new('git').arg('-C').arg(&root).arg('hash-object').arg('--').arg(rel).output().ok()?; if !output.status.success() { return None; } let s = String::from_utf8_lossy(&output.stdout).trim().to_string(); if s.len() == 40 { Some(s) } else { None } }",
+        "gwt": {
+          "given": "git hash-object возвращает '95d09f2b10159347eece71399a7e2e907ea3df4f\\n' на stdout, exit=0",
+          "when": "git_blob_oid_for_path",
+          "then": "trim → '95d09f2b10159347eece71399a7e2e907ea3df4f' (40 символов) → status.success=true → вернуть Some('95d09f2b10159347eece71399a7e2e907ea3df4f')"
+        }
+      }
+    },
+    {
+      "id": "SRC-0012/rule/file-mode-detection-unix",
+      "src": "SRC-0012",
+      "composition": "rule",
+      "terms": {
+        "condition": "На unix-платформах file_mode_for_path: IF fs::symlink_metadata(path) failed — вернуть None; IF file_type.is_symlink() — вернуть Symlink; IF permissions.mode() & 0o111 != 0 — вернуть Executable; иначе — Regular. На non-unix платформах всегда возвращается Some(Regular) (Executable и Symlink не детектируются)",
+        "numbers": [
+          {"value": "0o111", "kind": "octal bitmask: любой из битов x-права (user/group/other), turn_diff_tracker.rs:416"}
+        ],
+        "formula": "#[cfg(unix)] fn file_mode_for_path(path) = { let meta = fs::symlink_metadata(path).ok()?; let ft = meta.file_type(); if ft.is_symlink() { return Some(FileMode::Symlink); } let mode = meta.permissions().mode(); let is_exec = (mode & 0o111) != 0; Some(if is_exec { FileMode::Executable } else { FileMode::Regular }) }",
+        "gwt": {
+          "given": "path — regular file с permissions 0o755 (rwxr-xr-x) на unix",
+          "when": "file_mode_for_path(path)",
+          "then": "symlink_metadata Ok; is_symlink()=false; mode=0o755; 0o755 & 0o111 = 0o111 ≠ 0 → is_exec=true → вернуть Some(FileMode::Executable)"
+        }
+      }
+    },
+    {
+      "id": "SRC-0012/rule/git-file-mode-strings",
+      "src": "SRC-0012",
+      "composition": "rule",
+      "terms": {
+        "condition": "FileMode::as_str / Display соответствует git octal mode нотации: Regular → '100644', Executable → '100755', Symlink → '120000'. Эти строки используются в заголовках diff ('new file mode', 'deleted file mode', 'old mode', 'new mode')",
+        "numbers": [
+          {"value": "100644", "kind": "git mode string для Regular (turn_diff_tracker.rs:393)"},
+          {"value": "100755", "kind": "git mode string для Executable (turn_diff_tracker.rs:395)"},
+          {"value": "120000", "kind": "git mode string для Symlink (turn_diff_tracker.rs:396)"}
+        ],
+        "formula": "FileMode::as_str(self) = match self { FileMode::Regular => '100644', FileMode::Executable => '100755', FileMode::Symlink => '120000' }",
+        "gwt": {
+          "given": "FileMode::Symlink",
+          "when": "fmt (Display)",
+          "then": "write '120000' → форматированная строка = '120000'; используется в diff как 'new file mode 120000' или 'deleted file mode 120000'"
+        }
+      }
+    },
+    {
+      "id": "SRC-0012/rule/unified-diff-context-radius",
+      "src": "SRC-0012",
+      "composition": "rule",
+      "terms": {
+        "condition": "Unified diff строится с context_radius = 3 (3 строки контекста до и после каждого hunk) — совпадает со стандартным дефолтом git",
+        "numbers": [
+          {"value": 3, "kind": "context_radius unified diff (turn_diff_tracker.rs:346)"}
+        ],
+        "formula": "let diff = similar::TextDiff::from_lines(l, r); let unified = diff.unified_diff().context_radius(3).header(&old_header, &new_header).to_string()",
+        "gwt": {
+          "given": "left='a\\nb\\nc\\nd\\ne\\nf\\ng\\nh', right='a\\nb\\nc\\nd\\nX\\nf\\ng\\nh' (одна строка изменена)",
+          "when": "TextDiff::from_lines(l, r).unified_diff().context_radius(3)",
+          "then": "hunk включает 3 строки до изменения (b,c,d), изменение (-e/+X), 3 строки после (f,g,h)"
+        }
+      }
+    },
+    {
+      "id": "SRC-0012/rule/diff-file-status-branches",
+      "src": "SRC-0012",
+      "composition": "rule",
+      "terms": {
+        "condition": "get_file_diff классифицирует per-file изменение: (A) left_bytes == right_bytes (fast path) — пустая строка; (B) is_add = !left_present AND right_bytes.is_some() — 'new file mode {current_mode}'; (C) is_delete = left_present AND right_bytes.is_none() — 'deleted file mode {baseline_mode}'; (D) baseline_mode != current_mode (без add/delete) — 'old mode {baseline_mode}\\nnew mode {current_mode}'; (E) can_text_diff — unified text diff; (F) иначе — 'Binary files differ'. can_text_diff истина если: обе стороны UTF-8 валидны, ИЛИ is_add с UTF-8 правой, ИЛИ is_delete с UTF-8 левой",
+        "numbers": null,
+        "formula": "let left_present = left_oid.as_str() != ZERO_OID; let is_add = !left_present AND right_bytes.is_some(); let is_delete = left_present AND right_bytes.is_none(); let can_text_diff = matches!((left_text, right_text, is_add, is_delete), (Some(_), Some(_), _, _) | (_, Some(_), true, _) | (Some(_), _, _, true))",
+        "gwt": {
+          "given": "left_oid = '0000000000000000000000000000000000000000' (ZERO_OID, baseline отсутствовал); right_bytes = Some(utf8_bytes('new content')); current_mode = Regular",
+          "when": "get_file_diff",
+          "then": "left_present=false, is_add=true, is_delete=false; добавить 'new file mode 100644\\n'; left_text=None, right_text=Some('new content'); can_text_diff matches (_, Some, true, _) = true → text diff с header DEV_NULL → 'b/{right_display}'"
+        }
+      }
+    },
+    {
+      "id": "SRC-0012/rule/diff-sort-order",
+      "src": "SRC-0012",
+      "composition": "rule",
+      "terms": {
+        "condition": "В get_unified_diff per-file diffs сортируются лексикографически по repo-relative path (через relative_to_git_root_str current_path) — чтобы совпадать с поведением git. Backslashes '\\\\' заменяются на '/' для кроссплатформенной стабильности",
+        "numbers": null,
+        "formula": "baseline_file_names.sort_by_key(|internal| self.get_path_for_internal(internal).map(|p| self.relative_to_git_root_str(&p)).unwrap_or_default()); relative_to_git_root_str(path) = if let Some(root) = find_git_root_cached(path) { if let Ok(rel) = path.strip_prefix(&root) { rel.display().to_string() } else { path.display().to_string() } else { path.display().to_string() }.replace('\\\\', '/')",
+        "gwt": {
+          "given": "два файла internal1→'/repo/src/b.rs', internal2→'/repo/src/a.rs', git_root='/repo'",
+          "when": "get_unified_diff sort",
+          "then": "relative для internal1='src/b.rs', internal2='src/a.rs' → sort: internal2 раньше internal1; diff header для 'src/a.rs' первым"
+        }
+      }
+    },
+    {
+      "id": "SRC-0012/rule/diff-addition-uses-zero-oid",
+      "src": "SRC-0012",
+      "composition": "rule",
+      "terms": {
+        "condition": "Для addition (файл отсутствовал в baseline) BaselineFileInfo создаётся с content=vec![], mode=Regular, oid=ZERO_OID ('0000000000000000000000000000000000000000'). При вычислении diff left_present определяется как left_oid != ZERO_OID; если ZERO_OID — в заголовке '--- /dev/null' (DEV_NULL)",
+        "numbers": [
+          {"value": "0000000000000000000000000000000000000000", "kind": "ZERO_OID — git representation для отсутствующего объекта (turn_diff_tracker.rs:15)"},
+          {"value": "/dev/null", "kind": "DEV_NULL — заголовок diff для отсутствующей стороны (turn_diff_tracker.rs:16)"}
+        ],
+        "formula": "on_patch_begin для addition: BaselineFileInfo { path: path.clone(), content: vec![], mode: FileMode::Regular, oid: ZERO_OID.to_string() }; get_file_diff: left_present = left_oid.as_str() != ZERO_OID; old_header = if left_present { format!('a/{left_display}') } else { DEV_NULL.to_string() }; new_header аналогично через right_bytes.is_some()",
+        "gwt": {
+          "given": "файл /repo/new.txt создан в этом turn (ранее не существовал)",
+          "when": "on_patch_begin → get_file_diff",
+          "then": "baseline oid = ZERO_OID; left_present=false; is_add=true; diff: 'new file mode 100644\\n', index 0000..{right_oid}, '--- /dev/null', '+++ b/new.txt', unified hunks"
+        }
+      }
+    },
+    {
+      "id": "SRC-0012/rule/symlink-blob-platform",
+      "src": "SRC-0012",
+      "composition": "rule",
+      "terms": {
+        "condition": "symlink_blob_bytes на unix читает target через std::fs::read_link и возвращает os_str.as_bytes() (байты символьной ссылки); на non-unix всегда возвращает None (символьные ссылки не обрабатываются как blob). В baseline для Symlink oid всегда вычисляется через git_blob_sha1_hex_bytes локально (не через git hash-object)",
+        "numbers": null,
+        "formula": "#[cfg(unix)] fn symlink_blob_bytes(path) = { let target = std::fs::read_link(path).ok()?; Some(target.as_os_str().as_bytes().to_vec()) }; #[cfg(not(unix))] fn symlink_blob_bytes(_path) = None; в on_patch_begin: let oid = if mode == Some(FileMode::Symlink) { format!('{:x}', git_blob_sha1_hex_bytes(&content)) } else { self.git_blob_oid_for_path(path).unwrap_or_else(|| format!('{:x}', git_blob_sha1_hex_bytes(&content))) }",
+        "gwt": {
+          "given": "path = symlink '/a/link' → '/a/target' на unix",
+          "when": "blob_bytes(path, FileMode::Symlink)",
+          "then": "content = os_str bytes ('/a/target'); oid = формат '{:x}' от sha1('blob 9\\0/a/target') = локальный hash"
+        }
+      }
+    },
+    {
+      "id": "SRC-0012/rule/diff-baseline-immutability",
+      "src": "SRC-0012",
+      "composition": "rule",
+      "terms": {
+        "condition": "В on_patch_begin baseline snapshot создаётся ТОЛЬКО если external path ранее НЕ встречался в external_to_temp_name этом turn'е. IF external_to_temp_name.contains_key(path) — baseline не пересоздаётся (сохраняется исходный). Это гарантирует, что diff вычисляется относительно состояния файла на момент первого patch'а в turn",
+        "numbers": null,
+        "formula": "on_patch_begin(changes): for (path, change) in changes { if !self.external_to_temp_name.contains_key(path) { /* создать baseline — snapshot из диска или ZERO_OID */ } /* обновить rename mapping если FileChange::Update с move_path */ }",
+        "gwt": {
+          "given": "turn: первый patch меняет /foo.txt (baseline захвачен с content='v1'); второй patch снова меняет /foo.txt (сейчас на диске 'v2')",
+          "when": "on_patch_begin для второго patch",
+          "then": "external_to_temp_name.contains_key('/foo.txt') = true → baseline НЕ пересоздаётся → сохраняется content='v1' как baseline; final diff на момент turn end будет против 'v1', не 'v2'"
+        }
+      }
+    },
+    {
+      "id": "SRC-0012/rule/mark-turn-started-reset",
+      "src": "SRC-0012",
+      "composition": "rule",
+      "terms": {
+        "condition": "mark_turn_started устанавливает started_at = Some(Instant) и started_at_unix_secs = now_unix_timestamp_secs, И сбрасывает first_token_at = None и first_message_at = None. Это означает, что перезапуск turn (повторный mark_turn_started) заново разрешает запись TTFT и TTFM",
+        "numbers": null,
+        "formula": "mark_turn_started(&self, started_at: Instant) async { let mut state = self.state.lock().await; state.started_at = Some(started_at); state.started_at_unix_secs = Some(now_unix_timestamp_secs()); state.first_token_at = None; state.first_message_at = None }",
+        "gwt": {
+          "given": "state: started_at=Some(T0), first_token_at=Some(T1), first_message_at=Some(T2)",
+          "when": "mark_turn_started(T3) (повторный вызов)",
+          "then": "started_at=Some(T3); started_at_unix_secs=now; first_token_at=None; first_message_at=None → следующий qualifying event сможет снова записать TTFT"
+        }
+      }
+    },
+    {
+      "id": "SRC-0012/rule/enrichment-task-idempotency",
+      "src": "SRC-0012",
+      "composition": "rule",
+      "terms": {
+        "condition": "spawn_git_enrichment_task идемпотентен: IF repo_root is None — task не запускается (ранний return); IF enrichment_task уже Some (task уже запущен или запускался) — не создаётся новый. Гарантирует ровно одну параллельную git-энричмент задачу для данного TurnMetadataState",
+        "numbers": null,
+        "formula": "spawn_git_enrichment_task(&self) = { if self.repo_root.is_none() { return; } let mut task_guard = self.enrichment_task.lock().unwrap_or_else(PoisonError::into_inner); if task_guard.is_some() { return; } let state = self.clone(); *task_guard = Some(tokio::spawn(async move { ... })) }",
+        "gwt": {
+          "given": "TurnMetadataState с repo_root=Some('/repo'); spawn_git_enrichment_task уже вызван ранее (task_guard содержит Some(JoinHandle))",
+          "when": "второй вызов spawn_git_enrichment_task",
+          "then": "task_guard.is_some()=true → ранний return без создания нового tokio::spawn; JoinHandle первой задачи сохраняется"
+        }
+      }
+    },
+    {
+      "id": "SRC-0012/rule/workspace-metadata-inclusion",
+      "src": "SRC-0012",
+      "composition": "rule",
+      "terms": {
+        "condition": "build_turn_metadata_bag включает запись в workspaces IF repo_root = Some AND workspace_git_metadata = Some AND !workspace_git_metadata.is_empty(). Пустой workspace (все три поля None: associated_remote_urls, latest_git_commit_hash, has_changes) не добавляется. Дополнительно в TurnMetadataWorkspace serde пропускает поля с None через skip_serializing_if",
+        "numbers": null,
+        "formula": "build_turn_metadata_bag: if let (Some(repo_root), Some(workspace_git_metadata)) = (repo_root, workspace_git_metadata) AND !workspace_git_metadata.is_empty() { workspaces.insert(repo_root, workspace_git_metadata.into()); }; WorkspaceGitMetadata::is_empty(&self) = self.associated_remote_urls.is_none() AND self.latest_git_commit_hash.is_none() AND self.has_changes.is_none()",
+        "gwt": {
+          "given": "repo_root=Some('/repo'), workspace = WorkspaceGitMetadata{ associated_remote_urls: None, latest_git_commit_hash: None, has_changes: None }",
+          "when": "build_turn_metadata_bag",
+          "then": "workspace.is_empty()=true → условие if let ... AND !is_empty() не выполнено → workspaces остаётся пустой BTreeMap; в сериализованном TurnMetadataBag поле workspaces skip (skip_serializing_if BTreeMap::is_empty)"
+        }
+      }
+    },
+    {
+      "id": "SRC-0012/rule/metadata-header-priority",
+      "src": "SRC-0012",
+      "composition": "rule",
+      "terms": {
+        "condition": "current_header_value выбирает header в приоритете: enriched_header (если RwLock содержит Some) → base_header (иначе fallback). Затем пытается merge responsesapi_client_metadata. IF merge упал (JSON parse/serialize error) — возвращает исходный header как Some без merge (or(Some(header)))",
+        "numbers": null,
+        "formula": "current_header_value(&self) = { let header = if let Some(h) = self.enriched_header.read().unwrap_or_else(PoisonError::into_inner).as_ref().cloned() { h } else { self.base_header.clone() }; let rc_md = self.responsesapi_client_metadata.read().unwrap_or_else(PoisonError::into_inner).clone(); merge_responsesapi_client_metadata(&header, rc_md.as_ref()).or(Some(header)) }",
+        "gwt": {
+          "given": "enriched_header=None; base_header='{\"session_id\":\"s1\"}'; responsesapi_client_metadata=None",
+          "when": "current_header_value",
+          "then": "header = base_header = '{\"session_id\":\"s1\"}'; merge_responsesapi_client_metadata возвращает None (rc_md=None ранний ?); fallback or(Some(header)) → Some('{\"session_id\":\"s1\"}')"
+        }
+      }
+    },
+    {
+      "id": "SRC-0012/rule/merge-no-overwrite-existing-keys",
+      "src": "SRC-0012",
+      "composition": "rule",
+      "terms": {
+        "condition": "merge_responsesapi_client_metadata НЕ перезаписывает существующие ключи header'а. Для каждой (key, value) из client metadata — entry(key).or_insert_with(|| Value::String(value)) вставляет значение только если ключа ещё нет. Это защищает session_id/turn_id/thread_source от случайной перезаписи клиентскими метаданными",
+        "numbers": null,
+        "formula": "merge_responsesapi_client_metadata(header, rc_md) = { let rc_md = rc_md?; let mut metadata = serde_json::from_str::<Map<String, Value>>(header).ok()?; for (key, value) in rc_md { metadata.entry(key.clone()).or_insert_with(|| Value::String(value.clone())); } serde_json::to_string(&metadata).ok() }",
+        "gwt": {
+          "given": "header='{\"session_id\":\"server_sess\"}', rc_md = {'session_id': 'client_sess', 'custom': 'X'}",
+          "when": "merge_responsesapi_client_metadata",
+          "then": "metadata parsed = {session_id: 'server_sess'}; for session_id: entry уже есть → or_insert_with не вставляет; for custom: entry нет → вставить Value::String('X'); результат: {'session_id':'server_sess','custom':'X'} (session_id сохранён от server)"
+        }
+      }
+    },
+    {
+      "id": "SRC-0012/rule/base-header-fallback-empty-json",
+      "src": "SRC-0012",
+      "composition": "rule",
+      "terms": {
+        "condition": "При конструкции TurnMetadataState.new base_header = base_metadata.to_header_value() ИЛИ '{}' если сериализация вернула None. Гарантирует, что base_header всегда валидный JSON (минимум пустой объект), что важно для последующего merge_responsesapi_client_metadata (который парсит header как JSON Map)",
+        "numbers": [
+          {"value": "{}", "kind": "дефолтный header при неудачной сериализации (turn_metadata.rs:181)"}
+        ],
+        "formula": "let base_header = base_metadata.to_header_value().unwrap_or_else(|| '{}'.to_string())",
+        "gwt": {
+          "given": "base_metadata содержит значения, но serde_json::to_string неожиданно упал (гипотетически)",
+          "when": "TurnMetadataState::new",
+          "then": "base_header = '{}' — корректный пустой JSON; merge_responsesapi_client_metadata сможет корректно распарсить и добавить любые клиентские ключи"
+        }
+      }
+    },
+    {
+      "id": "SRC-0012/rule/poison-lock-recovery",
+      "src": "SRC-0012",
+      "composition": "rule",
+      "terms": {
+        "condition": "При чтении/записи RwLock и Mutex в TurnMetadataState применяется unwrap_or_else(PoisonError::into_inner) — извлекается inner guard даже из отравленного lock'а. Система не падает при panic в другом потоке, удерживавшем lock, и продолжает работу со state'ом (возможно corrupted, но не блокирующим)",
+        "numbers": null,
+        "formula": "*state.enriched_header.write().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(header_value); аналогично для read(), responsesapi_client_metadata, enrichment_task lock",
+        "gwt": {
+          "given": "другой поток panic'ил удерживая enriched_header.write() lock → lock отравлен",
+          "when": "current_header_value вызывает enriched_header.read()",
+          "then": "read() возвращает Err(PoisonError); unwrap_or_else(PoisonError::into_inner) извлекает RwLockReadGuard; чтение продолжается, TurnMetadataState не падает"
+        }
+      }
+    },
+    {
+      "id": "SRC-0012/rule/response-input-to-response-item-coverage",
+      "src": "SRC-0012",
+      "composition": "rule",
+      "terms": {
+        "condition": "response_input_to_response_item поддерживает только 4 варианта маппинга: FunctionCallOutput (1:1 clone), CustomToolCallOutput (1:1 clone), McpToolCallOutput (выполняет as_function_call_output_payload конверсию в FunctionCallOutput), ToolSearchOutput (оборачивает call_id в Some). Все остальные варианты ResponseInputItem → None (не конвертируются в ResponseItem)",
+        "numbers": [
+          {"value": 4, "kind": "количество поддерживаемых вариантов маппинга"}
+        ],
+        "formula": "response_input_to_response_item(input) = match input { FunctionCallOutput{call_id,output} => Some(ResponseItem::FunctionCallOutput{call_id:clone, output:clone}), CustomToolCallOutput{call_id,name,output} => Some(ResponseItem::CustomToolCallOutput{call_id:clone, name:clone, output:clone}), McpToolCallOutput{call_id,output} => Some(ResponseItem::FunctionCallOutput{call_id:clone, output:output.as_function_call_output_payload()}), ToolSearchOutput{call_id,status,execution,tools} => Some(ResponseItem::ToolSearchOutput{call_id:Some(clone), status:clone, execution:clone, tools:clone}), _ => None }",
+        "gwt": {
+          "given": "input = ResponseInputItem::McpToolCallOutput{ call_id: 'c1', output: mcp_output }",
+          "when": "response_input_to_response_item",
+          "then": "output.as_function_call_output_payload() вычисляется; возврат Some(ResponseItem::FunctionCallOutput{call_id:'c1', output: полученный FunctionCallOutputPayload}) — McpToolCallOutput маппится в FunctionCallOutput, а не в отдельный Mcp-вариант"
+        }
+      }
+    }
+  ]
+}

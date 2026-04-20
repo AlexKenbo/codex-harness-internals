@@ -1,0 +1,996 @@
+{
+  "src": "SRC-0005",
+  "schema_version": "2.0",
+  "lens": "use_case",
+  "compositions": [
+    {
+      "id": "SRC-0005/uc.user/initialize-state-runtime",
+      "src": "SRC-0005",
+      "composition": "use_case",
+      "level": "user",
+      "strategic_domain": "управление персистентным состоянием Codex",
+      "terms": {
+        "actor": "Запускающее приложение Codex (CLI/server)",
+        "goal": "Инициализировать persistent state runtime для пользовательского окружения codex_home",
+        "steps": [
+          "1. Приложение вызывает StateRuntime::init(codex_home, default_provider)",
+          "2. StateRuntime создаёт директорию codex_home, если её нет",
+          "3. StateRuntime удаляет файлы legacy state DB (имена unversioned base.sqlite или base_<digit+>.sqlite, отличные от текущей версии, плюс их -wal/-shm/-journal сидекары)",
+          "4. StateRuntime удаляет файлы legacy logs DB по тем же правилам",
+          "5. StateRuntime открывает файл state DB '<base>_<version>.sqlite' и применяет state-мигратор",
+          "6. StateRuntime открывает файл logs DB '<base>_<version>.sqlite' и применяет logs-мигратор",
+          "7. StateRuntime считывает MAX(threads.updated_at_ms) и устанавливает high-water mark монотонных миллисекунд",
+          "8. StateRuntime запускает logs startup maintenance: удаляет логи старше 10 дней, делает WAL checkpoint(TRUNCATE), incremental_vacuum",
+          "9. Приложение получает Arc<StateRuntime>, готовый к работе"
+        ],
+        "extensions (Cockburn)": [
+          {
+            "step": 5,
+            "condition": "не удалось открыть файл state DB",
+            "action": "записать warning «failed to open state db at <path>: <err>» и вернуть ошибку наверх"
+          },
+          {
+            "step": 6,
+            "condition": "не удалось открыть файл logs DB",
+            "action": "записать warning «failed to open logs db at <path>: <err>» и вернуть ошибку наверх"
+          },
+          {
+            "step": 8,
+            "condition": "logs startup maintenance вернул ошибку",
+            "action": "записать warning, но не прерывать инициализацию (runtime считается успешным)"
+          },
+          {
+            "step": 5,
+            "condition": "auto_vacuum в state DB ещё не INCREMENTAL",
+            "action": "выполнить PRAGMA auto_vacuum=INCREMENTAL и одиночный VACUUM (best-effort, ошибки lock игнорируются)"
+          }
+        ],
+        "edge_cases": [
+          {
+            "condition": "директория codex_home недоступна для чтения при cleanup",
+            "action": "записать warning «failed to read codex_home for state/logs db cleanup» и пропустить cleanup"
+          },
+          {
+            "condition": "Windows блокирует удаление .sqlite пока живут -wal/-shm",
+            "action": "удалять файлы в порядке убывания длины имени (сначала сидекары, потом основной файл)"
+          },
+          {
+            "condition": "incremental_vacuum или PRAGMA wal_checkpoint(TRUNCATE) не получили блокировку",
+            "action": "best-effort — продолжить, повтор на следующем запуске"
+          }
+        ],
+        "lifecycle": {
+          "entity": "SRC-0005/entity/state-runtime",
+          "states": [
+            "uninitialized",
+            "state_db_open",
+            "logs_db_open",
+            "ready"
+          ],
+          "transition": {
+            "from": "uninitialized",
+            "to": "ready",
+            "guard": "state DB и logs DB открыты и мигрированы; high-water mark thread_updated_at_millis загружен",
+            "side_effect": "удалены legacy файлы БД старых версий; logs очищены до окна retention"
+          }
+        },
+        "ux": null,
+        "result": "Готовый Arc<StateRuntime> с открытыми пулами state DB и logs DB; legacy файлы удалены; логи старше 10 дней удалены"
+      }
+    },
+    {
+      "id": "SRC-0005/uc.user/persist-thread-from-rollout",
+      "src": "SRC-0005",
+      "composition": "use_case",
+      "level": "user",
+      "strategic_domain": "управление сессиями (тредами) и историей",
+      "terms": {
+        "actor": "Подсистема управления rollout (вызывающая apply_rollout_items)",
+        "goal": "Сохранить или обновить метаданные треда на основе элементов rollout-файла",
+        "steps": [
+          "1. Подсистема rollout вызывает apply_rollout_items(builder, items, new_thread_memory_mode?, updated_at_override?)",
+          "2. StateRuntime загружает существующий ThreadMetadata по builder.id (если есть)",
+          "3. StateRuntime берёт metadata = existing либо builder.build(default_provider) и переустанавливает rollout_path",
+          "4. StateRuntime применяет каждый RolloutItem к metadata через apply_rollout_item",
+          "5. StateRuntime, если existing был, вызывает prefer_existing_git_info чтобы сохранить уже накопленную git-инфо",
+          "6. StateRuntime определяет updated_at: override параметр имеет приоритет, иначе берётся file_modified_time_utc(rollout_path)",
+          "7. StateRuntime upsert'ит тред: для нового — с creation_memory_mode (по умолчанию 'enabled'), для существующего — обычный upsert",
+          "8. StateRuntime извлекает memory_mode из последнего SessionMeta в items и, если найден, обновляет threads.memory_mode",
+          "9. StateRuntime извлекает dynamic_tools из первого SessionMeta и, если присутствуют, persist'ит их once-per-thread",
+          "10. StateRuntime регистрирует thread_spawn_edge: парсит SessionSource::SubAgent::ThreadSpawn(parent_thread_id) и вставляет ребро (parent→child, status='Open') если ещё нет"
+        ],
+        "extensions (Cockburn)": [
+          {
+            "step": 1,
+            "condition": "items пуст",
+            "action": "вернуть Ok без изменений"
+          },
+          {
+            "step": 6,
+            "condition": "файл rollout_path недоступен (mtime не получен) и override отсутствует",
+            "action": "оставить metadata.updated_at без изменения"
+          },
+          {
+            "step": 8,
+            "condition": "set_thread_memory_mode вернул ошибку",
+            "action": "пробросить ошибку наверх (не продолжать)"
+          },
+          {
+            "step": 9,
+            "condition": "persist_dynamic_tools вернул ошибку",
+            "action": "пробросить ошибку наверх"
+          },
+          {
+            "step": 10,
+            "condition": "source не является SessionSource::SubAgent::ThreadSpawn",
+            "action": "пропустить вставку ребра (вернуть Ok)"
+          }
+        ],
+        "edge_cases": [
+          {
+            "condition": "тред уже существует — creation_memory_mode игнорируется в upsert (см. UPSERT не пишет memory_mode)",
+            "action": "сохранить ранее установленный memory_mode (например, 'disabled')"
+          },
+          {
+            "condition": "новые dynamic_tools вызваны после первой записи",
+            "action": "ON CONFLICT(thread_id, position) DO NOTHING — повторно не перезаписывать"
+          },
+          {
+            "condition": "spawn-edge для child уже существует",
+            "action": "ON CONFLICT(child_thread_id) DO NOTHING (сохраняется существующий parent и status)"
+          }
+        ],
+        "lifecycle": {
+          "entity": "SRC-0005/entity/thread",
+          "states": [
+            "absent",
+            "created (memory_mode=enabled by default)",
+            "active (updated_at растёт)",
+            "memory_mode_changed (enabled/disabled/polluted)",
+            "archived",
+            "unarchived",
+            "deleted"
+          ],
+          "transition": {
+            "from": "active",
+            "to": "memory_mode_changed",
+            "guard": "items содержат SessionMeta с memory_mode != null",
+            "side_effect": "threads.memory_mode перезаписан последним значением из items"
+          }
+        },
+        "ux": null,
+        "result": "Тред сохранён в threads (id, rollout_path, метаданные сессии и git-инфа); dynamic_tools зарегистрированы один раз; spawn-edge от parent создан если source — ThreadSpawn"
+      }
+    },
+    {
+      "id": "SRC-0005/uc.user/list-threads-with-pagination",
+      "src": "SRC-0005",
+      "composition": "use_case",
+      "level": "user",
+      "strategic_domain": "поиск и навигация по сессиям",
+      "terms": {
+        "actor": "Клиент (UI/CLI), запрашивающий список тредов",
+        "goal": "Получить страницу тредов по фильтрам с курсором next_anchor",
+        "steps": [
+          "1. Клиент вызывает list_threads(page_size, anchor?, sort_key, allowed_sources, model_providers?, archived_only, search_term?)",
+          "2. StateRuntime запрашивает limit = page_size + 1 (для определения наличия следующей страницы)",
+          "3. StateRuntime фильтрует threads: archived = (1 если archived_only иначе 0), first_user_message <> ''",
+          "4. StateRuntime, если allowed_sources не пуст — добавляет threads.source IN (...)",
+          "5. StateRuntime, если model_providers задан и не пуст — добавляет threads.model_provider IN (...)",
+          "6. StateRuntime, если search_term задан — добавляет instr(threads.title, search_term) > 0",
+          "7. StateRuntime, если anchor задан — добавляет (sort_column < anchor_ts OR (sort_column = anchor_ts AND id < anchor.id))",
+          "8. StateRuntime сортирует по sort_column (created_at_ms или updated_at_ms) DESC, id DESC, LIMIT limit",
+          "9. StateRuntime десериализует строки в ThreadMetadata; если их > page_size — pop последнюю и берёт next_anchor из последней оставшейся",
+          "10. Клиент получает ThreadsPage{items, next_anchor, num_scanned_rows}"
+        ],
+        "extensions (Cockburn)": [
+          {
+            "step": 4,
+            "condition": "allowed_sources пуст",
+            "action": "не добавлять фильтр по источникам"
+          },
+          {
+            "step": 5,
+            "condition": "model_providers None или пуст",
+            "action": "не добавлять фильтр по провайдеру"
+          },
+          {
+            "step": 7,
+            "condition": "anchor None",
+            "action": "не добавлять курсорный фильтр"
+          },
+          {
+            "step": 9,
+            "condition": "число строк <= page_size",
+            "action": "next_anchor = None (это последняя страница)"
+          }
+        ],
+        "edge_cases": [
+          {
+            "condition": "тред с тем же sort_ts что anchor",
+            "action": "tiebreak по id < anchor.id для устойчивого порядка"
+          },
+          {
+            "condition": "тред с пустым first_user_message",
+            "action": "исключается из выдачи всегда"
+          }
+        ],
+        "lifecycle": null,
+        "ux": null,
+        "result": "ThreadsPage с items, next_anchor (или None) и num_scanned_rows; устойчивая пагинация по (sort_ts, id)"
+      }
+    },
+    {
+      "id": "SRC-0005/uc.user/archive-thread",
+      "src": "SRC-0005",
+      "composition": "use_case",
+      "level": "user",
+      "strategic_domain": "управление сессиями (тредами) и историей",
+      "terms": {
+        "actor": "Подсистема управления rollout (или пользовательский клиент через mark_archived)",
+        "goal": "Пометить тред как архивный (или снять архив) и обновить путь rollout",
+        "steps": [
+          "1. Вызывающий вызывает mark_archived(thread_id, rollout_path, archived_at) либо mark_unarchived(thread_id, rollout_path)",
+          "2. StateRuntime загружает ThreadMetadata по thread_id",
+          "3. StateRuntime устанавливает metadata.archived_at = Some(archived_at) (или None для unarchive)",
+          "4. StateRuntime переустанавливает metadata.rollout_path = новый путь",
+          "5. StateRuntime, если file_modified_time_utc(rollout_path) доступен, переустанавливает metadata.updated_at",
+          "6. StateRuntime сравнивает metadata.id с переданным thread_id; при несовпадении — записывает warning «thread id mismatch during (un)archive»",
+          "7. StateRuntime upsert'ит обновлённый ThreadMetadata"
+        ],
+        "extensions (Cockburn)": [
+          {
+            "step": 2,
+            "condition": "тред не найден",
+            "action": "вернуть Ok без изменений"
+          },
+          {
+            "step": 5,
+            "condition": "файл rollout_path недоступен",
+            "action": "оставить metadata.updated_at без изменения"
+          }
+        ],
+        "edge_cases": [
+          {
+            "condition": "повторный archive с тем же archived_at",
+            "action": "просто перезапишет колонку archived_at тем же значением"
+          }
+        ],
+        "lifecycle": {
+          "entity": "SRC-0005/entity/thread",
+          "states": [
+            "active (archived=0)",
+            "archived (archived=1, archived_at установлен)"
+          ],
+          "transition": {
+            "from": "active",
+            "to": "archived",
+            "guard": "mark_archived с переданным archived_at",
+            "side_effect": "обновлён rollout_path; updated_at = mtime файла rollout если доступен"
+          }
+        },
+        "ux": null,
+        "result": "Тред помечен как архивный (или снят с архива) с сохранением актуального rollout_path и updated_at"
+      }
+    },
+    {
+      "id": "SRC-0005/uc.user/insert-and-prune-logs",
+      "src": "SRC-0005",
+      "composition": "use_case",
+      "level": "user",
+      "strategic_domain": "управление логами процесса и тредов",
+      "terms": {
+        "actor": "Подсистема логгирования (вызывающая insert_logs)",
+        "goal": "Записать пакет логов и удержать персистентный объём логов в пределах бюджетов на партицию",
+        "steps": [
+          "1. Подсистема логирования вызывает insert_logs(entries[])",
+          "2. StateRuntime открывает транзакцию в logs DB",
+          "3. StateRuntime вычисляет estimated_bytes для каждой записи: длина feedback_log_body (или message как fallback) + длины level + target + module_path + file",
+          "4. StateRuntime вставляет batch INSERT в logs",
+          "5. StateRuntime запускает prune_logs_after_insert внутри той же транзакции (читатели не видят 'inserted but not pruned')",
+          "6. StateRuntime для каждого затронутого thread_id, у которого SUM(estimated_bytes) > 10 MiB или COUNT(*) > 1000, удаляет старейшие строки так, чтобы кумулятивный размер не превышал 10 MiB и количество не превышало 1000",
+          "7. StateRuntime для threadless строк выполняет тот же budget per process_uuid (включая отдельную партицию для process_uuid IS NULL)",
+          "8. StateRuntime коммитит транзакцию"
+        ],
+        "extensions (Cockburn)": [
+          {
+            "step": 1,
+            "condition": "entries пуст",
+            "action": "вернуть Ok без открытия транзакции"
+          },
+          {
+            "step": 6,
+            "condition": "одиночная вставленная строка > 10 MiB",
+            "action": "она будет удалена тем же prune (будджет 0 → строка попадает под условие cumulative > LIMIT)"
+          },
+          {
+            "step": 7,
+            "condition": "одиночная threadless строка с NULL process_uuid > 10 MiB",
+            "action": "удаляется тем же prune-шагом"
+          }
+        ],
+        "edge_cases": [
+          {
+            "condition": "feedback_log_body отсутствует, но message задан",
+            "action": "feedback_log_body берётся из message (write-time fallback для legacy callers)"
+          },
+          {
+            "condition": "ровно 1001 строка одного треда",
+            "action": "удаляется самая старая (1 строка) — остаётся ровно 1000"
+          },
+          {
+            "condition": "ровно 11 MiB одного rendered body на треде",
+            "action": "удаляется новейшая строка (она же единственная), партиция становится пустой"
+          }
+        ],
+        "lifecycle": null,
+        "ux": null,
+        "result": "Логи записаны атомарно с применённым retention; персистентный объём на партицию не превышает 10 MiB и 1000 строк"
+      }
+    },
+    {
+      "id": "SRC-0005/uc.user/query-feedback-logs-for-threads",
+      "src": "SRC-0005",
+      "composition": "use_case",
+      "level": "user",
+      "strategic_domain": "сбор отчёта обратной связи по тредам",
+      "terms": {
+        "actor": "Команда /feedback (или подсистема отчётности)",
+        "goal": "Собрать отрендеренный поток feedback-логов по списку тредов в пределах SQLite retention budget",
+        "steps": [
+          "1. Подсистема вызывает query_feedback_logs_for_threads(thread_ids)",
+          "2. StateRuntime для каждого запрошенного треда определяет latest process_uuid (последний процесс, в котором этот тред оставлял логи)",
+          "3. StateRuntime выбирает все строки логов с непустым feedback_log_body, относящиеся либо к запрошенным тредам, либо threadless того же latest process_uuid",
+          "4. StateRuntime ограничивает выборку через cumulative_estimated_bytes <= 10 MiB (newest first), затем форматирует строки format_feedback_log_line",
+          "5. StateRuntime последовательно добавляет строки от новейшей к старейшей пока total_bytes + line.len <= 10 MiB",
+          "6. StateRuntime инвертирует порядок в результат (от старой к новой) и возвращает Vec<u8>"
+        ],
+        "extensions (Cockburn)": [
+          {
+            "step": 1,
+            "condition": "thread_ids пуст",
+            "action": "вернуть пустой Vec<u8> без запроса к БД"
+          },
+          {
+            "step": 5,
+            "condition": "одиночная новейшая строка > 10 MiB",
+            "action": "она исключается (total_bytes + line.len превышает бюджет — break, итог пуст)"
+          },
+          {
+            "step": 3,
+            "condition": "тред не имеет ни одного process_uuid",
+            "action": "threadless строки для этого треда не подмешиваются (latest_processes даст NULL)"
+          }
+        ],
+        "edge_cases": [
+          {
+            "condition": "запрошены 2 треда, каждый с своим latest process; threadless строки обоих процессов входят в выдачу",
+            "action": "обе подмешиваются; threadless третьего process_uuid (не из latest) — нет"
+          },
+          {
+            "condition": "predшествующий процесс того же треда оставил threadless логи",
+            "action": "они исключаются (учитывается только latest process_uuid)"
+          }
+        ],
+        "lifecycle": null,
+        "ux": null,
+        "result": "Vec<u8> с отрендеренными строками feedback_log_body в хронологическом порядке, общий размер <= 10 MiB"
+      }
+    },
+    {
+      "id": "SRC-0005/uc.user/run-batch-agent-job",
+      "src": "SRC-0005",
+      "composition": "use_case",
+      "level": "user",
+      "strategic_domain": "автоматизация массовой обработки CSV-входа агентом",
+      "terms": {
+        "actor": "Подсистема batch-выполнения (создающая задание и распределяющая item'ы по тредам)",
+        "goal": "Создать batch-задание агента и провести каждый item через жизненный цикл до завершения",
+        "steps": [
+          "1. Подсистема вызывает create_agent_job(params, items[]) — в одной транзакции вставляет agent_jobs (status=Pending) и agent_job_items (status=Pending)",
+          "2. Подсистема вызывает mark_agent_job_running(job_id) — переводит job в Running, фиксирует started_at если ещё не задан",
+          "3. Для каждой свободной item подсистема вызывает mark_agent_job_item_running_with_thread(job_id, item_id, thread_id) — это переводит item из Pending в Running, привязывает thread_id, инкрементит attempt_count",
+          "4. Подсистема при завершении item получает результат и вызывает report_agent_job_item_result(job_id, item_id, reporting_thread_id, result_json) — атомарно завершает item только если он Running и assigned_thread_id совпадает",
+          "5. Подсистема периодически вызывает get_agent_job_progress(job_id), чтобы получить количество total/pending/running/completed/failed",
+          "6. По завершении всех item подсистема вызывает mark_agent_job_completed(job_id) либо mark_agent_job_failed(job_id, error)"
+        ],
+        "extensions (Cockburn)": [
+          {
+            "step": 4,
+            "condition": "report пришёл когда item уже Failed (поздний reporting)",
+            "action": "rows_affected=0 — report отвергается, статус остаётся Failed"
+          },
+          {
+            "step": 4,
+            "condition": "reporting_thread_id не совпадает с assigned_thread_id",
+            "action": "rows_affected=0 — report отвергается"
+          },
+          {
+            "step": 3,
+            "condition": "item уже не Pending",
+            "action": "mark_agent_job_item_running_with_thread вернёт false (rows_affected=0)"
+          },
+          {
+            "step": 6,
+            "condition": "вызов mark_agent_job_cancelled(job_id, reason)",
+            "action": "переводит job в Cancelled только если status IN (Pending, Running); записывает reason в last_error; возвращает true если изменено"
+          },
+          {
+            "step": 4,
+            "condition": "item упал, нужно вернуть в очередь",
+            "action": "вызвать mark_agent_job_item_pending(job_id, item_id, error_message?) — переводит из Running в Pending, очищает assigned_thread_id, пишет last_error"
+          },
+          {
+            "step": 4,
+            "condition": "item упал окончательно",
+            "action": "вызвать mark_agent_job_item_failed(job_id, item_id, error) — переводит из Running в Failed, фиксирует completed_at и last_error"
+          }
+        ],
+        "edge_cases": [
+          {
+            "condition": "повторная попытка mark_agent_job_item_running после восстановления из Pending",
+            "action": "attempt_count инкрементится на каждом возврате в Running"
+          },
+          {
+            "condition": "item помечен Completed без result_json",
+            "action": "mark_agent_job_item_completed требует result_json IS NOT NULL — иначе не пометит (rows_affected=0)"
+          }
+        ],
+        "lifecycle": {
+          "entity": "SRC-0005/entity/agent-job-item",
+          "states": [
+            "Pending",
+            "Running (assigned_thread_id != NULL)",
+            "Completed (result_json есть, reported_at заполнен)",
+            "Failed (last_error заполнен)"
+          ],
+          "transition": {
+            "from": "Running",
+            "to": "Completed",
+            "guard": "report пришёл от того же thread_id что был assigned, status=Running",
+            "side_effect": "result_json сохранён, reported_at=completed_at=updated_at=now, assigned_thread_id очищен"
+          }
+        },
+        "ux": null,
+        "result": "Все item обработаны: каждый Completed (с result_json) или Failed (с last_error). Job в финальном статусе Completed/Failed/Cancelled"
+      }
+    },
+    {
+      "id": "SRC-0005/uc.user/coordinate-rollout-backfill",
+      "src": "SRC-0005",
+      "composition": "use_case",
+      "level": "user",
+      "strategic_domain": "однократное восстановление метаданных rollout-файлов",
+      "terms": {
+        "actor": "Worker процесса, выполняющий backfill метаданных rollout",
+        "goal": "Гарантировать, что backfill запускается одним worker'ом за раз и доводится до завершения с persisted watermark",
+        "steps": [
+          "1. Worker вызывает try_claim_backfill(lease_seconds)",
+          "2. StateRuntime ensure_backfill_state_row — INSERT ON CONFLICT(id=1) DO NOTHING (status=Pending)",
+          "3. StateRuntime UPDATE backfill_state SET status=Running, updated_at=now WHERE id=1 AND status != Complete AND (status != Running OR updated_at <= now - lease_seconds)",
+          "4. StateRuntime возвращает true если rows_affected=1, иначе false",
+          "5. Если claimed — Worker периодически вызывает checkpoint_backfill(watermark) для записи прогресса",
+          "6. По завершении Worker вызывает mark_backfill_complete(last_watermark?): status=Complete, last_watermark=COALESCE(arg, существующий), last_success_at=now, updated_at=now"
+        ],
+        "extensions (Cockburn)": [
+          {
+            "step": 4,
+            "condition": "статус Complete",
+            "action": "вернуть false — backfill уже завершён"
+          },
+          {
+            "step": 4,
+            "condition": "статус Running и updated_at > now - lease_seconds (lease ещё активен у другого worker)",
+            "action": "вернуть false — конкурент держит lease"
+          },
+          {
+            "step": 4,
+            "condition": "статус Running но updated_at <= now - lease_seconds (lease протух)",
+            "action": "захватить (вернуть true)"
+          }
+        ],
+        "edge_cases": [
+          {
+            "condition": "повторный try_claim после собственного успешного claim",
+            "action": "вернёт false — текущая запись уже Running, lease ещё свежий (just-now updated_at)"
+          },
+          {
+            "condition": "claim после mark_backfill_complete",
+            "action": "вернёт false — singleton row в Complete"
+          }
+        ],
+        "lifecycle": {
+          "entity": "SRC-0005/entity/backfill-state",
+          "states": [
+            "Pending",
+            "Running (lease активен)",
+            "Running (lease протух)",
+            "Complete"
+          ],
+          "transition": {
+            "from": "Pending",
+            "to": "Running",
+            "guard": "try_claim_backfill при отсутствии конкурирующего активного lease",
+            "side_effect": "updated_at=now — lease начинает отсчёт"
+          }
+        },
+        "ux": null,
+        "result": "Singleton-запись backfill_state в нужном статусе: Running с обновлённым watermark или Complete с last_success_at; гарантия что одновременно работает не более одного worker'а"
+      }
+    },
+    {
+      "id": "SRC-0005/uc.user/upsert-remote-control-enrollment",
+      "src": "SRC-0005",
+      "composition": "use_case",
+      "level": "user",
+      "strategic_domain": "управление подключениями к remote-control серверу",
+      "terms": {
+        "actor": "Подсистема remote-control (клиент)",
+        "goal": "Зарегистрировать или обновить запись о привязке к серверу remote-control для (websocket_url, account_id, app_server_client_name?)",
+        "steps": [
+          "1. Подсистема вызывает upsert_remote_control_enrollment(record)",
+          "2. StateRuntime вычисляет ключ app_server_client_name: Some(s) → s, None → пустая строка",
+          "3. StateRuntime INSERT remote_control_enrollments ON CONFLICT(websocket_url, account_id, app_server_client_name) DO UPDATE: server_id, environment_id, server_name, updated_at",
+          "4. Подсистема может вызвать get_remote_control_enrollment(websocket_url, account_id, app_server_client_name?) для проверки",
+          "5. StateRuntime вернёт Some(record) с восстановленным app_server_client_name (пустая строка → None)",
+          "6. Подсистема может вызвать delete_remote_control_enrollment(...) — DELETE по тому же ключу, возвращает количество удалённых строк"
+        ],
+        "extensions (Cockburn)": [
+          {
+            "step": 5,
+            "condition": "запись отсутствует",
+            "action": "вернуть None"
+          },
+          {
+            "step": 5,
+            "condition": "клиент с другим именем (other-client) для того же account/url",
+            "action": "вернуть None — это другой ключ"
+          },
+          {
+            "step": 6,
+            "condition": "удаление с другим account_id или другим клиентом",
+            "action": "удалит только точно совпадающую запись (обычно 1 или 0 строк)"
+          }
+        ],
+        "edge_cases": [
+          {
+            "condition": "app_server_client_name = None vs Some('')",
+            "action": "оба маппятся на пустую строку в БД — становятся одним ключом"
+          }
+        ],
+        "lifecycle": null,
+        "ux": null,
+        "result": "Запись enrollments создана или обновлена; ключ изоляции — (websocket_url, account_id, app_server_client_name); обновлённое updated_at = now"
+      }
+    },
+    {
+      "id": "SRC-0005/uc.user/run-thread-memory-extraction",
+      "src": "SRC-0005",
+      "composition": "use_case",
+      "level": "user",
+      "strategic_domain": "извлечение памяти из тредов (stage-1 пайплайна памяти)",
+      "terms": {
+        "actor": "Worker thread (current_thread_id), запускающий стартовый скан stage-1 заданий",
+        "goal": "Захватить и довести до конца stage-1 задания памяти для устаревших чужих тредов в пределах max_running_jobs",
+        "steps": [
+          "1. Worker вызывает claim_stage1_jobs_for_startup(current_thread_id, params)",
+          "2. StateRuntime фильтрует threads через push_thread_filters (archived=0, allowed_sources, first_user_message<>'')",
+          "3. StateRuntime отбрасывает threads с memory_mode != 'enabled' и тред с id == current_thread_id",
+          "4. StateRuntime оставляет threads с updated_at_ms BETWEEN max_age_cutoff (now - max_age_days) AND idle_cutoff (now - min_rollout_idle_hours)",
+          "5. StateRuntime оставляет threads, у которых ((COALESCE(stage1_outputs.source_updated_at, -1) + 1) * 1000) <= updated_at_ms И ((COALESCE(jobs.last_success_watermark, -1) + 1) * 1000) <= updated_at_ms",
+          "6. StateRuntime сортирует по updated_at_ms DESC, id DESC и применяет LIMIT scan_limit",
+          "7. Для каждого треда из выборки Worker вызывает try_claim_stage1_job(thread.id, current_thread_id, source_updated_at=thread.updated_at.timestamp(), lease_seconds, max_running_jobs)",
+          "8. При Stage1JobClaimOutcome::Claimed{ownership_token} — Worker добавляет в результат и продолжает пока claimed.len() < max_claimed",
+          "9. Worker выполняет stage-1 экстракцию для каждого захваченного треда и фиксирует результат",
+          "10. На успехе с output Worker вызывает mark_stage1_job_succeeded(thread_id, ownership_token, source_updated_at, raw_memory, rollout_summary, rollout_slug?)",
+          "11. На успехе без output — mark_stage1_job_succeeded_no_output (удаляется существующая stage1_outputs строка и enqueue global consolidation, если удаление случилось)",
+          "12. На ошибке — mark_stage1_job_failed(thread_id, ownership_token, failure_reason, retry_delay_seconds): status=error, retry_at=now+delay, retry_remaining-=1"
+        ],
+        "extensions (Cockburn)": [
+          {
+            "step": 1,
+            "condition": "scan_limit=0 или max_claimed=0",
+            "action": "вернуть пустой Vec без запроса к БД"
+          },
+          {
+            "step": 7,
+            "condition": "stage1_outputs.source_updated_at >= source_updated_at",
+            "action": "SkippedUpToDate — пропустить"
+          },
+          {
+            "step": 7,
+            "condition": "jobs.last_success_watermark >= source_updated_at",
+            "action": "SkippedUpToDate"
+          },
+          {
+            "step": 7,
+            "condition": "глобальный count(running с lease > now) для kind=memory_stage1 уже >= max_running_jobs",
+            "action": "SkippedRunning"
+          },
+          {
+            "step": 7,
+            "condition": "существующий job retry_remaining <= 0",
+            "action": "SkippedRetryExhausted"
+          },
+          {
+            "step": 7,
+            "condition": "existing.retry_at > now",
+            "action": "SkippedRetryBackoff"
+          },
+          {
+            "step": 7,
+            "condition": "existing running с активным lease",
+            "action": "SkippedRunning"
+          },
+          {
+            "step": 10,
+            "condition": "stage1_outputs.source_updated_at в БД старше или равно — переупсертить, иначе игнорировать (WHERE excluded.source_updated_at >= existing)",
+            "action": "сохраняется более свежий output"
+          }
+        ],
+        "edge_cases": [
+          {
+            "condition": "input_watermark в claim продвинулся (excluded.input_watermark > existing) — даже когда retry_remaining=0",
+            "action": "разрешить захват и сбросить retry_remaining до DEFAULT_RETRY_REMAINING=3"
+          },
+          {
+            "condition": "ownership_token не совпадает в mark_*_job_succeeded/failed",
+            "action": "rows_affected=0 — операция отвергается (защита от потери ownership)"
+          },
+          {
+            "condition": "одновременно > max_running_jobs воркеров пытаются захватить",
+            "action": "лимит соблюдается через подзапрос в WHERE при INSERT и в UPSERT"
+          }
+        ],
+        "lifecycle": {
+          "entity": "SRC-0005/entity/job",
+          "states": [
+            "pending",
+            "running (с ownership_token и lease_until)",
+            "done (last_success_watermark = input_watermark)",
+            "error (retry_at назначен, retry_remaining уменьшен)"
+          ],
+          "transition": {
+            "from": "running",
+            "to": "done",
+            "guard": "ownership_token совпадает И status=running",
+            "side_effect": "stage1_outputs upsert (если есть output) либо delete (если нет output); enqueue global phase-2 consolidation"
+          }
+        },
+        "ux": null,
+        "result": "До max_claimed stage-1 заданий выполнены; stage1_outputs обновлены или удалены; global consolidation job (memory_consolidate_global, job_key='global') получил input_watermark и переведён в pending (или сохранён running)"
+      }
+    },
+    {
+      "id": "SRC-0005/uc.user/consolidate-global-memory",
+      "src": "SRC-0005",
+      "composition": "use_case",
+      "level": "user",
+      "strategic_domain": "глобальная консолидация памяти (phase-2)",
+      "terms": {
+        "actor": "Worker глобальной консолидации памяти",
+        "goal": "Захватить singleton phase-2 job, выполнить консолидацию выбранных stage-1 outputs и обновить baseline selected_for_phase2",
+        "steps": [
+          "1. Worker вызывает try_claim_global_phase2_job(worker_id, lease_seconds)",
+          "2. StateRuntime открывает BEGIN IMMEDIATE и читает singleton row jobs(kind=memory_consolidate_global, job_key='global')",
+          "3. StateRuntime возвращает SkippedNotDirty если input_watermark <= last_success_watermark, retry_remaining<=0 или retry_at>now; SkippedRunning если status=running и lease ещё активен",
+          "4. Иначе StateRuntime UPDATE: status=running, ownership_token=новый UUID, lease_until=now+lease_seconds, retry_at=NULL",
+          "5. Worker вызывает get_phase2_input_selection(n, max_unused_days), чтобы получить selected stage-1 outputs (current), previous_selected (selected_for_phase2=1) и retained/removed",
+          "6. Worker периодически вызывает heartbeat_global_phase2_job(ownership_token, lease_seconds), чтобы продлить lease_until",
+          "7. Worker выполняет консолидацию выбранных outputs (внешняя логика)",
+          "8. На успехе Worker вызывает mark_global_phase2_job_succeeded(token, completed_watermark, selected_outputs[]): UPDATE jobs SET status=done, last_success_watermark=max(существ, completed_watermark); сбрасывает selected_for_phase2=0 и selected_for_phase2_source_updated_at=NULL во всех stage1_outputs; затем для каждого selected_outputs устанавливает selected_for_phase2=1 и selected_for_phase2_source_updated_at = output.source_updated_at",
+          "9. На ошибке Worker вызывает mark_global_phase2_job_failed(token, reason, retry_delay_seconds) либо mark_global_phase2_job_failed_if_unowned (если ownership мог быть утерян)"
+        ],
+        "extensions (Cockburn)": [
+          {
+            "step": 2,
+            "condition": "singleton row отсутствует",
+            "action": "SkippedNotDirty (нет дёрнутой задачи)"
+          },
+          {
+            "step": 3,
+            "condition": "input_watermark <= last_success_watermark",
+            "action": "SkippedNotDirty"
+          },
+          {
+            "step": 3,
+            "condition": "retry_remaining <= 0",
+            "action": "SkippedNotDirty"
+          },
+          {
+            "step": 3,
+            "condition": "retry_at > now",
+            "action": "SkippedNotDirty"
+          },
+          {
+            "step": 3,
+            "condition": "status=running и lease_until > now",
+            "action": "SkippedRunning"
+          },
+          {
+            "step": 4,
+            "condition": "UPDATE rows_affected=0 (race с другим worker)",
+            "action": "вернуть SkippedRunning"
+          },
+          {
+            "step": 8,
+            "condition": "ownership_token не совпадает (потеря ownership)",
+            "action": "rows_affected=0 — succeeded не применён"
+          },
+          {
+            "step": 9,
+            "condition": "обычный fail но ownership мог быть утерян",
+            "action": "вызвать _failed_if_unowned — то же UPDATE с дополнительным условием ownership_token IS NULL допустимо"
+          }
+        ],
+        "edge_cases": [
+          {
+            "condition": "selected_outputs[] пуст в succeeded",
+            "action": "сброс selected_for_phase2=0 у всех существующих, новый baseline пуст"
+          },
+          {
+            "condition": "thread_id больше не существует или source_updated_at не совпадает",
+            "action": "UPDATE selected_for_phase2=1 не сработает — этот output не отметится"
+          }
+        ],
+        "lifecycle": {
+          "entity": "SRC-0005/entity/job",
+          "states": [
+            "pending (из enqueue_global_consolidation)",
+            "running (с ownership_token и lease)",
+            "done (last_success_watermark обновлён)",
+            "error (retry_at назначен)"
+          ],
+          "transition": {
+            "from": "running",
+            "to": "done",
+            "guard": "mark_global_phase2_job_succeeded с правильным ownership_token",
+            "side_effect": "selected_for_phase2 baseline переписан в stage1_outputs"
+          }
+        },
+        "ux": null,
+        "result": "Phase-2 job переведён в done с last_success_watermark = max(prev, completed_watermark); stage1_outputs имеют новый baseline selected_for_phase2 + сохранённый selected_for_phase2_source_updated_at для diff"
+      }
+    },
+    {
+      "id": "SRC-0005/uc.user/mark-thread-memory-polluted",
+      "src": "SRC-0005",
+      "composition": "use_case",
+      "level": "user",
+      "strategic_domain": "управление качеством памяти тредов",
+      "terms": {
+        "actor": "Подсистема контроля качества памяти треда",
+        "goal": "Пометить тред как 'polluted' (исключить из memory) и при необходимости запустить переконсолидацию phase-2",
+        "steps": [
+          "1. Подсистема вызывает mark_thread_memory_mode_polluted(thread_id)",
+          "2. StateRuntime открывает транзакцию",
+          "3. StateRuntime UPDATE threads SET memory_mode='polluted' WHERE id=? AND memory_mode != 'polluted'",
+          "4. Если rows_affected=0 — коммитит и возвращает false (тред уже polluted или не найден)",
+          "5. StateRuntime SELECT selected_for_phase2 FROM stage1_outputs WHERE thread_id=?",
+          "6. Если selected_for_phase2 != 0 — вызывает enqueue_global_consolidation_with_executor(tx, now): INSERT/UPSERT jobs(memory_consolidate_global, 'global') с input_watermark=now (для фазы phase-2 forgetting)",
+          "7. StateRuntime коммитит транзакцию и возвращает true"
+        ],
+        "extensions (Cockburn)": [
+          {
+            "step": 4,
+            "condition": "тред уже 'polluted' или отсутствует",
+            "action": "вернуть false (rows_affected=0)"
+          },
+          {
+            "step": 6,
+            "condition": "тред не входил в текущий phase-2 baseline (selected_for_phase2=0 или нет stage1_outputs)",
+            "action": "не enqueue'ить — phase-2 пересчёт не нужен"
+          }
+        ],
+        "edge_cases": [
+          {
+            "condition": "повторный mark_polluted",
+            "action": "вернёт false без побочных эффектов"
+          }
+        ],
+        "lifecycle": {
+          "entity": "SRC-0005/entity/thread",
+          "states": [
+            "enabled (memory_mode)",
+            "disabled",
+            "polluted"
+          ],
+          "transition": {
+            "from": "enabled",
+            "to": "polluted",
+            "guard": "mark_thread_memory_mode_polluted и текущий mode != 'polluted'",
+            "side_effect": "если тред был в phase-2 baseline — enqueue global consolidation для forgetting"
+          }
+        },
+        "ux": null,
+        "result": "Тред помечен как polluted; если был в phase-2 baseline — phase-2 job получает новый input_watermark (always продвигается через 'COALESCE(jobs.input_watermark,0)+1' если now не больше)"
+      }
+    },
+    {
+      "id": "SRC-0005/uc.user/clear-memory-data",
+      "src": "SRC-0005",
+      "composition": "use_case",
+      "level": "user",
+      "strategic_domain": "сброс хранилища памяти",
+      "terms": {
+        "actor": "Подсистема reset (или пользовательский админ-вызов)",
+        "goal": "Полностью очистить персистентное состояние памяти за одну транзакцию",
+        "steps": [
+          "1. Подсистема вызывает clear_memory_data()",
+          "2. StateRuntime открывает транзакцию",
+          "3. StateRuntime DELETE FROM stage1_outputs",
+          "4. StateRuntime DELETE FROM jobs WHERE kind = 'memory_stage1' OR kind = 'memory_consolidate_global'",
+          "5. StateRuntime коммитит транзакцию"
+        ],
+        "extensions (Cockburn)": [],
+        "edge_cases": [
+          {
+            "condition": "никаких stage1_outputs или memory jobs нет",
+            "action": "пройдёт без ошибок (DELETE не требует соответствий)"
+          }
+        ],
+        "lifecycle": null,
+        "ux": null,
+        "result": "Все stage1_outputs удалены; все memory jobs (stage1 + consolidate_global) удалены; phase-2 baseline сброшен на пусто"
+      }
+    },
+    {
+      "id": "SRC-0005/uc.user/track-thread-spawn-tree",
+      "src": "SRC-0005",
+      "composition": "use_case",
+      "level": "user",
+      "strategic_domain": "отслеживание иерархии порождённых тредов (sub-agent spawn)",
+      "terms": {
+        "actor": "Подсистема управления sub-agent тредами (родитель-потомок)",
+        "goal": "Поддерживать направленный граф parent→child тредов и обходить его с фильтром по статусу",
+        "steps": [
+          "1. Подсистема при создании ребёнка вызывает upsert_thread_spawn_edge(parent, child, status) либо это происходит автоматически в insert_thread_if_absent / upsert_thread из SessionSource::SubAgent::ThreadSpawn",
+          "2. StateRuntime INSERT thread_spawn_edges (parent_thread_id, child_thread_id, status) ON CONFLICT(child_thread_id) DO UPDATE SET parent_thread_id=excluded.parent_thread_id, status=excluded.status",
+          "3. Подсистема меняет статус ребра set_thread_spawn_edge_status(child, status)",
+          "4. Подсистема запрашивает детей конкретного статуса list_thread_spawn_children_with_status(parent, status) — SELECT child_thread_id WHERE parent=? AND status=? ORDER BY child_thread_id",
+          "5. Подсистема запрашивает потомков конкретного статуса list_thread_spawn_descendants_with_status(root, status) — рекурсивный CTE, ORDER BY depth ASC, child_thread_id ASC",
+          "6. Подсистема ищет ребёнка по канонизированному agent_path — find_thread_spawn_child_by_path / find_thread_spawn_descendant_by_path"
+        ],
+        "extensions (Cockburn)": [
+          {
+            "step": 6,
+            "condition": "по agent_path найдено больше одного треда",
+            "action": "вернуть Err 'multiple agents found for canonical path `<path>`'"
+          },
+          {
+            "step": 1,
+            "condition": "source не ThreadSpawn",
+            "action": "автоматическая вставка ребра пропускается"
+          }
+        ],
+        "edge_cases": [
+          {
+            "condition": "child уже имеет другого parent — upsert перезапишет parent",
+            "action": "ребро обновляется (один parent на child гарантирован уникальным ON CONFLICT по child_thread_id)"
+          },
+          {
+            "condition": "BFS обход: depth ASC, при равенстве — child_thread_id ASC",
+            "action": "стабильный порядок выдачи descendants"
+          }
+        ],
+        "lifecycle": {
+          "entity": "SRC-0005/entity/thread-spawn-edge",
+          "states": [
+            "Open",
+            "Closed"
+          ],
+          "transition": {
+            "from": "Open",
+            "to": "Closed",
+            "guard": "set_thread_spawn_edge_status(child, Closed)",
+            "side_effect": "ребро не появляется в list_*_with_status(Open) — больше не считается активной живой связью"
+          }
+        },
+        "ux": null,
+        "result": "Граф spawn хранится: один parent на child, статус ребра Open/Closed; обходы children/descendants фильтруются по статусу с устойчивым порядком"
+      }
+    },
+    {
+      "id": "SRC-0005/uc.sub/allocate-monotonic-thread-updated-at",
+      "src": "SRC-0005",
+      "composition": "use_case",
+      "level": "sub",
+      "strategic_domain": null,
+      "terms": {
+        "actor": "Подсистема upsert треда (allocate_thread_updated_at)",
+        "goal": "Выдать уникальную монотонную миллисекундную метку updated_at для устойчивости курсорной пагинации",
+        "steps": [
+          "1. Подсистема считывает candidate = миллисекунды из переданного updated_at",
+          "2. Подсистема в цикле читает текущий high-water mark thread_updated_at_millis (Atomic, Relaxed)",
+          "3. Если candidate > current — пытается CAS(current, candidate); при успехе использует candidate",
+          "4. Если candidate <= current и (current - candidate) >= 1000 — допускает candidate как историческую метку (backfill/repair)",
+          "5. Иначе — bumped = current + 1; пытается CAS(current, bumped); при успехе использует bumped",
+          "6. Возвращает результат epoch_millis_to_datetime"
+        ],
+        "extensions (Cockburn)": [
+          {
+            "step": 3,
+            "condition": "CAS проиграл гонку",
+            "action": "продолжить цикл (continue)"
+          },
+          {
+            "step": 5,
+            "condition": "CAS проиграл гонку",
+            "action": "продолжить цикл"
+          },
+          {
+            "step": 4,
+            "condition": "candidate близок к current (в пределах 1 секунды) но не больше",
+            "action": "не использовать candidate — bump current+1, чтобы не тащить старые строки вперёд"
+          }
+        ],
+        "edge_cases": [
+          {
+            "condition": "две одновременные upsert'а с одинаковым wall-clock millis",
+            "action": "вторая получает current+1, чтобы updated_at оставался уникальным"
+          },
+          {
+            "condition": "backfill метка старше высокого high-water mark на >= 1000 ms",
+            "action": "сохраняется как есть — историческая упорядоченность по mtime файла rollout"
+          }
+        ],
+        "lifecycle": null,
+        "ux": null,
+        "result": "Уникальная и монотонная (внутри процесса) миллисекундная метка для updated_at_ms; курсорная пагинация по (updated_at_ms, id) устойчива"
+      }
+    },
+    {
+      "id": "SRC-0005/uc.sub/migrate-and-version-databases",
+      "src": "SRC-0005",
+      "composition": "use_case",
+      "level": "sub",
+      "strategic_domain": null,
+      "terms": {
+        "actor": "Подсистема инициализации SQLite (open_state_sqlite / open_logs_sqlite + remove_legacy_db_files)",
+        "goal": "Открыть актуальные версии state DB и logs DB, удалить файлы предыдущих версий, переключить state DB на INCREMENTAL auto_vacuum",
+        "steps": [
+          "1. Подсистема формирует имя текущей версии: '<base>_<version>.sqlite' (db_filename)",
+          "2. Подсистема перебирает файлы в codex_home, нормализуя суффиксы '-wal', '-shm', '-journal'",
+          "3. Подсистема пропускает файлы, чьё нормализованное имя совпадает с current_name",
+          "4. Подсистема помечает к удалению файлы с именем '<base>.sqlite' (unversioned legacy)",
+          "5. Подсистема помечает к удалению файлы с именем '<base>_<digit+>.sqlite' (другие версии)",
+          "6. Подсистема сортирует пути по убыванию длины (сидекары удаляются раньше основной)",
+          "7. Подсистема удаляет каждый файл; ошибки логируются warning, но не прерывают",
+          "8. Подсистема открывает SqlitePool с base_sqlite_options: WAL, NORMAL synchronous, busy_timeout=5s, log_statements=Off, create_if_missing=true, max_connections=5",
+          "9. Подсистема применяет мигратор (state или logs)",
+          "10. Для state DB: если PRAGMA auto_vacuum != INCREMENTAL — выполнить PRAGMA auto_vacuum=INCREMENTAL и одиночный VACUUM; затем PRAGMA incremental_vacuum (best-effort)"
+        ],
+        "extensions (Cockburn)": [
+          {
+            "step": 2,
+            "condition": "не удалось прочитать codex_home",
+            "action": "записать warning и завершить cleanup без удалений"
+          },
+          {
+            "step": 7,
+            "condition": "tokio::fs::remove_file вернул ошибку",
+            "action": "записать warning «failed to remove legacy <db_label> db file <path>: <err>» и продолжить с остальными"
+          },
+          {
+            "step": 9,
+            "condition": "runtime_state_migrator отличается от STATE_MIGRATOR — терпит более новые применённые миграции",
+            "action": "не падать с MigrateError::VersionMissing для неизвестных более поздних версий"
+          }
+        ],
+        "edge_cases": [
+          {
+            "condition": "файл 'state.sqlite_backup' или числовое имя '123'",
+            "action": "не удалять (не подходит ни под unversioned, ни под versioned шаблон)"
+          },
+          {
+            "condition": "Windows: основной .sqlite не удаляется пока живы -wal/-shm",
+            "action": "сортировка по убыванию длины пути гарантирует, что сидекары удаляются раньше"
+          }
+        ],
+        "lifecycle": null,
+        "ux": null,
+        "result": "В codex_home остаются только текущие версии state и logs DB с применёнными миграциями; state DB переведён на INCREMENTAL auto_vacuum; логи 'failed to ...' для проблемных файлов"
+      }
+    }
+  ]
+}

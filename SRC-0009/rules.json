@@ -1,0 +1,944 @@
+{
+  "src": "SRC-0009",
+  "schema_version": "2.0",
+  "lens": "rule",
+  "compositions": [
+    {
+      "id": "SRC-0009/rule/submission-channel-capacity",
+      "src": "SRC-0009",
+      "composition": "rule",
+      "terms": {
+        "condition": "Submission-канал между Codex и submission_loop — bounded с фиксированной capacity; та же capacity используется для delegate ops/events каналов (tx_sub/rx_sub, tx_ops/rx_ops в run_codex_thread_interactive). Если канал заполнен — отправитель блокируется (back-pressure); если tx_sub закрыт — submit возвращает CodexErr::InternalAgentDied",
+        "numbers": [
+          {"value": 512, "kind": "channel_capacity", "name": "SUBMISSION_CHANNEL_CAPACITY"}
+        ],
+        "formula": null,
+        "gwt": {
+          "given": "SUBMISSION_CHANNEL_CAPACITY = 512",
+          "when": "async_channel::bounded(SUBMISSION_CHANNEL_CAPACITY) создаёт (tx_sub, rx_sub) в Codex::spawn_internal и в run_codex_thread_interactive",
+          "then": "очередь submissions/ops ограничена 512; после 512 pending элементов producer блокируется до тех пор, пока consumer не освободит слот"
+        }
+      }
+    },
+    {
+      "id": "SRC-0009/rule/thread-created-channel-capacity",
+      "src": "SRC-0009",
+      "composition": "rule",
+      "terms": {
+        "condition": "Broadcast-канал thread_created_tx в ThreadManagerState имеет фиксированную capacity; подписчики через subscribe_thread_created получают thread_id каждого созданного треда",
+        "numbers": [
+          {"value": 1024, "kind": "channel_capacity", "name": "THREAD_CREATED_CHANNEL_CAPACITY"}
+        ],
+        "formula": null,
+        "gwt": {
+          "given": "THREAD_CREATED_CHANNEL_CAPACITY = 1024",
+          "when": "ThreadManager::new / with_models_provider_and_home_for_tests → broadcast::channel(THREAD_CREATED_CHANNEL_CAPACITY)",
+          "then": "до 1024 последних thread_id буферизуются для подписчиков broadcast-канала"
+        }
+      }
+    },
+    {
+      "id": "SRC-0009/rule/session-configured-first-event",
+      "src": "SRC-0009",
+      "composition": "rule",
+      "terms": {
+        "condition": "Первое событие, возвращаемое codex.next_event() после Codex::spawn, обязано быть EventMsg::SessionConfigured с id == INITIAL_SUBMIT_ID (пустая строка \"\"); любое иное событие — ошибка инициализации сессии",
+        "numbers": [
+          {"value": "\"\"", "kind": "initial_submit_id", "name": "INITIAL_SUBMIT_ID"}
+        ],
+        "formula": null,
+        "gwt": {
+          "given": "INITIAL_SUBMIT_ID = \"\"",
+          "when": "finalize_thread_spawn: codex.next_event().await → Event { id, msg: EventMsg::SessionConfigured(session_configured) } if id == INITIAL_SUBMIT_ID",
+          "then": "возвращается NewThread { thread_id, thread, session_configured }; иначе CodexErr::SessionConfiguredNotFirstEvent"
+        }
+      }
+    },
+    {
+      "id": "SRC-0009/rule/steer-input-preconditions",
+      "src": "SRC-0009",
+      "composition": "rule",
+      "terms": {
+        "condition": "steer_input допускается только при строгом наборе условий: input непустой, есть активный turn с task kind=Regular, expected_turn_id совпадает с active (если задан). Иначе возвращаются типизированные ошибки SteerInputError.",
+        "numbers": null,
+        "formula": null,
+        "gwt": {
+          "given": "varied preconditions",
+          "when": "Session::steer_input(input, expected_turn_id, responsesapi_client_metadata)",
+          "then": "input.is_empty() → SteerInputError::EmptyInput ('input must not be empty'); active_turn is None → SteerInputError::NoActiveTurn(input) ('no active turn to steer'); active_turn_id != expected_turn_id → SteerInputError::ExpectedTurnMismatch { expected, actual } ('expected active turn id `X` but found `Y`'); TaskKind::Review → ActiveTurnNotSteerable{Review} ('cannot steer a review turn'); TaskKind::Compact → ActiveTurnNotSteerable{Compact} ('cannot steer a compact turn'); Regular → push_pending_input + accept_mailbox_delivery_for_current_turn + Ok(active_turn_id)"
+        }
+      }
+    },
+    {
+      "id": "SRC-0009/rule/steer-error-to-event-mapping",
+      "src": "SRC-0009",
+      "composition": "rule",
+      "terms": {
+        "condition": "SteerInputError сериализуется в ErrorEvent с фиксированными сообщениями и CodexErrorInfo: NoActiveTurn/ExpectedTurnMismatch/EmptyInput → BadRequest; ActiveTurnNotSteerable{turn_kind} → ActiveTurnNotSteerable{turn_kind}",
+        "numbers": null,
+        "formula": null,
+        "gwt": {
+          "given": "SteerInputError::ActiveTurnNotSteerable{turn_kind=NonSteerableTurnKind::Review}",
+          "when": "to_error_event()",
+          "then": "ErrorEvent { message: 'cannot steer a review turn', codex_error_info: Some(CodexErrorInfo::ActiveTurnNotSteerable { turn_kind: Review }) }"
+        }
+      }
+    },
+    {
+      "id": "SRC-0009/rule/agent-identity-registration-timeout",
+      "src": "SRC-0009",
+      "composition": "rule",
+      "terms": {
+        "condition": "HTTP-запрос POST /v1/agent/register должен завершиться за AGENT_REGISTRATION_TIMEOUT; запрос GET /authenticate_app_v2 для минта human-biscuit — за AGENT_IDENTITY_BISCUIT_TIMEOUT. Превышение → ошибка отправки с контекстом 'failed to send agent identity ... request to {url}'",
+        "numbers": [
+          {"value": "15s (Duration::from_secs(15))", "kind": "timeout", "name": "AGENT_REGISTRATION_TIMEOUT"},
+          {"value": "15s (Duration::from_secs(15))", "kind": "timeout", "name": "AGENT_IDENTITY_BISCUIT_TIMEOUT"}
+        ],
+        "formula": null,
+        "gwt": {
+          "given": "AGENT_REGISTRATION_TIMEOUT = AGENT_IDENTITY_BISCUIT_TIMEOUT = 15s",
+          "when": "AgentIdentityManager::register_agent_identity и mint_human_biscuit отправляют HTTP-запросы через create_client с .timeout(...)",
+          "then": "любой запрос, не завершившийся за 15 секунд, возвращает ошибку клиента с with_context'ом 'failed to send agent identity registration/biscuit request to {url}'"
+        }
+      }
+    },
+    {
+      "id": "SRC-0009/rule/agent-identity-binding-id-format",
+      "src": "SRC-0009",
+      "composition": "rule",
+      "terms": {
+        "condition": "binding_id для AgentIdentity в рамках ChatGPT-auth строится как 'chatgpt-account-{resolved_account_id}', где resolved_account_id = forced_chatgpt_workspace_id (если непустой) иначе token_data.account_id (если непустой); иначе биндинг не создаётся",
+        "numbers": null,
+        "formula": "binding_id = 'chatgpt-account-' + resolved_account_id",
+        "gwt": {
+          "given": "forced_workspace_id=None, token_data.account_id=Some('account-123'), chatgpt_user_id=Some('user-123')",
+          "when": "AgentIdentityBinding::from_auth(&auth, None)",
+          "then": "Some(AgentIdentityBinding { binding_id: 'chatgpt-account-account-123', chatgpt_account_id: 'account-123', chatgpt_user_id: Some('user-123'), access_token: 'access-token-account-123' })"
+        }
+      }
+    },
+    {
+      "id": "SRC-0009/rule/agent-identity-feature-gate",
+      "src": "SRC-0009",
+      "composition": "rule",
+      "terms": {
+        "condition": "Регистрация agent identity выполняется ТОЛЬКО при Feature::UseAgentIdentity=enabled И текущий auth is_chatgpt_auth; при API-key auth или ChatGPT-auth без account_id — возвращается Ok(None) и регистрация не производится",
+        "numbers": null,
+        "formula": null,
+        "gwt": {
+          "given": "Feature::UseAgentIdentity=false",
+          "when": "AgentIdentityManager::ensure_registered_identity()",
+          "then": "return Ok(None) — регистрация пропускается (verified by ensure_registered_identity_skips_when_feature_is_disabled тест, и assert_eq!(..., None))"
+        }
+      }
+    },
+    {
+      "id": "SRC-0009/rule/agent-identity-api-key-skip",
+      "src": "SRC-0009",
+      "composition": "rule",
+      "terms": {
+        "condition": "Если auth = API key (не ChatGPT OAuth), AgentIdentityBinding::from_auth возвращает None → ensure_registered_identity возвращает Ok(None) даже при включённом feature",
+        "numbers": null,
+        "formula": null,
+        "gwt": {
+          "given": "CodexAuth::from_api_key('test-key'); Feature::UseAgentIdentity=true",
+          "when": "manager.ensure_registered_identity().await",
+          "then": "Ok(None) — регистрация не выполняется (verified by ensure_registered_identity_skips_for_api_key_auth)"
+        }
+      }
+    },
+    {
+      "id": "SRC-0009/rule/agent-identity-cache-reuse",
+      "src": "SRC-0009",
+      "composition": "rule",
+      "terms": {
+        "condition": "Если в auth есть StoredAgentIdentity с валидным workspace_id == binding.chatgpt_account_id, matches_binding==true и validate_key_material==Ok — identity переиспользуется без повторной регистрации; иначе — stale запись удаляется через auth.remove_agent_identity()",
+        "numbers": null,
+        "formula": null,
+        "gwt": {
+          "given": "first call зарегистрировала identity с agent_runtime_id='agent_123'",
+          "when": "второй вызов ensure_registered_identity()",
+          "then": "identity переиспользуется; first == second; first.agent_runtime_id='agent_123', abom.agent_harness_id='codex-cli', chatgpt_account_id='account-123', chatgpt_user_id=Some('user-123') (verified by ensure_registered_identity_registers_and_reuses_cached_identity, expect(1) на mock /v1/agent/register)"
+        }
+      }
+    },
+    {
+      "id": "SRC-0009/rule/agent-identity-user-mismatch-invalidates-cache",
+      "src": "SRC-0009",
+      "composition": "rule",
+      "terms": {
+        "condition": "Если текущий chatgpt_user_id отличается от stored.chatgpt_user_id при том же account_id — cached identity считается stale: warn + auth.remove_agent_identity() + регистрация новой",
+        "numbers": null,
+        "formula": null,
+        "gwt": {
+          "given": "stored.chatgpt_user_id='user-old', current auth.chatgpt_user_id='user-new', workspace_id='account-123', stored.agent_runtime_id='agent_old'",
+          "when": "ensure_registered_identity",
+          "then": "stored удалён; регистрация POST /v1/agent/register с новыми ключами; stored.agent_runtime_id='agent_new', stored.chatgpt_user_id=Some('user-new') (verified by ensure_registered_identity_deletes_different_user_identity_and_reregisters)"
+        }
+      }
+    },
+    {
+      "id": "SRC-0009/rule/agent-harness-id-by-session-source",
+      "src": "SRC-0009",
+      "composition": "rule",
+      "terms": {
+        "condition": "agent_harness_id в AgentBillOfMaterials определяется matrix-решением по SessionSource: VSCode → 'codex-app'; Cli, Exec, Mcp, Custom(_), SubAgent(_), Unknown → 'codex-cli'",
+        "numbers": null,
+        "formula": null,
+        "gwt": {
+          "given": "SessionSource::Cli",
+          "when": "build_abom(SessionSource::Cli)",
+          "then": "AgentBillOfMaterials { agent_version: env!('CARGO_PKG_VERSION'), agent_harness_id: 'codex-cli', running_location: 'Cli-{OS}' } (verified: first.abom.agent_harness_id == 'codex-cli' в ensure_registered_identity_registers_and_reuses_cached_identity)"
+        }
+      }
+    },
+    {
+      "id": "SRC-0009/rule/agent-identity-running-location-format",
+      "src": "SRC-0009",
+      "composition": "rule",
+      "terms": {
+        "condition": "running_location в AgentBillOfMaterials строится как '{session_source}-{os}', где os = std::env::consts::OS",
+        "numbers": null,
+        "formula": "running_location = format!('{}-{}', session_source, std::env::consts::OS)",
+        "gwt": {
+          "given": "SessionSource::Cli на macOS",
+          "when": "build_abom(SessionSource::Cli)",
+          "then": "running_location = 'Cli-macos'"
+        }
+      }
+    },
+    {
+      "id": "SRC-0009/rule/agent-identity-registration-url-construction",
+      "src": "SRC-0009",
+      "composition": "rule",
+      "terms": {
+        "condition": "URL для регистрации и минта biscuit строятся как chatgpt_base_url без trailing '/' + фиксированные пути '/v1/agent/register' и '/authenticate_app_v2' соответственно",
+        "numbers": null,
+        "formula": "agent_registration_url = trim_end_matches('/') + '/v1/agent/register'; agent_identity_biscuit_url = trim_end_matches('/') + '/authenticate_app_v2'",
+        "gwt": {
+          "given": "chatgpt_base_url = 'https://mock/backend-api/'",
+          "when": "agent_registration_url(&url)",
+          "then": "'https://mock/backend-api/v1/agent/register' (verified by ensure_registered_identity_uses_chatgpt_base_url тест, mock path '/backend-api/v1/agent/register')"
+        }
+      }
+    },
+    {
+      "id": "SRC-0009/rule/agent-identity-human-biscuit-header",
+      "src": "SRC-0009",
+      "composition": "rule",
+      "terms": {
+        "condition": "Минтинг human-biscuit требует bearer auth от access_token и отправки target_method + target_url в headers; ответ должен содержать header 'x-openai-authorization' (UTF-8 строка) — только тогда biscuit валиден",
+        "numbers": null,
+        "formula": null,
+        "gwt": {
+          "given": "GET /authenticate_app_v2 c Authorization: 'Bearer access-token-account-123', X-Request-Id: 'codex-agent-identity-{base64url}', X-Original-Method: 'POST', X-Original-Url: '{target_url}'",
+          "when": "response.status=200 с header 'x-openai-authorization: human-biscuit'",
+          "then": "возвращается 'human-biscuit' как String; иначе — ошибка 'agent identity biscuit response did not include x-openai-authorization' или 'response header was not valid UTF-8' (verified by mount_human_biscuit mock и regex на заголовки)"
+        }
+      }
+    },
+    {
+      "id": "SRC-0009/rule/agent-identity-request-id-format",
+      "src": "SRC-0009",
+      "composition": "rule",
+      "terms": {
+        "condition": "X-Request-Id для biscuit-минта формируется как 'codex-agent-identity-{URL_SAFE_NO_PAD(16 random bytes)}'; 16 байт генерируются через OsRng.try_fill_bytes, при ошибке — context 'failed to generate agent identity request id'",
+        "numbers": [
+          {"value": 16, "kind": "byte_count", "name": "request_id_bytes length"}
+        ],
+        "formula": "request_id = 'codex-agent-identity-' + URL_SAFE_NO_PAD.encode([u8;16] from OsRng)",
+        "gwt": {
+          "given": "request_id_bytes = OsRng.try_fill_bytes(&mut [0u8;16])",
+          "when": "agent_identity_request_id()",
+          "then": "'codex-agent-identity-' + 22-char base64url-no-padding (16*8/6 = ~22 chars без '=')"
+        }
+      }
+    },
+    {
+      "id": "SRC-0009/rule/agent-identity-private-key-size",
+      "src": "SRC-0009",
+      "composition": "rule",
+      "terms": {
+        "condition": "ed25519 private key генерируется как ровно 32 случайных байта из OsRng; полученный SigningKey сериализуется в PKCS#8 DER и base64 STANDARD",
+        "numbers": [
+          {"value": 32, "kind": "byte_count", "name": "ed25519 secret_key_bytes length"}
+        ],
+        "formula": "signing_key = SigningKey::from_bytes(&[0u8;32] filled by OsRng); private_key_pkcs8_base64 = BASE64_STANDARD.encode(signing_key.to_pkcs8_der().as_bytes())",
+        "gwt": {
+          "given": "let mut secret_key_bytes = [0u8;32]; OsRng.try_fill_bytes(&mut secret_key_bytes)?",
+          "when": "generate_agent_key_material()",
+          "then": "GeneratedAgentKeyMaterial с private_key_pkcs8_base64 (PKCS#8 DER в BASE64 STANDARD) и public_key_ssh (ssh-ed25519 + base64 SSH blob)"
+        }
+      }
+    },
+    {
+      "id": "SRC-0009/rule/ssh-ed25519-public-key-wire-format",
+      "src": "SRC-0009",
+      "composition": "rule",
+      "terms": {
+        "condition": "public_key_ssh = 'ssh-ed25519 {base64}' где base64 = SSH blob: 4-byte BE длина строки (11) + 'ssh-ed25519' (11 bytes) + 4-byte BE длина ключа (32) + 32 bytes ed25519 public key; итого декодированный blob = 51 байт",
+        "numbers": [
+          {"value": 11, "kind": "length_prefix", "name": "'ssh-ed25519' string length"},
+          {"value": 32, "kind": "length_prefix", "name": "ed25519 public key bytes"},
+          {"value": 51, "kind": "total_length", "name": "decoded SSH blob length (4+11+4+32)"}
+        ],
+        "formula": "blob = be_bytes(len('ssh-ed25519')=11) + 'ssh-ed25519' + be_bytes(len(verifying_key)=32) + verifying_key_bytes; public_key_ssh = 'ssh-ed25519 ' + BASE64_STANDARD.encode(blob)",
+        "gwt": {
+          "given": "verifying_key 32 bytes из ed25519",
+          "when": "encode_ssh_ed25519_public_key(&verifying_key)",
+          "then": "decoded blob имеет len()=51; &decoded[..4]==11u32.to_be_bytes(); &decoded[4..15]==b'ssh-ed25519'; &decoded[15..19]==32u32.to_be_bytes() (verified by encode_ssh_ed25519_public_key_matches_expected_wire_shape)"
+        }
+      }
+    },
+    {
+      "id": "SRC-0009/rule/agent-identity-validate-key-material",
+      "src": "SRC-0009",
+      "composition": "rule",
+      "terms": {
+        "condition": "StoredAgentIdentity валиден тогда и только тогда, когда encode_ssh_ed25519_public_key(signing_key.verifying_key()) == self.public_key_ssh; при несовпадении — ошибка 'stored public key does not match the private key'",
+        "numbers": null,
+        "formula": "derived_public_key = encode_ssh_ed25519_public_key(&signing_key.verifying_key()); ensure self.public_key_ssh == derived_public_key",
+        "gwt": {
+          "given": "stored.private_key_pkcs8_base64 невалиден или не соответствует stored.public_key_ssh",
+          "when": "stored.validate_key_material()",
+          "then": "Err('stored public key does not match the private key') → ensure_registered_identity: warn + auth.remove_agent_identity() + повторная регистрация (verified by ensure_registered_identity_deletes_invalid_cached_identity_and_reregisters — невалидный base64 private_key с runtime_id 'agent_invalid' заменяется на 'agent_456')"
+        }
+      }
+    },
+    {
+      "id": "SRC-0009/rule/agent-identity-workspace-match",
+      "src": "SRC-0009",
+      "composition": "rule",
+      "terms": {
+        "condition": "При восстановлении StoredAgentIdentity из AgentIdentityAuthRecord проверяется record.workspace_id == binding.chatgpt_account_id; при несовпадении — bail!('stored agent identity workspace {record} does not match current workspace {binding}')",
+        "numbers": null,
+        "formula": null,
+        "gwt": {
+          "given": "record.workspace_id='account-A'; binding.chatgpt_account_id='account-B'",
+          "when": "StoredAgentIdentity::from_auth_record(binding, record, abom)",
+          "then": "Err('stored agent identity workspace \"account-A\" does not match current workspace \"account-B\"')"
+        }
+      }
+    },
+    {
+      "id": "SRC-0009/rule/agent-identity-matches-binding",
+      "src": "SRC-0009",
+      "composition": "rule",
+      "terms": {
+        "condition": "StoredAgentIdentity.matches_binding(binding) = true ТТТК (binding_id == stored.binding_id) И (chatgpt_account_id == stored.chatgpt_account_id) И (binding.chatgpt_user_id==Some(x) → stored.chatgpt_user_id.as_deref()==Some(x); binding.chatgpt_user_id==None → true)",
+        "numbers": null,
+        "formula": "matches = (self.binding_id == b.binding_id) && (self.chatgpt_account_id == b.chatgpt_account_id) && match b.chatgpt_user_id { Some(u) => self.chatgpt_user_id.as_deref()==Some(u), None => true }",
+        "gwt": {
+          "given": "stored = StoredAgentIdentity{chatgpt_user_id=Some('u1')}; binding.chatgpt_user_id=None",
+          "when": "stored.matches_binding(&binding)",
+          "then": "true (None binding user_id совпадает с любым stored user_id — None-binding = relaxed matching)"
+        }
+      }
+    },
+    {
+      "id": "SRC-0009/rule/subagent-depth-gate",
+      "src": "SRC-0009",
+      "composition": "rule",
+      "terms": {
+        "condition": "При spawn с SessionSource::SubAgent(ThreadSpawn { depth, .. }) и depth >= config.agent_max_depth — features SpawnCsv и Collab отключаются в этой сессии (нельзя рекурсивно спавнить ещё глубже)",
+        "numbers": [
+          {"value": "config.agent_max_depth", "kind": "limit", "name": "agent_max_depth (config)"}
+        ],
+        "formula": "if matches!(session_source, SessionSource::SubAgent(SubAgentSource::ThreadSpawn { depth, .. })) && depth >= config.agent_max_depth { disable(SpawnCsv); disable(Collab); }",
+        "gwt": {
+          "given": "config.agent_max_depth = 3; session_source = SubAgent(ThreadSpawn { depth: 3 })",
+          "when": "Codex::spawn_internal обрабатывает аргументы",
+          "then": "config.features.disable(SpawnCsv) + config.features.disable(Collab) — ребёнок не сможет спавнить subagents"
+        }
+      }
+    },
+    {
+      "id": "SRC-0009/rule/subagent-models-refresh-offline",
+      "src": "SRC-0009",
+      "composition": "rule",
+      "terms": {
+        "condition": "RefreshStrategy для models_manager в Codex::spawn_internal выбирается по session_source: SubAgent(_) → Offline (не ходим в сеть за списком моделей); иначе OnlineIfUncached",
+        "numbers": null,
+        "formula": "refresh_strategy = match session_source { SessionSource::SubAgent(_) => RefreshStrategy::Offline, _ => RefreshStrategy::OnlineIfUncached }",
+        "gwt": {
+          "given": "session_source = SessionSource::SubAgent(...)",
+          "when": "Codex::spawn_internal",
+          "then": "refresh_strategy = Offline; list_models не вызывается если config.model задана и refresh_strategy == Offline"
+        }
+      }
+    },
+    {
+      "id": "SRC-0009/rule/base-instructions-priority",
+      "src": "SRC-0009",
+      "composition": "rule",
+      "terms": {
+        "condition": "base_instructions сессии определяются приоритетом: 1) config.base_instructions override; 2) conversation_history.get_base_instructions() (session_meta из rollout); 3) model_info.get_model_instructions(config.personality)",
+        "numbers": null,
+        "formula": "base_instructions = config.base_instructions.clone().or_else(|| conversation_history.get_base_instructions().map(|s| s.text)).unwrap_or_else(|| model_info.get_model_instructions(config.personality))",
+        "gwt": {
+          "given": "config.base_instructions = None; conversation_history = New",
+          "when": "spawn_internal резолвит base_instructions",
+          "then": "= model_info.get_model_instructions(config.personality) — fallback к model default"
+        }
+      }
+    },
+    {
+      "id": "SRC-0009/rule/guardian-reviewer-bypass-exec-policy",
+      "src": "SRC-0009",
+      "composition": "rule",
+      "terms": {
+        "condition": "Если session_source принадлежит guardian reviewer (is_guardian_reviewer_source) — exec_policy ИГНОРИРУЕТ caller-provided rules (inherited_exec_policy) и использует ExecPolicyManager::default (built-in shell safety checks). Это защищает reviewer от silent auto-approve и от caller-specific rules",
+        "numbers": null,
+        "formula": null,
+        "gwt": {
+          "given": "session_source = guardian reviewer; inherited_exec_policy = Some(parent_exec_policy)",
+          "when": "spawn_internal резолвит exec_policy",
+          "then": "exec_policy = Arc::new(ExecPolicyManager::default()) — parent_exec_policy игнорируется"
+        }
+      }
+    },
+    {
+      "id": "SRC-0009/rule/delegate-subagent-inheritance",
+      "src": "SRC-0009",
+      "composition": "rule",
+      "terms": {
+        "condition": "run_codex_thread_interactive жёстко задаёт параметры child при Codex::spawn: session_source = SessionSource::SubAgent(subagent_source); skills_manager/plugins_manager/mcp_manager/skills_watcher/agent_control/exec_policy/analytics_events_client наследуются через Arc::clone от parent_session.services; persist_extended_history=false; dynamic_tools=Vec::new(); metrics_service_name=None; inherited_shell_snapshot=None; user_shell_override=None; parent_trace=None",
+        "numbers": null,
+        "formula": null,
+        "gwt": {
+          "given": "parent_session с работающими skills/plugins/mcp/analytics; subagent_source = SubAgentSource::X",
+          "when": "run_codex_thread_interactive(..., parent_session, parent_ctx, cancel_token, subagent_source, initial_history)",
+          "then": "child Codex получает те же инстансы services через Arc::clone; session_source = SubAgent(X); persist_extended_history=false; если Feature::GeneralAnalytics — emit_subagent_session_started(thread_id, parent_thread_id, thread_config, subagent_source)"
+        }
+      }
+    },
+    {
+      "id": "SRC-0009/rule/delegate-event-filter",
+      "src": "SRC-0009",
+      "composition": "rule",
+      "terms": {
+        "condition": "forward_events НЕ форвардит к consumer следующие события от child: AgentMessageDelta, AgentReasoningDelta, TokenCount, SessionConfigured, ThreadNameUpdated. Approval-events (ExecApprovalRequest, ApplyPatchApprovalRequest, RequestUserInput, RequestPermissions) обрабатываются локально и не форвардятся. McpToolCallBegin/End кешируют invocation в pending_mcp_invocations и форвардятся",
+        "numbers": null,
+        "formula": null,
+        "gwt": {
+          "given": "child emits EventMsg::AgentMessageDelta(...)",
+          "when": "forward_events.match event",
+          "then": "событие игнорируется (не идёт в tx_sub consumer); цикл продолжает next_event"
+        }
+      }
+    },
+    {
+      "id": "SRC-0009/rule/delegate-shutdown-drain-timeout",
+      "src": "SRC-0009",
+      "composition": "rule",
+      "terms": {
+        "condition": "При shutdown_delegate: отправляются Op::Interrupt и Op::Shutdown; events дренируются с верхним пределом 500ms. Дренаж прекращается на TurnAborted/TurnComplete или по истечении 500ms",
+        "numbers": [
+          {"value": "500ms (Duration::from_millis(500))", "kind": "timeout", "name": "shutdown_delegate drain timeout"}
+        ],
+        "formula": null,
+        "gwt": {
+          "given": "child всё ещё эмитит события после Op::Shutdown",
+          "when": "tokio::time::timeout(Duration::from_millis(500), { loop next_event → break on TurnAborted/TurnComplete })",
+          "then": "цикл прекращается либо по получению TurnAborted/TurnComplete либо по таймауту 500ms; background sends перестают попадать в закрытый канал"
+        }
+      }
+    },
+    {
+      "id": "SRC-0009/rule/delegate-one-shot-closed-tx",
+      "src": "SRC-0009",
+      "composition": "rule",
+      "terms": {
+        "condition": "run_codex_thread_one_shot возвращает Codex с tx_sub, чей rx_closed сразу дропнут — чтобы caller не мог послать дополнительные Op после одноразового старта. bridge-task посылает Op::Shutdown в реальный child ops_tx при получении EventMsg::TurnComplete или EventMsg::TurnAborted",
+        "numbers": null,
+        "formula": null,
+        "gwt": {
+          "given": "Codex из run_codex_thread_one_shot",
+          "when": "caller попытается tx_sub.send(op)",
+          "then": "send завершится ошибкой (rx_closed дропнут) — интерфейс one-shot запрещает дополнительные ops"
+        }
+      }
+    },
+    {
+      "id": "SRC-0009/rule/fork-snapshot-from-usize",
+      "src": "SRC-0009",
+      "composition": "rule",
+      "terms": {
+        "condition": "Устаревший API fork_thread(usize, ...) совместим за счёт From<usize> for ForkSnapshot → TruncateBeforeNthUserMessage(value). Это сохраняет вызывающий код, заменивший тип параметра с usize на ForkSnapshot",
+        "numbers": null,
+        "formula": "ForkSnapshot::from(n: usize) = ForkSnapshot::TruncateBeforeNthUserMessage(n)",
+        "gwt": {
+          "given": "fork_thread(3usize, config, path, ...)",
+          "when": "From<usize> applied",
+          "then": "эквивалентно fork_thread(ForkSnapshot::TruncateBeforeNthUserMessage(3), ...)"
+        }
+      }
+    },
+    {
+      "id": "SRC-0009/rule/truncate-before-nth-user-message-rules",
+      "src": "SRC-0009",
+      "composition": "rule",
+      "terms": {
+        "condition": "truncate_rollout_before_nth_user_message_from_start(&items, n): n == usize::MAX → возвращает items.to_vec(); user_positions.len() <= n → возвращает items.to_vec() (без обрезки); иначе cut_idx = user_positions[n] и items[..cut_idx]. Если результат пустой → InitialHistory::New; иначе InitialHistory::Forked",
+        "numbers": [
+          {"value": "usize::MAX", "kind": "sentinel", "name": "no-truncation marker"}
+        ],
+        "formula": "rolled = if n == usize::MAX then items else (if user_positions.len() <= n then items else items[..user_positions[n]])",
+        "gwt": {
+          "given": "items: 5 RolloutItems где user messages в позициях [0, 2, 4]; n = 2",
+          "when": "truncate_rollout_before_nth_user_message_from_start(items, 2)",
+          "then": "cut_idx = user_positions[2] = 4; результат = items[..4] (перед третьим user message)"
+        }
+      }
+    },
+    {
+      "id": "SRC-0009/rule/truncate-last-n-fork-turns-empty",
+      "src": "SRC-0009",
+      "composition": "rule",
+      "terms": {
+        "condition": "truncate_rollout_to_last_n_fork_turns: n_from_end == 0 → возвращает Vec::new(); fork_turn_positions.len() <= n_from_end → возвращает items.to_vec() (все); иначе keep_idx = fork_turn_positions[len - n_from_end]; items[keep_idx..]",
+        "numbers": [
+          {"value": 0, "kind": "boundary", "name": "n_from_end zero case → empty vec"}
+        ],
+        "formula": "keep_idx = fork_turn_positions[fork_turn_positions.len() - n_from_end]; result = items[keep_idx..]",
+        "gwt": {
+          "given": "items с fork_turn_positions = [0, 3, 5, 9]; n_from_end = 2",
+          "when": "truncate_rollout_to_last_n_fork_turns",
+          "then": "keep_idx = fork_turn_positions[2] = 5; результат = items[5..]"
+        }
+      }
+    },
+    {
+      "id": "SRC-0009/rule/thread-rolledback-truncation",
+      "src": "SRC-0009",
+      "composition": "rule",
+      "terms": {
+        "condition": "ThreadRolledBack.num_turns влияет на подсчёт позиций: user_message_positions_in_rollout делает saturating_sub(num_turns) над накопленным списком. fork_turn_positions: num_turns==0 игнорируется; при num_turns>0 находится rollback_start_idx (либо последний usize::MAX-ограниченный position либо первый), retain fork_positions < rollback_start_idx",
+        "numbers": [
+          {"value": "usize::MAX", "kind": "fallback", "name": "usize::try_from(num_turns).unwrap_or(usize::MAX)"}
+        ],
+        "formula": "new_len = user_positions.len().saturating_sub(num_turns); user_positions.truncate(new_len)",
+        "gwt": {
+          "given": "4 user messages накоплено в user_positions; ThreadRolledBack.num_turns = 2",
+          "when": "user_message_positions_in_rollout встречает rollback",
+          "then": "user_positions.truncate(2) — отражает эффективную пост-rollback историю"
+        }
+      }
+    },
+    {
+      "id": "SRC-0009/rule/trigger-turn-boundary",
+      "src": "SRC-0009",
+      "composition": "rule",
+      "terms": {
+        "condition": "Fork-turn boundary = либо is_real_user_message_boundary (parse_turn_item == Some(UserMessage(_))) либо is_trigger_turn_boundary (ResponseItem::Message с role=='assistant' и InterAgentCommunication::from_message_content(content).trigger_turn == true)",
+        "numbers": null,
+        "formula": "is_trigger = role == 'assistant' && InterAgentCommunication::from_message_content(content).is_some_and(|c| c.trigger_turn)",
+        "gwt": {
+          "given": "assistant message с InterAgentCommunication::trigger_turn=true",
+          "when": "fork_turn_positions_in_rollout",
+          "then": "индекс этого item включается в fork_turn_positions (наряду с real user messages)"
+        }
+      }
+    },
+    {
+      "id": "SRC-0009/rule/interrupted-boundary-append",
+      "src": "SRC-0009",
+      "composition": "rule",
+      "terms": {
+        "condition": "append_interrupted_boundary добавляет два items в конец истории: RolloutItem::ResponseItem(interrupted_turn_history_marker()) + RolloutItem::EventMsg(TurnAborted{ turn_id, reason: Interrupted, completed_at: None, duration_ms: None }). Для InitialHistory::New/Cleared результат становится InitialHistory::Forked; для Resumed — разбирается в Forked(resumed.history) с добавлением",
+        "numbers": null,
+        "formula": "aborted_event = RolloutItem::EventMsg(EventMsg::TurnAborted(TurnAbortedEvent { turn_id, reason: TurnAbortReason::Interrupted, completed_at: None, duration_ms: None }))",
+        "gwt": {
+          "given": "history=InitialHistory::Cleared; turn_id=Some('turn-x')",
+          "when": "append_interrupted_boundary(history, Some('turn-x'))",
+          "then": "InitialHistory::Forked(vec![ResponseItem(interrupted_turn_history_marker), EventMsg(TurnAborted{turn_id: Some('turn-x'), reason: Interrupted, completed_at: None, duration_ms: None})])"
+        }
+      }
+    },
+    {
+      "id": "SRC-0009/rule/snapshot-turn-state-midturn-detection",
+      "src": "SRC-0009",
+      "composition": "rule",
+      "terms": {
+        "condition": "snapshot_turn_state: если builder.has_active_turn() && active_turn_id.is_some() и status==InProgress → ends_mid_turn=true; если status != InProgress → ends_mid_turn=false. Если нет явного turn и есть last_user_position — ends_mid_turn = !есть TurnComplete/TurnAborted в items после last_user_position",
+        "numbers": null,
+        "formula": "ends_mid_turn = (builder.has_active_turn() && active_turn_id.is_some() && status==InProgress) OR (no_active_turn && last_user_position.is_some() && !items[last_user_position+1..].any(item is TurnComplete|TurnAborted))",
+        "gwt": {
+          "given": "rollout с user message в idx=5 и без последующих TurnComplete/TurnAborted",
+          "when": "snapshot_turn_state",
+          "then": "SnapshotTurnState { ends_mid_turn: true, active_turn_id: None, active_turn_start_index: None } — synthetic fork/resume обрабатывается как mid-turn"
+        }
+      }
+    },
+    {
+      "id": "SRC-0009/rule/cancelled-approval-defaults",
+      "src": "SRC-0009",
+      "composition": "rule",
+      "terms": {
+        "condition": "При cancel_token.cancelled во время ожидания approval/user_input/permissions — возвращаются безопасные defaults: ReviewDecision::Abort; пустой RequestUserInputResponse { answers: HashMap::new() }; пустой RequestPermissionsResponse { permissions: Default::default(), scope: PermissionGrantScope::Turn }. Parent уведомляется через notify_*",
+        "numbers": null,
+        "formula": null,
+        "gwt": {
+          "given": "review_rx ожидает decision; cancel_token.cancel()",
+          "when": "await_approval_with_cancel",
+          "then": "review_cancel_token.cancel() (если задан); parent_session.notify_approval(approval_id, ReviewDecision::Abort); возвращается ReviewDecision::Abort"
+        }
+      }
+    },
+    {
+      "id": "SRC-0009/rule/mcp-review-decision-mapping",
+      "src": "SRC-0009",
+      "composition": "rule",
+      "terms": {
+        "condition": "maybe_auto_review_mcp_request_user_input преобразует ReviewDecision в label: ApprovedForSession → options.find(label == MCP_TOOL_APPROVAL_ACCEPT_FOR_SESSION) (fallback MCP_TOOL_APPROVAL_ACCEPT); Approved/ApprovedExecpolicyAmendment{...}/NetworkPolicyAmendment{...} → MCP_TOOL_APPROVAL_ACCEPT; Denied/TimedOut/Abort → MCP_TOOL_APPROVAL_DECLINE_SYNTHETIC",
+        "numbers": null,
+        "formula": null,
+        "gwt": {
+          "given": "review_rx возвратил ReviewDecision::ApprovedForSession; вопрос имеет option с label == MCP_TOOL_APPROVAL_ACCEPT_FOR_SESSION",
+          "when": "auto-review mapping",
+          "then": "selected_label = MCP_TOOL_APPROVAL_ACCEPT_FOR_SESSION; ответ возвращается как RequestUserInputResponse { answers: { question.id: { answers: [selected_label] } } }"
+        }
+      }
+    },
+    {
+      "id": "SRC-0009/rule/out-of-band-elicitation-counter-bounds",
+      "src": "SRC-0009",
+      "composition": "rule",
+      "terms": {
+        "condition": "Счётчик out_of_band_elicitation_count: checked_add(1) при overflow → Fatal('out-of-band elicitation count overflowed'); decrement при *guard==0 → InvalidRequest('out-of-band elicitation count is already zero'); pause_state(paused=true) только при переходе 0→1; pause_state(paused=false) только при переходе 1→0",
+        "numbers": [
+          {"value": 0, "kind": "boundary", "name": "counter floor"},
+          {"value": "u64::MAX", "kind": "boundary", "name": "counter ceiling (overflow)"}
+        ],
+        "formula": null,
+        "gwt": {
+          "given": "count = 0",
+          "when": "increment → 1 (was_zero=true) → decrement → 0 (now_zero=true)",
+          "then": "set_out_of_band_elicitation_pause_state(true) при increment, set_out_of_band_elicitation_pause_state(false) при decrement"
+        }
+      }
+    },
+    {
+      "id": "SRC-0009/rule/managed-network-proxy-active",
+      "src": "SRC-0009",
+      "composition": "rule",
+      "terms": {
+        "condition": "Managed network proxy активен для данной SandboxPolicy ТТТК policy != SandboxPolicy::DangerFullAccess. При DangerFullAccess proxy не управляется сессией",
+        "numbers": null,
+        "formula": "active = !matches!(sandbox_policy, SandboxPolicy::DangerFullAccess)",
+        "gwt": {
+          "given": "sandbox_policy = SandboxPolicy::DangerFullAccess",
+          "when": "Session::managed_network_proxy_active_for_sandbox_policy",
+          "then": "false (proxy не активен для full-access режима)"
+        }
+      }
+    },
+    {
+      "id": "SRC-0009/rule/reasoning-effort-median-of-supported",
+      "src": "SRC-0009",
+      "composition": "rule",
+      "terms": {
+        "condition": "При смене модели (TurnContext::with_model): если текущий reasoning_effort есть в supported_reasoning_levels новой модели — сохранить; иначе — взять median (supported[(len - 1)/2]) либо model_info.default_reasoning_level. Если текущий был None — также median-of-supported либо default_reasoning_level",
+        "numbers": null,
+        "formula": "reasoning_effort = if supported.contains(current) then current else supported.get((supported.len().saturating_sub(1)) / 2).copied().or(model_info.default_reasoning_level)",
+        "gwt": {
+          "given": "supported_reasoning_levels = [Low, Medium, High]; current = ExtraHigh",
+          "when": "with_model(new_model)",
+          "then": "current не в supported → supported[(3-1)/2] = supported[1] = Medium; reasoning_effort = Some(Medium)"
+        }
+      }
+    },
+    {
+      "id": "SRC-0009/rule/auto-compact-trigger-midturn",
+      "src": "SRC-0009",
+      "composition": "rule",
+      "terms": {
+        "condition": "Mid-turn auto-compact срабатывает в run_turn когда total_usage_tokens >= auto_compact_limit И needs_follow_up (model_needs_follow_up || has_pending_input). После — run_auto_compact(InitialContextInjection::BeforeLastUserMessage, CompactionReason::ContextLimit, CompactionPhase::MidTurn) + client_session.reset_websocket_session + continue",
+        "numbers": [
+          {"value": "i64::MAX", "kind": "fallback", "name": "auto_compact_limit fallback when model_info.auto_compact_token_limit() is None"}
+        ],
+        "formula": "auto_compact_limit = model_info.auto_compact_token_limit().unwrap_or(i64::MAX); trigger = (total_usage_tokens >= auto_compact_limit) && (model_needs_follow_up || has_pending_input)",
+        "gwt": {
+          "given": "total_usage_tokens = 120000; auto_compact_limit = 100000; needs_follow_up = true",
+          "when": "run_turn sampling loop",
+          "then": "run_auto_compact(BeforeLastUserMessage, ContextLimit, MidTurn) → client_session.reset_websocket_session → continue"
+        }
+      }
+    },
+    {
+      "id": "SRC-0009/rule/auto-compact-pre-turn",
+      "src": "SRC-0009",
+      "composition": "rule",
+      "terms": {
+        "condition": "Pre-turn auto-compact в run_pre_sampling_compact: если total_usage_tokens (после возможной maybe_run_previous_model_inline_compact) >= auto_compact_limit → run_auto_compact(InitialContextInjection::DoNotInject, CompactionReason::ContextLimit, CompactionPhase::PreTurn)",
+        "numbers": null,
+        "formula": "trigger_pre_turn = total_usage_tokens >= auto_compact_limit",
+        "gwt": {
+          "given": "total_usage_tokens >= auto_compact_limit перед sampling",
+          "when": "run_pre_sampling_compact",
+          "then": "run_auto_compact(DoNotInject, ContextLimit, PreTurn) — не инжектировать initial context, просто compact"
+        }
+      }
+    },
+    {
+      "id": "SRC-0009/rule/previous-model-inline-compact",
+      "src": "SRC-0009",
+      "composition": "rule",
+      "terms": {
+        "condition": "maybe_run_previous_model_inline_compact срабатывает при смене модели на меньший context window: требует (previous.model != current.model) И (previous.context_window > current.context_window) И (total_usage_tokens > new_auto_compact_limit). Компактит на previous_model_turn_context с CompactionReason::ModelDownshift, phase=PreTurn",
+        "numbers": null,
+        "formula": "should_run = total_usage_tokens > new_auto_compact_limit && previous.slug != current.slug && previous.context_window > current.context_window",
+        "gwt": {
+          "given": "previous model = gpt-5.3-codex (context_window=200k); current = gpt-5.2 (context_window=128k); total_usage_tokens=140k; new_auto_compact_limit=120k",
+          "when": "run_pre_sampling_compact → maybe_run_previous_model_inline_compact",
+          "then": "run_auto_compact(DoNotInject, ModelDownshift, PreTurn) на previous_model_turn_context; возвращается Ok(true)"
+        }
+      }
+    },
+    {
+      "id": "SRC-0009/rule/stop-hook-permission-mode",
+      "src": "SRC-0009",
+      "composition": "rule",
+      "terms": {
+        "condition": "В Stop-hook permission_mode определяется по turn_context.approval_policy: Never → 'bypassPermissions'; UnlessTrusted/OnFailure/OnRequest/Granular(_) → 'default'",
+        "numbers": null,
+        "formula": "permission_mode = match approval_policy.value() { Never => 'bypassPermissions', UnlessTrusted|OnFailure|OnRequest|Granular(_) => 'default' }",
+        "gwt": {
+          "given": "approval_policy = AskForApproval::Never",
+          "when": "run_turn формирует StopRequest",
+          "then": "StopRequest.permission_mode = 'bypassPermissions'"
+        }
+      }
+    },
+    {
+      "id": "SRC-0009/rule/stop-hook-continuation",
+      "src": "SRC-0009",
+      "composition": "rule",
+      "terms": {
+        "condition": "Если stop_outcome.should_block == true: build_hook_prompt_message(stop_outcome.continuation_fragments) → если Some(message) → record_conversation_items + stop_hook_active=true + continue loop; если None — send EventMsg::Warning('Stop hook requested continuation without a prompt; ignoring the block.') и НЕ continue",
+        "numbers": null,
+        "formula": null,
+        "gwt": {
+          "given": "stop_outcome.should_block=true; continuation_fragments не дают валидного hook_prompt_message",
+          "when": "run_turn обрабатывает stop hook",
+          "then": "send Warning 'Stop hook requested continuation without a prompt; ignoring the block.'; не continue — выполнение продолжает в ту же итерацию без rerun"
+        }
+      }
+    },
+    {
+      "id": "SRC-0009/rule/after-agent-hook-abort",
+      "src": "SRC-0009",
+      "composition": "rule",
+      "terms": {
+        "condition": "При HookResult::FailedAbort в AfterAgent hook — run_turn отправляет EventMsg::Error с сообщением 'after_agent hook ''{hook_name}'' failed and aborted turn completion: {error}' и возвращает None (turn считается аварийно прерванным). HookResult::FailedContinue логируется как warn, но не прерывает",
+        "numbers": null,
+        "formula": null,
+        "gwt": {
+          "given": "after_agent hook 'my-hook' возвращает HookResult::FailedAbort(error)",
+          "when": "run_turn hook dispatch",
+          "then": "abort_message = Some('after_agent hook \\'my-hook\\' failed and aborted turn completion: {error}'); send EventMsg::Error; return None"
+        }
+      }
+    },
+    {
+      "id": "SRC-0009/rule/invalid-image-recovery",
+      "src": "SRC-0009",
+      "composition": "rule",
+      "terms": {
+        "condition": "На CodexErr::InvalidImageRequest() run_turn пытается санировать history: если history.replace_last_turn_images('Invalid image') == true → continue (retry сампинга); иначе send EventMsg::Error с сообщением 'Invalid image in your last message. Please remove it and try again.' (CodexErrorInfo::BadRequest) и break",
+        "numbers": null,
+        "formula": null,
+        "gwt": {
+          "given": "model вернул InvalidImageRequest; history содержит last_turn с image",
+          "when": "run_turn обрабатывает ошибку",
+          "then": "error_or_panic('Invalid image detected; sanitizing tool output to prevent poisoning'); history.replace_last_turn_images('Invalid image') == true → continue (retry без image)"
+        }
+      }
+    },
+    {
+      "id": "SRC-0009/rule/sandbox-policy-change-network-derivation",
+      "src": "SRC-0009",
+      "composition": "rule",
+      "terms": {
+        "condition": "При SessionConfiguration::apply: если updates.sandbox_policy задан и set успешен → network_sandbox_policy = NetworkSandboxPolicy::from(next.sandbox_policy.get()); file_system_sandbox_policy rederives через FileSystemSandboxPolicy::from_legacy_sandbox_policy ТОЛЬКО если sandbox_policy_changed ИЛИ (cwd_changed И текущая file_system_policy matches legacy) — иначе сохраняются \"richer\" split policies",
+        "numbers": null,
+        "formula": "file_system_policy_matches_legacy = current.fs_policy == FileSystemSandboxPolicy::from_legacy_sandbox_policy(current.sandbox, current.cwd); rederive = sandbox_changed || (cwd_changed && file_system_policy_matches_legacy)",
+        "gwt": {
+          "given": "session использует custom FileSystemSandboxPolicy (не legacy); обновляется только cwd",
+          "when": "SessionConfiguration::apply(updates)",
+          "then": "file_system_sandbox_policy НЕ пересчитывается (file_system_policy_matches_legacy=false); richer split policy сохраняется; network_sandbox_policy остаётся прежним"
+        }
+      }
+    },
+    {
+      "id": "SRC-0009/rule/cyber-safety-reroute-message",
+      "src": "SRC-0009",
+      "composition": "rule",
+      "terms": {
+        "condition": "При маршрутизации запроса на gpt-5.2 из-за high-risk cyber activity — эмитится ModelReroute event (from_model, to_model, reason=HighRiskCyberActivity) + Warning event + record_model_warning с текстом, содержащим ссылки CYBER_VERIFY_URL (chatgpt.com/cyber) и CYBER_SAFETY_URL (developers.openai.com/codex/concepts/cyber-safety)",
+        "numbers": [
+          {"value": "https://chatgpt.com/cyber", "kind": "url", "name": "CYBER_VERIFY_URL"},
+          {"value": "https://developers.openai.com/codex/concepts/cyber-safety", "kind": "url", "name": "CYBER_SAFETY_URL"}
+        ],
+        "formula": "warning_message = 'Your account was flagged for potentially high-risk cyber activity and this request was routed to gpt-5.2 as a fallback. To regain access to gpt-5.3-codex, apply for trusted access: {CYBER_VERIFY_URL} or learn more: {CYBER_SAFETY_URL}'",
+        "gwt": {
+          "given": "requested_model = 'gpt-5.3-codex'; server вернул 'gpt-5.2' (разный от requested)",
+          "when": "maybe_warn_on_server_model_mismatch",
+          "then": "send EventMsg::ModelReroute { from_model: 'gpt-5.3-codex', to_model: 'gpt-5.2', reason: HighRiskCyberActivity }; Warning с сообщением с обеими URL; record_model_warning"
+        }
+      }
+    },
+    {
+      "id": "SRC-0009/rule/input-empty-no-pending-returns-none",
+      "src": "SRC-0009",
+      "composition": "rule",
+      "terms": {
+        "condition": "run_turn возвращает None, если input.is_empty() И !sess.has_pending_input() (нет работы для turn)",
+        "numbers": null,
+        "formula": null,
+        "gwt": {
+          "given": "input = Vec::new(); sess.has_pending_input() == false",
+          "when": "run_turn",
+          "then": "return None без каких-либо side effects"
+        }
+      }
+    },
+    {
+      "id": "SRC-0009/rule/inject-response-items-nonempty",
+      "src": "SRC-0009",
+      "composition": "rule",
+      "terms": {
+        "condition": "CodexThread::inject_response_items отказывает пустой input: Err(CodexErr::InvalidRequest('items must not be empty')). Также pending_message_input_item принимает только ResponseItem::Message — для прочих вариантов возвращает CodexErr::InvalidRequest('append_message only supports ResponseItem::Message')",
+        "numbers": null,
+        "formula": null,
+        "gwt": {
+          "given": "items = Vec::new()",
+          "when": "CodexThread::inject_response_items(items)",
+          "then": "Err(CodexErr::InvalidRequest('items must not be empty'))"
+        }
+      }
+    },
+    {
+      "id": "SRC-0009/rule/thread-rollback-preconditions",
+      "src": "SRC-0009",
+      "composition": "rule",
+      "terms": {
+        "condition": "handlers::thread_rollback: num_turns == 0 → Error('num_turns must be >= 1', CodexErrorInfo::ThreadRollbackFailed); если есть активный turn → Error('Cannot rollback while a turn is in progress.', ThreadRollbackFailed); если нет persisted rollout recorder → Error('thread rollback requires a persisted rollout path', ThreadRollbackFailed)",
+        "numbers": [
+          {"value": 1, "kind": "min_value", "name": "num_turns minimum"}
+        ],
+        "formula": null,
+        "gwt": {
+          "given": "Op::ThreadRollback { num_turns: 0 }",
+          "when": "handlers::thread_rollback",
+          "then": "send Event::Error { message: 'num_turns must be >= 1', codex_error_info: ThreadRollbackFailed }; return (до rollback кода не доходит)"
+        }
+      }
+    },
+    {
+      "id": "SRC-0009/rule/set-thread-memory-mode-persistence",
+      "src": "SRC-0009",
+      "composition": "rule",
+      "terms": {
+        "condition": "persist_thread_memory_mode_update: требует активный rollout recorder (иначе 'Session persistence is disabled; cannot update thread memory mode.'); проверяет session_meta.meta.id == sess.conversation_id (иначе bail!('rollout session metadata id mismatch: expected {}, found {}')). Меняет session_meta.memory_mode на 'enabled' или 'disabled' по ThreadMemoryMode",
+        "numbers": null,
+        "formula": "memory_mode_str = match mode { ThreadMemoryMode::Enabled => 'enabled', ThreadMemoryMode::Disabled => 'disabled' }",
+        "gwt": {
+          "given": "session с активным rollout recorder; ThreadMemoryMode::Disabled",
+          "when": "persist_thread_memory_mode_update",
+          "then": "session_meta.memory_mode = Some('disabled'); записывается RolloutItem::SessionMeta + flush"
+        }
+      }
+    },
+    {
+      "id": "SRC-0009/rule/token-usage-trace-logging",
+      "src": "SRC-0009",
+      "composition": "rule",
+      "terms": {
+        "condition": "После sampling_request run_turn эмитит tracing::trace с полями turn_id, total_usage_tokens, estimated_token_count, auto_compact_limit, token_limit_reached, model_needs_follow_up, has_pending_input, needs_follow_up — 'post sampling token usage'",
+        "numbers": null,
+        "formula": "token_limit_reached = total_usage_tokens >= auto_compact_limit",
+        "gwt": {
+          "given": "total_usage_tokens=80000; auto_compact_limit=100000",
+          "when": "run_turn после run_sampling_request",
+          "then": "token_limit_reached=false; trace!(turn_id, 80000, _, 100000, false, ...) 'post sampling token usage'"
+        }
+      }
+    },
+    {
+      "id": "SRC-0009/rule/subagent-analytics-requires-client-metadata",
+      "src": "SRC-0009",
+      "composition": "rule",
+      "terms": {
+        "condition": "emit_subagent_session_started: если client_name ИЛИ client_version (из AppServerClientMetadata) отсутствуют — warn!('skipping subagent thread analytics: missing inherited client metadata') и не эмитить событие; иначе — track_subagent_thread_started с полем created_at = UNIX_EPOCH.elapsed().as_secs (u64)",
+        "numbers": null,
+        "formula": "created_at = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs()",
+        "gwt": {
+          "given": "AppServerClientMetadata { client_name: None, client_version: Some('v1') }",
+          "when": "emit_subagent_session_started",
+          "then": "warn!('skipping subagent thread analytics: missing inherited client metadata'); track_subagent_thread_started НЕ вызывается"
+        }
+      }
+    },
+    {
+      "id": "SRC-0009/rule/overwriting-pending-approval-warn",
+      "src": "SRC-0009",
+      "composition": "rule",
+      "terms": {
+        "condition": "Если insert_pending_approval/insert_pending_request_permissions/insert_pending_user_input/insert_pending_elicitation обнаруживают существующую запись — эмитится warn с ключом (call_id/approval_id/sub_id/{server, request_id}) для диагностики двойной подписки",
+        "numbers": null,
+        "formula": null,
+        "gwt": {
+          "given": "для approval_id='X' уже есть pending entry",
+          "when": "request_command_approval повторно insert_pending_approval('X', tx)",
+          "then": "warn!('Overwriting existing pending approval for call_id: X')"
+        }
+      }
+    },
+    {
+      "id": "SRC-0009/rule/elicitation-resolve-content-policy",
+      "src": "SRC-0009",
+      "composition": "rule",
+      "terms": {
+        "condition": "При Op::ResolveElicitation: декодировать decision→ElicitationAction: Accept → content = content.unwrap_or_else(|| json!({})) (сохраняем legacy fallback для клиентов, шлющих только action); Decline/Cancel → content = None",
+        "numbers": null,
+        "formula": null,
+        "gwt": {
+          "given": "decision=Accept; content=None",
+          "when": "handlers::resolve_elicitation",
+          "then": "content = Some(json!({})) — пустой объект как legacy fallback"
+        }
+      }
+    },
+    {
+      "id": "SRC-0009/rule/deprecated-type-aliases",
+      "src": "SRC-0009",
+      "composition": "rule",
+      "terms": {
+        "condition": "В lib.rs объявлены три deprecated type aliases, совместимые со старым API: ConversationManager=ThreadManager; NewConversation=NewThread; CodexConversation=CodexThread. Их использование вызывает warning компилятора с note='use {новое имя}'. Также deprecated re-export: find_conversation_path_by_id_str (use find_thread_path_by_id_str)",
+        "numbers": null,
+        "formula": null,
+        "gwt": {
+          "given": "external code использует ConversationManager",
+          "when": "компиляция кода",
+          "then": "компилятор выдаёт deprecation warning 'use ThreadManager'; тип совместим на runtime (алиас)"
+        }
+      }
+    },
+    {
+      "id": "SRC-0009/rule/stdout-stderr-forbidden",
+      "src": "SRC-0009",
+      "composition": "rule",
+      "terms": {
+        "condition": "Корневой модуль крейта codex-core задаёт `#![deny(clippy::print_stdout, clippy::print_stderr)]` — любые прямые println!/eprintln!/print! в library коде запрещены. Весь user-visible output должен идти через TUI или tracing stack",
+        "numbers": null,
+        "formula": null,
+        "gwt": {
+          "given": "попытка добавить println!('hello') в codex-core/src/*.rs",
+          "when": "cargo build с clippy deny",
+          "then": "ошибка компиляции: 'use of println! is denied by `clippy::print_stdout`'"
+        }
+      }
+    }
+  ]
+}

@@ -1,0 +1,666 @@
+{
+  "src": "SRC-0015",
+  "schema_version": "2.0",
+  "lens": "rule",
+  "compositions": [
+    {
+      "id": "SRC-0015/rule/session-denied-host-precedence",
+      "src": "SRC-0015",
+      "composition": "rule",
+      "terms": {
+        "condition": "Если HostApprovalKey присутствует в session_denied_hosts — запрос отклоняется немедленно с причиной not_allowed; проверка session_denied_hosts выполняется ПЕРЕД проверкой session_approved_hosts",
+        "numbers": [{"value": "not_allowed", "kind": "deny_reason_constant", "note": "REASON_NOT_ALLOWED: &str = \"not_allowed\""}],
+        "formula": null,
+        "gwt": {
+          "given": "HostApprovalKey{host=\"api.example.com\", protocol=\"https\", port=443} зарегистрирован в session_denied_hosts",
+          "when": "handle_inline_policy_request приходит с тем же host+protocol+port",
+          "then": "возвращается NetworkDecision::deny(\"not_allowed\") — пользователь не спрашивается повторно"
+        }
+      }
+    },
+    {
+      "id": "SRC-0015/rule/session-approved-host-shortcut",
+      "src": "SRC-0015",
+      "composition": "rule",
+      "terms": {
+        "condition": "Если HostApprovalKey присутствует в session_approved_hosts (и не в denied) — запрос разрешается немедленно без опроса пользователя/guardian; возвращается NetworkDecision::Allow",
+        "numbers": null,
+        "formula": null,
+        "gwt": {
+          "given": "HostApprovalKey{host=\"api.example.com\", protocol=\"https\", port=443} добавлен в session_approved_hosts (после ReviewDecision::ApprovedForSession или NetworkPolicyAmendment{Allow})",
+          "when": "handle_inline_policy_request приходит повторно с тем же ключом",
+          "then": "возвращается NetworkDecision::Allow без prompt"
+        }
+      }
+    },
+    {
+      "id": "SRC-0015/rule/host-key-case-normalization",
+      "src": "SRC-0015",
+      "composition": "rule",
+      "terms": {
+        "condition": "Host в HostApprovalKey нормализуется через to_ascii_lowercase; сравнение/кэширование регистронезависимо по host",
+        "numbers": null,
+        "formula": "HostApprovalKey.host = request.host.to_ascii_lowercase()",
+        "gwt": {
+          "given": "NetworkPolicyRequest{host=\"API.Example.COM\", port=443, protocol=HttpsConnect}",
+          "when": "HostApprovalKey::from_request(request, NetworkApprovalProtocol::Https)",
+          "then": "key.host=\"api.example.com\", key.protocol=\"https\", key.port=443 — совпадает с ранее одобренным ключом lowercase варианта"
+        }
+      }
+    },
+    {
+      "id": "SRC-0015/rule/sandbox-policy-allows-network-approval",
+      "src": "SRC-0015",
+      "composition": "rule",
+      "terms": {
+        "condition": "Approval-поток для сетевого запроса разрешён только если SandboxPolicy=ReadOnly или SandboxPolicy=WorkspaceWrite; для других sandbox policy owner немедленно ставит Deny и записывает DeniedByPolicy с сообщением \"Network access to \\\"{target}\\\" was blocked by policy.\"",
+        "numbers": null,
+        "formula": "sandbox_policy_allows_network_approval_flow(policy) = matches!(policy, SandboxPolicy::ReadOnly {..} | SandboxPolicy::WorkspaceWrite {..})",
+        "gwt": {
+          "given": "turn_context.sandbox_policy=SandboxPolicy::DangerFullAccess (не ReadOnly и не WorkspaceWrite)",
+          "when": "owner handle_inline_policy_request проверяет политику",
+          "then": "pending.set_decision(Deny); call_outcomes записывает DeniedByPolicy(\"Network access to \\\"https://example.com:443\\\" was blocked by policy.\"); возврат NetworkDecision::deny(\"not_allowed\")"
+        }
+      }
+    },
+    {
+      "id": "SRC-0015/rule/approval-policy-allows-network-approval-flow",
+      "src": "SRC-0015",
+      "composition": "rule",
+      "terms": {
+        "condition": "Approval-поток для сетевого запроса разрешён при любой AskForApproval кроме Never; при AskForApproval::Never owner немедленно ставит Deny и записывает DeniedByPolicy",
+        "numbers": null,
+        "formula": "allows_network_approval_flow(policy) = !matches!(policy, AskForApproval::Never)",
+        "gwt": {
+          "given": "turn_context.approval_policy=AskForApproval::Never",
+          "when": "owner handle_inline_policy_request проверяет политику approval",
+          "then": "pending.set_decision(Deny); call_outcomes: DeniedByPolicy(\"Network access to ... was blocked by policy.\"); возврат NetworkDecision::deny(\"not_allowed\") — approval-поток отключён"
+        }
+      }
+    },
+    {
+      "id": "SRC-0015/rule/active-call-required-for-turn-context",
+      "src": "SRC-0015",
+      "composition": "rule",
+      "terms": {
+        "condition": "Approval невозможен без активного turn: если session.active_turn.tasks.first()=None (нет активного task) — owner немедленно Deny с DeniedByPolicy и возвратом not_allowed",
+        "numbers": null,
+        "formula": null,
+        "gwt": {
+          "given": "session.active_turn.lock().await даёт Some(turn) но turn.tasks.first()=None (нет первого task в turn)",
+          "when": "active_turn_context(session) вызывается в owner-ветке",
+          "then": "возвращается None → owner ставит Deny, записывает DeniedByPolicy(policy_denial_message), возвращает deny(\"not_allowed\")"
+        }
+      }
+    },
+    {
+      "id": "SRC-0015/rule/protocol-key-label-mapping",
+      "src": "SRC-0015",
+      "composition": "rule",
+      "terms": {
+        "condition": "NetworkApprovalProtocol маппится в stable string label для ключа и prompt: Http→\"http\", Https→\"https\", Socks5Tcp→\"socks5-tcp\", Socks5Udp→\"socks5-udp\"; используется в HostApprovalKey.protocol и target-строке",
+        "numbers": [
+          {"value": "http", "kind": "protocol_label"},
+          {"value": "https", "kind": "protocol_label"},
+          {"value": "socks5-tcp", "kind": "protocol_label"},
+          {"value": "socks5-udp", "kind": "protocol_label"}
+        ],
+        "formula": "protocol_key_label(Http)=\"http\"; protocol_key_label(Https)=\"https\"; protocol_key_label(Socks5Tcp)=\"socks5-tcp\"; protocol_key_label(Socks5Udp)=\"socks5-udp\"",
+        "gwt": {
+          "given": "NetworkApprovalProtocol::Socks5Tcp",
+          "when": "protocol_key_label(protocol)",
+          "then": "вернуть \"socks5-tcp\" — используется в HostApprovalKey.protocol и в target-строке"
+        }
+      }
+    },
+    {
+      "id": "SRC-0015/rule/network-protocol-to-approval-protocol-mapping",
+      "src": "SRC-0015",
+      "composition": "rule",
+      "terms": {
+        "condition": "NetworkProtocol из запроса маппится в NetworkApprovalProtocol: Http→Http, HttpsConnect→Https, Socks5Tcp→Socks5Tcp, Socks5Udp→Socks5Udp",
+        "numbers": null,
+        "formula": "request.protocol (NetworkProtocol) → NetworkApprovalProtocol: Http→Http; HttpsConnect→Https; Socks5Tcp→Socks5Tcp; Socks5Udp→Socks5Udp",
+        "gwt": {
+          "given": "NetworkPolicyRequest{protocol=NetworkProtocol::HttpsConnect}",
+          "when": "handle_inline_policy_request маппит протокол",
+          "then": "NetworkApprovalProtocol::Https → protocol_key_label=\"https\" в HostApprovalKey"
+        }
+      }
+    },
+    {
+      "id": "SRC-0015/rule/approval-id-for-key-format",
+      "src": "SRC-0015",
+      "composition": "rule",
+      "terms": {
+        "condition": "Guardian approval id и session approval id для network-запроса формируются по формату network#{protocol}#{host}#{port}",
+        "numbers": null,
+        "formula": "approval_id_for_key(key) = format!(\"network#{}#{}#{}\", key.protocol, key.host, key.port)",
+        "gwt": {
+          "given": "HostApprovalKey{protocol=\"https\", host=\"api.example.com\", port=443}",
+          "when": "approval_id_for_key(key)",
+          "then": "\"network#https#api.example.com#443\""
+        }
+      }
+    },
+    {
+      "id": "SRC-0015/rule/format-network-target",
+      "src": "SRC-0015",
+      "composition": "rule",
+      "terms": {
+        "condition": "Target-строка сетевого запроса (для prompt user/guardian и policy_denial_message) форматируется как {protocol}://{host}:{port}",
+        "numbers": null,
+        "formula": "format_network_target(protocol, host, port) = format!(\"{protocol}://{host}:{port}\")",
+        "gwt": {
+          "given": "protocol=\"https\", host=\"api.example.com\", port=443",
+          "when": "Self::format_network_target(\"https\", \"api.example.com\", 443)",
+          "then": "\"https://api.example.com:443\" — используется в prompt и в policy_denial_message \"Network access to \\\"{target}\\\" was blocked by policy.\""
+        }
+      }
+    },
+    {
+      "id": "SRC-0015/rule/pending-host-approval-deduplication",
+      "src": "SRC-0015",
+      "composition": "rule",
+      "terms": {
+        "condition": "Одновременные запросы к одному HostApprovalKey дедуплицируются: первый (owner) инициирует approval, остальные (non-owners) ждут решения через Notify и возвращают to_network_decision существующего PendingApprovalDecision",
+        "numbers": null,
+        "formula": "(pending, is_owner) = get_or_create_pending_approval(key): if key in map → (existing, false); else insert new → (created, true). Non-owner: pending.wait_for_decision().await.to_network_decision()",
+        "gwt": {
+          "given": "два конкурентных handle_inline_policy_request с одним HostApprovalKey; первый является owner, второй получает is_owner=false",
+          "when": "второй запрос выполняет pending.wait_for_decision().await",
+          "then": "пока decision=None — notified.await; после owner.set_decision(AllowOnce) — loop проверяет и возвращает AllowOnce.to_network_decision()=NetworkDecision::Allow; запрос не дублирует prompt"
+        }
+      }
+    },
+    {
+      "id": "SRC-0015/rule/pending-approval-decision-to-network-decision",
+      "src": "SRC-0015",
+      "composition": "rule",
+      "terms": {
+        "condition": "PendingApprovalDecision транслируется в NetworkDecision: AllowOnce|AllowForSession → NetworkDecision::Allow; Deny → NetworkDecision::deny(\"not_allowed\")",
+        "numbers": [{"value": "not_allowed", "kind": "deny_reason"}],
+        "formula": "to_network_decision(AllowOnce)=Allow; to_network_decision(AllowForSession)=Allow; to_network_decision(Deny)=NetworkDecision::deny(\"not_allowed\")",
+        "gwt": {
+          "given": "PendingApprovalDecision::AllowForSession",
+          "when": "decision.to_network_decision()",
+          "then": "NetworkDecision::Allow (прокси пропускает запрос)"
+        }
+      }
+    },
+    {
+      "id": "SRC-0015/rule/review-decision-to-pending-decision-mapping",
+      "src": "SRC-0015",
+      "composition": "rule",
+      "terms": {
+        "condition": "Маппинг ReviewDecision в PendingApprovalDecision: Approved|ApprovedExecpolicyAmendment → AllowOnce; ApprovedForSession → AllowForSession; NetworkPolicyAmendment{Allow} → AllowForSession (+persist amendment); NetworkPolicyAmendment{Deny} → Deny (+persist amendment, +cache_session_deny=true, record DeniedByUser в owner_call); Denied|Abort → Deny; TimedOut → Deny",
+        "numbers": null,
+        "formula": null,
+        "gwt": {
+          "given": "ReviewDecision::NetworkPolicyAmendment{network_policy_amendment.action=Allow}",
+          "when": "resolved match",
+          "then": "persist_network_policy_amendment (Ok → record message; Err → warn + send WarningEvent); resolved=AllowForSession → session_approved_hosts.insert(key), session_denied_hosts.remove(key); pending.set_decision(AllowForSession); NetworkDecision::Allow"
+        }
+      }
+    },
+    {
+      "id": "SRC-0015/rule/network-policy-amendment-persistence-failure-recovery",
+      "src": "SRC-0015",
+      "composition": "rule",
+      "terms": {
+        "condition": "При ошибке session.persist_network_policy_amendment: записать warn!(message); отправить Event{id=sub_id, msg=EventMsg::Warning(WarningEvent{message: \"Failed to apply network policy amendment: {err}\"})}; НЕ блокировать результат approval — resolved всё равно переходит в AllowForSession/Deny согласно action",
+        "numbers": null,
+        "formula": "on persist Err(err) → warn!(\"{message}\"); session.send_event_raw(Event{id: turn_context.sub_id.clone(), msg: EventMsg::Warning(WarningEvent{message: \"Failed to apply network policy amendment: {err}\"})}).await",
+        "gwt": {
+          "given": "ReviewDecision::NetworkPolicyAmendment{action=Allow}; persist_network_policy_amendment вернул Err(\"disk full\")",
+          "when": "on Err branch",
+          "then": "emit warn \"Failed to apply network policy amendment: disk full\"; emit Event Warning на sub_id; но resolved=AllowForSession продолжает выполняться → session_approved_hosts.insert; NetworkDecision::Allow"
+        }
+      }
+    },
+    {
+      "id": "SRC-0015/rule/denied-by-user-priority-in-call-outcomes",
+      "src": "SRC-0015",
+      "composition": "rule",
+      "terms": {
+        "condition": "Существующий DeniedByUser в call_outcomes НЕ перезаписывается последующими outcome-записями (приоритет явного отказа пользователя)",
+        "numbers": null,
+        "formula": "record_call_outcome(id, outcome): if matches!(call_outcomes.get(id), Some(DeniedByUser)) { return } else { call_outcomes.insert(id, outcome) }",
+        "gwt": {
+          "given": "call_outcomes[registration_id]=DeniedByUser (пользователь явно отклонил)",
+          "when": "поздний record_call_outcome(registration_id, DeniedByPolicy(msg))",
+          "then": "запись не производится — DeniedByUser остаётся; finish_immediate вернёт ToolError::Rejected(\"rejected by user\")"
+        }
+      }
+    },
+    {
+      "id": "SRC-0015/rule/single-active-call-attribution-gate",
+      "src": "SRC-0015",
+      "composition": "rule",
+      "terms": {
+        "condition": "Attribution outcome без явного registration_id возможна только когда активен ровно один call; при active_calls.len() != 1 outcome не записывается (невозможно однозначно приписать конкретному tool call)",
+        "numbers": [{"value": 1, "kind": "active_call_count_for_attribution"}],
+        "formula": "resolve_single_active_call: if active_calls.len()==1 { active_calls.values().next().cloned() } else { None }",
+        "gwt": {
+          "given": "active_calls.len()=2 (параллельные tool calls); BlockedRequest приходит от NetworkProxy",
+          "when": "record_blocked_request → record_outcome_for_single_active_call",
+          "then": "resolve_single_active_call=None → return; call_outcomes не обновляется; finish_immediate любого call вернёт Ok(()) по своей линии"
+        }
+      }
+    },
+    {
+      "id": "SRC-0015/rule/record-blocked-request-none-message-short-circuit",
+      "src": "SRC-0015",
+      "composition": "rule",
+      "terms": {
+        "condition": "Если denied_network_policy_message(&blocked)=None — запись outcome пропускается (BlockedRequest не интерпретируется как policy denial)",
+        "numbers": null,
+        "formula": "record_blocked_request(blocked): let Some(message) = denied_network_policy_message(&blocked) else { return }; record_outcome_for_single_active_call(DeniedByPolicy(message))",
+        "gwt": {
+          "given": "BlockedRequest для которого denied_network_policy_message вернул None",
+          "when": "record_blocked_request вызван",
+          "then": "ранний return — outcome не записывается; предыдущие outcomes (если есть) не затронуты"
+        }
+      }
+    },
+    {
+      "id": "SRC-0015/rule/outcome-to-tool-error-mapping",
+      "src": "SRC-0015",
+      "composition": "rule",
+      "terms": {
+        "condition": "На finish_immediate_network_approval outcome транслируется в Result<(), ToolError>: None → Ok(()); DeniedByUser → Err(ToolError::Rejected(\"rejected by user\")); DeniedByPolicy(message) → Err(ToolError::Rejected(message))",
+        "numbers": [{"value": "rejected by user", "kind": "rejection_message_user"}],
+        "formula": null,
+        "gwt": {
+          "given": "call_outcomes[registration_id]=DeniedByPolicy(\"Network access to \\\"https://blocked.com:443\\\" was blocked by policy.\")",
+          "when": "finish_immediate_network_approval(session, active) извлекает outcome и unregister",
+          "then": "Err(ToolError::Rejected(\"Network access to \\\"https://blocked.com:443\\\" was blocked by policy.\")) — tool call завершается с policy-сообщением"
+        }
+      }
+    },
+    {
+      "id": "SRC-0015/rule/begin-network-approval-activation-gate",
+      "src": "SRC-0015",
+      "composition": "rule",
+      "terms": {
+        "condition": "ActiveNetworkApproval создаётся только если: spec=Some && managed_network_active=true && spec.network.is_some(); иначе begin_network_approval возвращает None (network-approval цикл пропускается)",
+        "numbers": null,
+        "formula": "begin_network_approval: spec?; if !managed_network_active || spec.network.is_none() { return None }; registration_id=Uuid::new_v4(); register_call; Some(ActiveNetworkApproval{registration_id=Some, mode=spec.mode})",
+        "gwt": {
+          "given": "spec=Some(NetworkApprovalSpec{network=None, mode=Immediate}), managed_network_active=true",
+          "when": "begin_network_approval(session, turn_id, managed_network_active=true, spec)",
+          "then": "spec.network.is_none()=true → return None; active_calls НЕ обновляется; ActiveNetworkApproval не выдаётся"
+        }
+      }
+    },
+    {
+      "id": "SRC-0015/rule/into-deferred-conversion-rule",
+      "src": "SRC-0015",
+      "composition": "rule",
+      "terms": {
+        "condition": "ActiveNetworkApproval конвертируется в DeferredNetworkApproval только при mode=Deferred И registration_id=Some; иначе возвращается None (active approval просто drop-ается)",
+        "numbers": null,
+        "formula": "into_deferred(self): match (self.mode, self.registration_id) { (Deferred, Some(id)) → Some(DeferredNetworkApproval{id}); _ → None }",
+        "gwt": {
+          "given": "ActiveNetworkApproval{mode=Immediate, registration_id=Some(\"uuid\")}",
+          "when": "active.into_deferred()",
+          "then": "None — tool call не продолжает жить после run; finish_deferred_network_approval(session, None) также становится noop"
+        }
+      }
+    },
+    {
+      "id": "SRC-0015/rule/session-approved-host-update-on-allow-for-session",
+      "src": "SRC-0015",
+      "composition": "rule",
+      "terms": {
+        "condition": "Если resolved=AllowForSession — ключ добавляется в session_approved_hosts И удаляется из session_denied_hosts (атомарный переход approved)",
+        "numbers": null,
+        "formula": "if matches!(resolved, AllowForSession) { session_denied_hosts.remove(&key); session_approved_hosts.insert(key.clone()) }",
+        "gwt": {
+          "given": "ключ ранее был в session_denied_hosts; resolved=AllowForSession",
+          "when": "application of resolution",
+          "then": "session_denied_hosts.remove(key) → session_approved_hosts.insert(key) — следующий запрос к ключу вернёт Allow без prompt"
+        }
+      }
+    },
+    {
+      "id": "SRC-0015/rule/session-denied-host-update-on-amendment-deny",
+      "src": "SRC-0015",
+      "composition": "rule",
+      "terms": {
+        "condition": "Если resolved=Deny через NetworkPolicyAmendment{Deny} (cache_session_deny=true) — ключ удаляется из session_approved_hosts И добавляется в session_denied_hosts",
+        "numbers": null,
+        "formula": "if cache_session_deny { session_approved_hosts.remove(&key); session_denied_hosts.insert(key.clone()) }",
+        "gwt": {
+          "given": "ключ ранее был в session_approved_hosts; ReviewDecision=NetworkPolicyAmendment{Deny} → cache_session_deny=true",
+          "when": "application of resolution",
+          "then": "session_approved_hosts.remove(key) → session_denied_hosts.insert(key); следующий запрос к ключу вернёт deny(\"not_allowed\") без prompt"
+        }
+      }
+    },
+    {
+      "id": "SRC-0015/rule/default-exec-approval-requirement-matrix",
+      "src": "SRC-0015",
+      "composition": "rule",
+      "terms": {
+        "condition": "Решение default_exec_approval_requirement по матрице (AskForApproval × FileSystemSandboxKind): Never|OnFailure → Skip{bypass_sandbox=false, amendment=None}; OnRequest|Granular → NeedsApproval только если FS=Restricted, иначе Skip; UnlessTrusted → NeedsApproval всегда; если needs_approval И Granular(cfg) И !cfg.allows_sandbox_approval() → Forbidden{reason:\"approval policy disallowed sandbox approval prompt\"}",
+        "numbers": [{"value": "approval policy disallowed sandbox approval prompt", "kind": "forbidden_reason"}],
+        "formula": "needs_approval = match policy { Never|OnFailure → false; OnRequest|Granular(_) → matches!(fs.kind, FileSystemSandboxKind::Restricted); UnlessTrusted → true }; if needs_approval && matches!(policy, Granular(cfg) if !cfg.allows_sandbox_approval()) → Forbidden{reason}; else if needs_approval → NeedsApproval{reason=None, amendment=None}; else → Skip{bypass_sandbox=false, amendment=None}",
+        "gwt": {
+          "given": "policy=AskForApproval::Granular(cfg) где cfg.allows_sandbox_approval()=false; fs.kind=FileSystemSandboxKind::Restricted",
+          "when": "default_exec_approval_requirement(policy, &fs)",
+          "then": "needs_approval=true; Granular && !allows_sandbox_approval → ExecApprovalRequirement::Forbidden{reason: \"approval policy disallowed sandbox approval prompt\"}"
+        }
+      }
+    },
+    {
+      "id": "SRC-0015/rule/sandbox-override-for-first-attempt",
+      "src": "SRC-0015",
+      "composition": "rule",
+      "terms": {
+        "condition": "Первая попытка исполнения пропускает sandbox (BypassSandboxFirstAttempt) только если: sandbox_permissions.requires_escalated_permissions()=true ИЛИ exec_approval_requirement=Skip{bypass_sandbox=true, ..}. ExecPolicy Allow (Skip+bypass_sandbox=true) означает полный trust и превалирует над with_additional_permissions sandboxed-hints",
+        "numbers": null,
+        "formula": "sandbox_override_for_first_attempt(perms, req) = if perms.requires_escalated_permissions() || matches!(req, Skip{bypass_sandbox=true, ..}) { BypassSandboxFirstAttempt } else { NoOverride }",
+        "gwt": {
+          "given": "sandbox_permissions.requires_escalated_permissions()=false; exec_approval_requirement=Skip{bypass_sandbox=true, amendment=None}",
+          "when": "sandbox_override_for_first_attempt(permissions, &req)",
+          "then": "BypassSandboxFirstAttempt — первая попытка без sandbox (полный trust от ExecPolicy Allow)"
+        }
+      }
+    },
+    {
+      "id": "SRC-0015/rule/wants-no-sandbox-approval-matrix",
+      "src": "SRC-0015",
+      "composition": "rule",
+      "terms": {
+        "condition": "Можно ли запросить no-sandbox approval определяется по AskForApproval: OnFailure→true; UnlessTrusted→true; Never→false; OnRequest→false; Granular(cfg)→cfg.sandbox_approval",
+        "numbers": null,
+        "formula": "wants_no_sandbox_approval(policy): OnFailure→true; UnlessTrusted→true; Never→false; OnRequest→false; Granular(cfg)→cfg.sandbox_approval",
+        "gwt": {
+          "given": "policy=AskForApproval::Granular(cfg) где cfg.sandbox_approval=true",
+          "when": "wants_no_sandbox_approval(policy)",
+          "then": "true — разрешается prompt no-sandbox approval; при cfg.sandbox_approval=false → false (запрещено)"
+        }
+      }
+    },
+    {
+      "id": "SRC-0015/rule/should-bypass-approval-rule",
+      "src": "SRC-0015",
+      "composition": "rule",
+      "terms": {
+        "condition": "Approval пропускается (should_bypass=true) если already_approved=true (пользователь ранее approved-for-session эти keys) ИЛИ если policy=AskForApproval::Never",
+        "numbers": null,
+        "formula": "should_bypass_approval(policy, already_approved): if already_approved { return true }; matches!(policy, AskForApproval::Never)",
+        "gwt": {
+          "given": "already_approved=false; policy=AskForApproval::Never",
+          "when": "should_bypass_approval(Never, false)",
+          "then": "true — не спрашиваем, потому что Never означает автоматическое разрешение (без prompt)"
+        }
+      }
+    },
+    {
+      "id": "SRC-0015/rule/with-cached-approval-empty-keys-defense",
+      "src": "SRC-0015",
+      "composition": "rule",
+      "terms": {
+        "condition": "Если keys пустой — кэш не проверяется и fetch() вызывается напрямую (защитное поведение, чтобы не трактовать пустой набор как уже-approved)",
+        "numbers": null,
+        "formula": "with_cached_approval: if keys.is_empty() { return fetch().await }",
+        "gwt": {
+          "given": "keys=Vec::new() (эмпирически не бывает, но защитная проверка)",
+          "when": "with_cached_approval(services, tool_name, keys=[], fetch)",
+          "then": "fetch().await вызывается напрямую, кэш не используется; telemetry counter НЕ инкрементируется (за пределами фигурной скобки ранний return)"
+        }
+      }
+    },
+    {
+      "id": "SRC-0015/rule/with-cached-approval-all-keys-session-approved-shortcut",
+      "src": "SRC-0015",
+      "composition": "rule",
+      "terms": {
+        "condition": "with_cached_approval возвращает ApprovedForSession БЕЗ fetch только если ВСЕ keys имеют store.get(key)=Some(ApprovedForSession); если хотя бы один ключ не ApprovedForSession — fetch вызывается",
+        "numbers": null,
+        "formula": "already_approved = keys.iter().all(|key| matches!(store.get(key), Some(ReviewDecision::ApprovedForSession))); if already_approved { return ApprovedForSession } else { fetch().await }",
+        "gwt": {
+          "given": "apply_patch с keys=[\"file_a.rs\", \"file_b.rs\"]; store содержит file_a.rs→ApprovedForSession, file_b.rs не в store",
+          "when": "with_cached_approval(services, \"apply_patch\", keys, fetch)",
+          "then": "already_approved=false (file_b не ApprovedForSession) → вызывается fetch().await; telemetry counter codex.approval.requested инкрементируется"
+        }
+      }
+    },
+    {
+      "id": "SRC-0015/rule/with-cached-approval-cache-put-on-session-decision",
+      "src": "SRC-0015",
+      "composition": "rule",
+      "terms": {
+        "condition": "Кэш ApprovalStore обновляется только если decision=ApprovedForSession: для КАЖДОГО ключа из keys кладётся store.put(key, ApprovedForSession). Другие decisions (Approved, Denied, Abort, TimedOut, NetworkPolicyAmendment, ApprovedExecpolicyAmendment) НЕ кэшируются",
+        "numbers": null,
+        "formula": "if matches!(decision, ApprovedForSession) { for key in keys { store.put(key, ApprovedForSession) } }",
+        "gwt": {
+          "given": "apply_patch с keys=[\"file_a\", \"file_b\"]; fetch вернул ReviewDecision::Approved (одноразовое)",
+          "when": "if matches!(decision, ApprovedForSession) проверка",
+          "then": "false → cache не обновляется; следующий вызов с теми же keys вновь инициирует fetch (Approved не переиспользуется)"
+        }
+      }
+    },
+    {
+      "id": "SRC-0015/rule/approval-store-key-serialization",
+      "src": "SRC-0015",
+      "composition": "rule",
+      "terms": {
+        "condition": "ApprovalStore ключ сериализуется в JSON-строку через serde_json::to_string. При ошибке сериализации: get → None (кэш-miss); put → тихо пропускает (if let Ok(s) = ... )",
+        "numbers": null,
+        "formula": "get: serde_json::to_string(key).ok()? → map.get(&s).cloned(); put: if let Ok(s) = serde_json::to_string(&key) { map.insert(s, value) }",
+        "gwt": {
+          "given": "key, чья сериализация возвращает Err (гипотетически невозможно для ApprovalKey: Serialize, но защита есть)",
+          "when": "store.put(key, ApprovedForSession)",
+          "then": "if let Ok(s) не срабатывает; map.insert не вызывается; кэш не отравлен"
+        }
+      }
+    },
+    {
+      "id": "SRC-0015/rule/approval-requested-telemetry",
+      "src": "SRC-0015",
+      "composition": "rule",
+      "terms": {
+        "condition": "При каждом реальном fetch approval (когда кэш не сработал и keys не пустые) инкрементируется session telemetry counter codex.approval.requested с тэгами tool=tool_name, approved=decision.to_opaque_string()",
+        "numbers": [
+          {"value": "codex.approval.requested", "kind": "metric_name"},
+          {"value": 1, "kind": "metric_increment"}
+        ],
+        "formula": "services.session_telemetry.counter(\"codex.approval.requested\", /*inc*/1, &[(\"tool\", tool_name), (\"approved\", decision.to_opaque_string())])",
+        "gwt": {
+          "given": "tool_name=\"apply_patch\"; decision=ReviewDecision::ApprovedForSession",
+          "when": "fetch вернул decision, счётчик вызывается",
+          "then": "counter codex.approval.requested += 1 с тэгами tool=\"apply_patch\", approved=<ApprovedForSession.to_opaque_string()>"
+        }
+      }
+    },
+    {
+      "id": "SRC-0015/rule/sync-approved-hosts-clear-replace-semantics",
+      "src": "SRC-0015",
+      "composition": "rule",
+      "terms": {
+        "condition": "sync_session_approved_hosts_to полностью замещает target session_approved_hosts: other.clear() + extend с клонированными ключами источника. session_denied_hosts целевой сессии НЕ переносится",
+        "numbers": null,
+        "formula": "let approved_hosts = self.session_approved_hosts.lock().await.clone(); let mut other_approved_hosts = other.session_approved_hosts.lock().await; other_approved_hosts.clear(); other_approved_hosts.extend(approved_hosts.iter().cloned())",
+        "gwt": {
+          "given": "self.session_approved_hosts={key_a, key_b}; other.session_approved_hosts={key_c}; other.session_denied_hosts={key_d}",
+          "when": "self.sync_session_approved_hosts_to(other)",
+          "then": "other.session_approved_hosts={key_a, key_b} (key_c удалён); other.session_denied_hosts={key_d} (не затронуто); other.active_calls/pending/outcomes не затронуты"
+        }
+      }
+    },
+    {
+      "id": "SRC-0015/rule/guardian-routing-rule",
+      "src": "SRC-0015",
+      "composition": "rule",
+      "terms": {
+        "condition": "Approval маршрутизируется через guardian (review_approval_request) если routes_approval_to_guardian(&turn_context)=true; иначе — через session.request_command_approval с командой [network-access, target]. guardian_review_id генерируется только при маршрутизации через guardian",
+        "numbers": [
+          {"value": "network-access", "kind": "prompt_command_name"}
+        ],
+        "formula": "use_guardian = routes_approval_to_guardian(&turn_context); guardian_review_id = use_guardian.then(new_guardian_review_id); if guardian_review_id.is_some() { review_approval_request(&session, &turn_context, review_id, GuardianApprovalRequest::NetworkAccess{id, turn_id, target, host, protocol, port}, Some(policy_denial_message)) } else { session.request_command_approval(turn_context, approval_id, None, vec![\"network-access\", target], cwd, Some(prompt_reason), Some(network_approval_context), None, None, None) }",
+        "gwt": {
+          "given": "turn_context где routes_approval_to_guardian=true",
+          "when": "owner branch в handle_inline_policy_request",
+          "then": "guardian_review_id=Some(new_guardian_review_id()); вызов review_approval_request с GuardianApprovalRequest::NetworkAccess{id=guardian_approval_id, turn_id=owner_call?.turn_id иначе turn_context.sub_id, target, host, protocol, port=key.port}, reason=Some(policy_denial_message.clone())"
+        }
+      }
+    },
+    {
+      "id": "SRC-0015/rule/guardian-denied-recording-rule",
+      "src": "SRC-0015",
+      "composition": "rule",
+      "terms": {
+        "condition": "При ReviewDecision::Denied|Abort: если approval был через guardian (guardian_review_id=Some) И есть owner_call → record_call_outcome(owner_call.registration_id, DeniedByPolicy(guardian_rejection_message(session, review_id).await)); если без guardian И есть owner_call → record_call_outcome(owner_call.registration_id, DeniedByUser)",
+        "numbers": null,
+        "formula": null,
+        "gwt": {
+          "given": "ReviewDecision::Denied; guardian_review_id=Some(\"review-1\"); owner_call=Some(call)",
+          "when": "Denied | Abort branch",
+          "then": "guardian_rejection_message(session, \"review-1\") → message; record_call_outcome(owner_call.registration_id, DeniedByPolicy(message)); finish_immediate → ToolError::Rejected(message) — пользователь получит guardian-specific сообщение"
+        }
+      }
+    },
+    {
+      "id": "SRC-0015/rule/timeout-outcome-recording",
+      "src": "SRC-0015",
+      "composition": "rule",
+      "terms": {
+        "condition": "При ReviewDecision::TimedOut — если owner_call=Some, записать DeniedByPolicy(guardian_timeout_message()) в call_outcomes[owner_call.registration_id]; resolved=Deny",
+        "numbers": null,
+        "formula": null,
+        "gwt": {
+          "given": "ReviewDecision::TimedOut; owner_call=Some(call)",
+          "when": "TimedOut branch",
+          "then": "record_call_outcome(owner_call.registration_id, DeniedByPolicy(guardian_timeout_message())); resolved=Deny; finish_immediate → ToolError::Rejected(guardian_timeout_message_text) — tool call завершается с таймаут-сообщением"
+        }
+      }
+    },
+    {
+      "id": "SRC-0015/rule/prompt-reason-format",
+      "src": "SRC-0015",
+      "composition": "rule",
+      "terms": {
+        "condition": "Prompt reason для user-approval формируется как \"{host} is not in the allowed_domains\"; policy_denial_message — как \"Network access to \\\"{target}\\\" was blocked by policy.\"",
+        "numbers": [
+          {"value": "is not in the allowed_domains", "kind": "prompt_reason_suffix"},
+          {"value": "Network access to", "kind": "policy_denial_prefix"},
+          {"value": "was blocked by policy.", "kind": "policy_denial_suffix"}
+        ],
+        "formula": "prompt_reason = format!(\"{} is not in the allowed_domains\", request.host); policy_denial_message = format!(\"Network access to \\\"{target}\\\" was blocked by policy.\")",
+        "gwt": {
+          "given": "request.host=\"api.example.com\"; target=\"https://api.example.com:443\"",
+          "when": "prompt конструируется",
+          "then": "prompt_reason=\"api.example.com is not in the allowed_domains\"; policy_denial_message=\"Network access to \\\"https://api.example.com:443\\\" was blocked by policy.\""
+        }
+      }
+    },
+    {
+      "id": "SRC-0015/rule/unregister-call-cleanup",
+      "src": "SRC-0015",
+      "composition": "rule",
+      "terms": {
+        "condition": "unregister_call удаляет регистрацию И её outcome: active_calls.shift_remove(registration_id) И call_outcomes.remove(registration_id)",
+        "numbers": null,
+        "formula": "unregister_call(id): active_calls.shift_remove(id); call_outcomes.remove(id)",
+        "gwt": {
+          "given": "active_calls[\"uuid-1\"]=call; call_outcomes[\"uuid-1\"]=DeniedByUser",
+          "when": "unregister_call(\"uuid-1\")",
+          "then": "active_calls без \"uuid-1\" (IndexMap shift_remove сохраняет порядок остальных); call_outcomes без \"uuid-1\""
+        }
+      }
+    },
+    {
+      "id": "SRC-0015/rule/network-policy-decider-weak-session-guard",
+      "src": "SRC-0015",
+      "composition": "rule",
+      "terms": {
+        "condition": "build_network_policy_decider возвращает NetworkDecision::ask(\"not_allowed\") если сессия уже дропнута (Weak<Session>.upgrade()=None); иначе — делегирует в network_approval.handle_inline_policy_request",
+        "numbers": [{"value": "not_allowed", "kind": "ask_reason"}],
+        "formula": "let Some(session) = network_policy_decider_session.read().await.upgrade() else { return NetworkDecision::ask(\"not_allowed\") }; network_approval.handle_inline_policy_request(session, request).await",
+        "gwt": {
+          "given": "NetworkProxy прислал запрос; Weak<Session>.upgrade()=None (сессия дропнута)",
+          "when": "network_policy_decider вызывается",
+          "then": "NetworkDecision::ask(\"not_allowed\") — прокси получает ask, что означает маркировку для последующего обращения (не Allow, не строгий Deny)"
+        }
+      }
+    },
+    {
+      "id": "SRC-0015/rule/pending-host-approval-decision-wait-loop",
+      "src": "SRC-0015",
+      "composition": "rule",
+      "terms": {
+        "condition": "wait_for_decision реализует безопасный ожидающий цикл: регистрирует notified ДО чтения decision (anti-miss-notify), читает decision под lock — если Some, возвращает; иначе notified.await и повторяет",
+        "numbers": null,
+        "formula": "loop { let notified = self.notify.notified(); if let Some(decision) = *self.decision.lock().await { return decision } notified.await }",
+        "gwt": {
+          "given": "PendingHostApproval с decision=None; second waiter вызывает wait_for_decision",
+          "when": "notified зарегистрирован; lock прочитан → None; notified.await; owner вызывает set_decision(AllowOnce)",
+          "then": "notify.notify_waiters пробуждает waiter; новый loop: lock → Some(AllowOnce); return AllowOnce"
+        }
+      }
+    },
+    {
+      "id": "SRC-0015/rule/set-decision-notify-all-waiters",
+      "src": "SRC-0015",
+      "composition": "rule",
+      "terms": {
+        "condition": "set_decision под lock записывает *current=Some(decision), затем notify_waiters (не notify_one); все ожидающие будут пробуждены и прочитают общее решение — не создаётся гонка с повторным опросом",
+        "numbers": null,
+        "formula": "set_decision(decision): { let mut current = self.decision.lock().await; *current = Some(decision) } self.notify.notify_waiters()",
+        "gwt": {
+          "given": "PendingHostApproval с 3 waiters: 1 owner, 2 non-owners, decision=None",
+          "when": "owner вызывает set_decision(AllowForSession)",
+          "then": "current=Some(AllowForSession); notify_waiters пробуждает обоих non-owners; каждый читает decision=Some и возвращает AllowForSession.to_network_decision()=Allow"
+        }
+      }
+    },
+    {
+      "id": "SRC-0015/rule/escalate-on-failure-default-true",
+      "src": "SRC-0015",
+      "composition": "rule",
+      "terms": {
+        "condition": "Sandboxable::escalate_on_failure имеет default=true: по умолчанию tool запрашивает эскалацию прав при падении в sandbox (если Approvable::wants_no_sandbox_approval для текущей policy позволяет)",
+        "numbers": null,
+        "formula": "trait Sandboxable { fn escalate_on_failure(&self) -> bool { true } }",
+        "gwt": {
+          "given": "ToolRuntime не переопределяет escalate_on_failure",
+          "when": "runner спрашивает sandboxable.escalate_on_failure()",
+          "then": "true — при падении в sandbox будет попытка no-sandbox approval (если policy разрешает)"
+        }
+      }
+    },
+    {
+      "id": "SRC-0015/rule/tool-runtime-network-approval-spec-default-none",
+      "src": "SRC-0015",
+      "composition": "rule",
+      "terms": {
+        "condition": "ToolRuntime::network_approval_spec имеет default=None: tool не требует network approval, если не переопределит метод",
+        "numbers": null,
+        "formula": "trait ToolRuntime { fn network_approval_spec(&self, _req, _ctx) -> Option<NetworkApprovalSpec> { None } }",
+        "gwt": {
+          "given": "ToolRuntime не переопределяет network_approval_spec",
+          "when": "begin_network_approval получает spec из tool runtime",
+          "then": "spec=None → early return None в begin_network_approval → ActiveNetworkApproval не создаётся; tool исполняется без network approval gate"
+        }
+      }
+    },
+    {
+      "id": "SRC-0015/rule/approvable-sandbox-mode-default-no-override",
+      "src": "SRC-0015",
+      "composition": "rule",
+      "terms": {
+        "condition": "Approvable::sandbox_mode_for_first_attempt имеет default=NoOverride; Approvable::exec_approval_requirement имеет default=None; переопределяются конкретными tools когда нужен кастомный override",
+        "numbers": null,
+        "formula": "sandbox_mode_for_first_attempt(_req) → SandboxOverride::NoOverride; exec_approval_requirement(_req) → None",
+        "gwt": {
+          "given": "Approvable не переопределяет оба метода",
+          "when": "runner запрашивает",
+          "then": "sandbox_mode_for_first_attempt=NoOverride (первый attempt с sandbox); exec_approval_requirement=None → fall back к default_exec_approval_requirement на основе policy+fs.kind"
+        }
+      }
+    }
+  ]
+}

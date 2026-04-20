@@ -1,0 +1,321 @@
+{
+  "src": "SRC-0010",
+  "schema_version": "2.0",
+  "lens": "structural",
+  "compositions": [
+    {
+      "id": "SRC-0010/entity/model-client",
+      "src": "SRC-0010",
+      "composition": "entity",
+      "terms": {
+        "object": "ModelClient — session-scoped клиент для вызовов API модельного провайдера. Живёт на протяжении всей Codex-сессии, хранит стабильную конфигурацию (auth, provider, conversation_id) и состояние fallback транспорта",
+        "attributes": [
+          "auth_manager: опциональный менеджер аутентификации (Arc<AuthManager>)",
+          "conversation_id: ThreadId — идентификатор беседы",
+          "window_generation: счётчик window generation (AtomicU64, начальное значение 0)",
+          "installation_id: String — идентификатор установки",
+          "provider: ModelProviderInfo — информация о провайдере модели",
+          "auth_env_telemetry: AuthEnvTelemetry — телеметрия окружения аутентификации",
+          "session_source: SessionSource — источник сессии (Cli/VSCode/Exec/Mcp/Custom/SubAgent/Unknown)",
+          "model_verbosity: Option<VerbosityConfig> — настройка verbosity модели",
+          "enable_request_compression: bool — включение сжатия запросов",
+          "include_timing_metrics: bool — включение метрик тайминга",
+          "beta_features_header: Option<String> — заголовок beta-фичей",
+          "disable_websockets: AtomicBool — флаг отключения websocket (session-scoped)",
+          "cached_websocket_session: WebsocketSession (в StdMutex) — закешированная websocket-сессия для переиспользования между ходами"
+        ],
+        "relationships": [
+          {"to": "SRC-0010/entity/model-client-session", "rel": "creates", "card": "1:N", "note": "new_session() создаёт fresh turn-scoped сессию"},
+          {"to": "SRC-0010/entity/websocket-session", "rel": "caches", "card": "1:1", "note": "cached_websocket_session хранит последнюю сессию для переиспользования"},
+          {"to": "SRC-0010/entity/prompt", "rel": "consumes", "card": "1:N", "note": "compact_conversation_history, summarize_memories принимают Prompt"}
+        ],
+        "enumerations": {
+          "session_source": ["Cli", "VSCode", "Exec", "Mcp", "Custom", "SubAgent", "Unknown"],
+          "subagent_source_header_values": ["review (SubAgentSource::Review)", "compact (SubAgentSource::Compact)", "memory_consolidation (SubAgentSource::MemoryConsolidation)", "collab_spawn (SubAgentSource::ThreadSpawn)", "<label> (SubAgentSource::Other)"],
+          "auth_mode_header_values": ["ApiKey (AuthMode::ApiKey)", "Chatgpt (AuthMode::Chatgpt, AuthMode::ChatgptAuthTokens)"]
+        },
+        "data_flows": [
+          {"source": "AuthManager", "transform": "auth_manager_for_provider — резолвинг auth для провайдера", "sink": "ModelClient.state.auth_manager"},
+          {"source": "ModelProviderInfo + codex_api_key_env_enabled", "transform": "collect_auth_env_telemetry", "sink": "ModelClient.state.auth_env_telemetry"},
+          {"source": "conversation_id + window_generation", "transform": "format!(\"{conversation_id}:{window_generation}\")", "sink": "X-Codex-Window-Id header"},
+          {"source": "SessionSource::SubAgent", "transform": "subagent_header_value mapping", "sink": "X-OpenAI-Subagent header"},
+          {"source": "SessionSource::SubAgent::ThreadSpawn.parent_thread_id", "transform": "parent_thread_id_header_value", "sink": "X-Codex-Parent-Thread-Id header"}
+        ],
+        "config": {
+          "enable_request_compression": {"value": "caller-supplied", "source": "constructor parameter", "default": null},
+          "include_timing_metrics": {"value": "caller-supplied", "source": "constructor parameter", "default": null},
+          "beta_features_header": {"value": "caller-supplied", "source": "constructor parameter", "default": null, "note": "sent as 'x-codex-beta-features' header when non-empty"},
+          "model_verbosity": {"value": "caller-supplied", "source": "constructor parameter", "default": null, "note": "игнорируется если model не support_verbosity (warn лог)"},
+          "disable_websockets": {"value": false, "source": "hardcoded initial", "default": false, "note": "активируется через force_http_fallback"}
+        }
+      }
+    },
+    {
+      "id": "SRC-0010/entity/model-client-session",
+      "src": "SRC-0010",
+      "composition": "entity",
+      "terms": {
+        "object": "ModelClientSession — turn-scoped streaming сессия. Создаётся один раз на каждый Codex turn, держит ленивое websocket-соединение и sticky-routing token (turn_state). Повторное использование между turns нарушит client/server контракт (утечка turn_state в следующий turn)",
+        "attributes": [
+          "client: ModelClient — ссылка на родительский session-scoped клиент",
+          "websocket_session: WebsocketSession — per-turn websocket состояние",
+          "turn_state: Arc<OnceLock<String>> — sticky-routing token, получаемый от сервера через 'x-codex-turn-state' response header. Однажды установленный, отправляется обратно во всех последующих запросах этого turn'а"
+        ],
+        "relationships": [
+          {"to": "SRC-0010/entity/model-client", "rel": "belongs_to", "card": "N:1", "note": "создаётся через ModelClient::new_session()"},
+          {"to": "SRC-0010/entity/websocket-session", "rel": "owns", "card": "1:1"},
+          {"to": "SRC-0010/entity/response-stream", "rel": "produces", "card": "1:N", "note": "stream() возвращает ResponseStream"},
+          {"to": "SRC-0010/entity/last-response", "rel": "tracks", "card": "1:1", "note": "через websocket_session.last_response_rx"}
+        ],
+        "enumerations": {
+          "websocket_stream_outcome": ["Stream (возвращает ResponseStream)", "FallbackToHttp (переключение на HTTP-транспорт)"]
+        },
+        "data_flows": [
+          {"source": "ModelClient.cached_websocket_session", "transform": "take_cached_websocket_session (std::mem::take)", "sink": "ModelClientSession.websocket_session at creation"},
+          {"source": "ModelClientSession.websocket_session on drop", "transform": "store_cached_websocket_session", "sink": "ModelClient.cached_websocket_session"},
+          {"source": "server response header 'x-codex-turn-state'", "transform": "OnceLock::set", "sink": "ModelClientSession.turn_state"},
+          {"source": "ModelClientSession.turn_state", "transform": "build_responses_headers + build_websocket_headers", "sink": "'x-codex-turn-state' request header for all subsequent requests in turn"}
+        ],
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0010/entity/prompt",
+      "src": "SRC-0010",
+      "composition": "entity",
+      "terms": {
+        "object": "Prompt — payload запроса API для одного model turn. Содержит contextual input items, доступные tools, instructions и опциональные настройки модели (personality, output_schema)",
+        "attributes": [
+          "input: Vec<ResponseItem> — conversation context input items",
+          "tools: Vec<ToolSpec> — tools доступные модели, включая tools из external MCP servers",
+          "parallel_tool_calls: bool — разрешены ли параллельные tool calls",
+          "base_instructions: BaseInstructions — базовые инструкции (с полем text)",
+          "personality: Option<Personality> — опциональная personality модели",
+          "output_schema: Option<Value> — опциональная output schema для ответа модели"
+        ],
+        "relationships": [
+          {"to": "SRC-0010/entity/model-client-session", "rel": "consumed_by", "card": "N:1", "note": "stream, stream_responses_api, stream_responses_websocket, prewarm_websocket"},
+          {"to": "SRC-0010/entity/model-client", "rel": "consumed_by", "card": "N:1", "note": "compact_conversation_history"}
+        ],
+        "enumerations": null,
+        "data_flows": [
+          {"source": "Prompt.input + Prompt.tools", "transform": "get_formatted_input: если среди tools присутствует Freeform 'apply_patch' — reserialize_shell_outputs (структурировать shell output в текст)", "sink": "input для API request"},
+          {"source": "Prompt.tools", "transform": "create_tools_json_for_responses_api", "sink": "tools в ResponsesApiRequest"},
+          {"source": "Prompt.output_schema + verbosity", "transform": "create_text_param_for_request", "sink": "text param в API request"}
+        ],
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0010/entity/response-stream",
+      "src": "SRC-0010",
+      "composition": "entity",
+      "terms": {
+        "object": "ResponseStream — stream ответов модели. Обёртка над mpsc::Receiver<Result<ResponseEvent>>, реализует futures::Stream. События ResponseEvent поступают в канал из фонового tokio task, который обрабатывает SSE/WebSocket stream от API",
+        "attributes": [
+          "rx_event: mpsc::Receiver<Result<ResponseEvent>> — принимающая сторона канала событий"
+        ],
+        "relationships": [
+          {"to": "SRC-0010/entity/model-client-session", "rel": "produced_by", "card": "1:1", "note": "через stream_responses_api или stream_responses_websocket"},
+          {"to": "SRC-0010/entity/last-response", "rel": "emits_to", "card": "1:1", "note": "map_response_stream отправляет LastResponse через oneshot::channel при событии Completed"}
+        ],
+        "enumerations": {
+          "response_event_types_seen_in_mapping": ["OutputItemDone(item)", "Completed { response_id, token_usage }", "(другие — проходят прозрачно)"]
+        },
+        "data_flows": [
+          {"source": "API stream (SSE или WebSocket)", "transform": "map_response_stream tokio::spawn — накапливает items_added для OutputItemDone, отсылает LastResponse при Completed, пишет token_usage в session_telemetry", "sink": "ResponseStream.rx_event через mpsc канал (buffer 1600)"},
+          {"source": "ResponseEvent::Completed.token_usage", "transform": "session_telemetry.sse_event_completed(input_tokens, output_tokens, cached_input_tokens, reasoning_output_tokens, total_tokens)", "sink": "telemetry"}
+        ],
+        "config": {
+          "channel_buffer_size": {"value": 1600, "source": "hardcoded (client.rs:1571)", "default": 1600, "note": "mpsc::channel::<Result<ResponseEvent>>(1600)"}
+        }
+      }
+    },
+    {
+      "id": "SRC-0010/entity/websocket-session",
+      "src": "SRC-0010",
+      "composition": "entity",
+      "terms": {
+        "object": "WebsocketSession — per-turn состояние WebSocket-соединения. Держит открытое WebSocket-соединение, последний отправленный request (для incremental delta detection) и приёмник last_response для привязки previous_response_id",
+        "attributes": [
+          "connection: Option<ApiWebSocketConnection> — WebSocket соединение (None до первого запроса)",
+          "last_request: Option<ResponsesApiRequest> — последний отправленный request (для проверки incremental extension)",
+          "last_response_rx: Option<oneshot::Receiver<LastResponse>> — приёмник для получения LastResponse от фонового task",
+          "connection_reused: StdMutex<bool> — флаг переиспользования соединения между запросами turn'а"
+        ],
+        "relationships": [
+          {"to": "SRC-0010/entity/model-client-session", "rel": "owned_by", "card": "1:1"},
+          {"to": "SRC-0010/entity/last-response", "rel": "receives", "card": "1:1", "note": "через oneshot::Receiver"}
+        ],
+        "enumerations": null,
+        "data_flows": [
+          {"source": "connect_websocket (initial)", "transform": "ApiWebSocketResponsesClient::new(...).connect(headers, default_headers, turn_state, telemetry)", "sink": "WebsocketSession.connection"},
+          {"source": "stream_responses_websocket", "transform": "если connection.is_closed() → reconnect; иначе — connection_reused=true", "sink": "WebsocketSession.connection, WebsocketSession.connection_reused"},
+          {"source": "map_response_stream при Completed", "transform": "oneshot::send(LastResponse{response_id, items_added})", "sink": "WebsocketSession.last_response_rx"}
+        ],
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0010/entity/last-response",
+      "src": "SRC-0010",
+      "composition": "entity",
+      "terms": {
+        "object": "LastResponse — результат предыдущего ответа модели в текущем turn. Используется для incremental request detection: если новый запрос = previous_request + delta inputs, то отправляется только delta с привязкой previous_response_id",
+        "attributes": [
+          "response_id: String — идентификатор предыдущего response",
+          "items_added: Vec<ResponseItem> — items, добавленные сервером в предыдущем response (OutputItemDone события)"
+        ],
+        "relationships": [
+          {"to": "SRC-0010/entity/websocket-session", "rel": "belongs_to", "card": "1:1"}
+        ],
+        "enumerations": null,
+        "data_flows": [
+          {"source": "map_response_stream: накопление items при OutputItemDone + response_id при Completed", "transform": "std::mem::take(items_added) + response_id.clone()", "sink": "LastResponse через oneshot::channel"},
+          {"source": "LastResponse.items_added", "transform": "get_incremental_items: baseline = previous_request.input + last_response.items_added; new_request.input должен starts_with(baseline)", "sink": "incremental delta items для следующего WebSocket запроса"},
+          {"source": "LastResponse.response_id", "transform": "prepare_websocket_request", "sink": "previous_response_id в ResponseCreateWsRequest"}
+        ],
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0010/entity/prompt-formatted-input",
+      "src": "SRC-0010",
+      "composition": "entity",
+      "terms": {
+        "object": "Structured shell output — формат структурированного вывода shell-команд (для apply_patch/shell/container.exec tools в Freeform режиме). Преобразует raw JSON-output shell-вызова в текст с секциями Exit code / Wall time / Total output lines / Output",
+        "attributes": [
+          "output: String — текст вывода shell-команды",
+          "metadata.exit_code: i32 — код завершения",
+          "metadata.duration_seconds: f32 — время выполнения в секундах",
+          "total_output_lines: Option<u32> — общее количество строк (если в выводе есть префикс 'Total output lines: <N>\\n')"
+        ],
+        "relationships": [
+          {"to": "SRC-0010/entity/prompt", "rel": "transforms_for", "card": "N:1", "note": "применяется в Prompt::get_formatted_input при наличии Freeform apply_patch tool"}
+        ],
+        "enumerations": {
+          "triggering_tool_names": ["shell", "container.exec", "apply_patch"],
+          "triggering_response_item_variants": ["LocalShellCall", "CustomToolCall (name=apply_patch)", "FunctionCall (name in shell/container.exec/apply_patch)", "FunctionCallOutput", "CustomToolCallOutput"]
+        },
+        "data_flows": [
+          {"source": "ResponseItem::FunctionCallOutput.output.text_content()", "transform": "parse_structured_shell_output → build_structured_output: секции 'Exit code: {N}' + 'Wall time: {D} seconds' + optional 'Total output lines: {L}' + 'Output:' + <text>", "sink": "ResponseItem.output.body = FunctionCallOutputBody::Text(structured)"},
+          {"source": "raw output с префиксом 'Total output lines: <N>\\n\\n'", "transform": "strip_total_output_header: отрезает префикс до первой \\n, парсит число, удаляет ведущий \\n", "sink": "(stripped_text, total_lines)"}
+        ],
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0010/entity/realtime-webrtc-call-start",
+      "src": "SRC-0010",
+      "composition": "entity",
+      "terms": {
+        "object": "RealtimeWebrtcCallStart — результат открытия WebRTC Realtime-вызова. SDP answer возвращается клиенту, call_id и sideband_headers остаются на сервере чтобы обычная Realtime WebSocket machinery могла присоединиться к тому же in-progress call как sideband controller",
+        "attributes": [
+          "sdp: String — SDP answer от сервера",
+          "call_id: String — идентификатор Realtime call",
+          "sideband_headers: ApiHeaderMap — HTTP-заголовки для sideband WebSocket join (переиспользуют API-auth material от создания call)"
+        ],
+        "relationships": [
+          {"to": "SRC-0010/entity/model-client", "rel": "produced_by", "card": "1:1", "note": "create_realtime_call_with_headers"}
+        ],
+        "enumerations": null,
+        "data_flows": [
+          {"source": "api_auth (CoreAuthProvider)", "transform": "sideband_websocket_auth_headers: api_auth.add_auth_headers(&mut headers)", "sink": "RealtimeWebrtcCallStart.sideband_headers"},
+          {"source": "extra_headers + sideband auth headers", "transform": "ApiRealtimeCallClient.create_with_session_and_headers(sdp, session_config, extra_headers)", "sink": "RealtimeWebrtcCallStart.sdp + call_id"}
+        ],
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0010/entity/request-headers-contract",
+      "src": "SRC-0010",
+      "composition": "entity",
+      "terms": {
+        "object": "Responses API Request Headers — набор Codex-specific HTTP-заголовков, отправляемых с каждым Responses API запросом (HTTP и WebSocket handshake). Реализуют конвенции Codex для идентификации установки, sticky routing, метаданных turn'а, beta-фичей и subagent-контекста",
+        "attributes": [
+          "x-codex-installation-id: идентификатор установки Codex",
+          "x-codex-turn-state: sticky-routing token для всех запросов в рамках одного turn",
+          "x-codex-turn-metadata: опциональные per-turn метаданные для observability",
+          "x-codex-parent-thread-id: ID родительского thread для sub-agent ThreadSpawn",
+          "x-codex-window-id: '{conversation_id}:{window_generation}' — идентификатор текущего conversation window",
+          "x-openai-subagent: тип subagent (review/compact/memory_consolidation/collab_spawn/<label>)",
+          "x-responsesapi-include-timing-metrics: 'true' если include_timing_metrics включён",
+          "x-codex-beta-features: список beta-фичей (non-empty)",
+          "OpenAI-Beta: 'responses_websockets=2026-02-06' — beta header для WebSocket v2 транспорта",
+          "x-client-request-id: conversation_id (только в WebSocket handshake)"
+        ],
+        "relationships": [
+          {"to": "SRC-0010/entity/model-client-session", "rel": "produced_by", "card": "N:1", "note": "build_responses_options, build_websocket_headers"},
+          {"to": "SRC-0010/entity/model-client", "rel": "produced_by", "card": "N:1", "note": "build_responses_identity_headers, build_subagent_headers, build_ws_client_metadata"}
+        ],
+        "enumerations": {
+          "subagent_labels": ["review", "compact", "memory_consolidation", "collab_spawn", "<custom label>"],
+          "auth_mode_labels": ["ApiKey", "Chatgpt"],
+          "endpoints": ["/responses", "/responses/compact", "/memories/trace_summarize"]
+        },
+        "data_flows": [
+          {"source": "turn_state (OnceLock) — получается из 'x-codex-turn-state' response header сервера на первом запросе turn'а", "transform": "OnceLock::get + HeaderValue::from_str", "sink": "x-codex-turn-state request header для последующих запросов"},
+          {"source": "session_source + subagent_source", "transform": "subagent_header_value mapping", "sink": "x-openai-subagent header"},
+          {"source": "turn_metadata_header (строка, параметр)", "transform": "parse_turn_metadata_header: HeaderValue::from_str (невалидные → None)", "sink": "x-codex-turn-metadata header"}
+        ],
+        "config": {
+          "OPENAI_BETA_HEADER": {"value": "OpenAI-Beta", "source": "hardcoded const (line 123)", "default": "OpenAI-Beta"},
+          "X_CODEX_INSTALLATION_ID_HEADER": {"value": "x-codex-installation-id", "source": "hardcoded const (line 124)", "default": "x-codex-installation-id"},
+          "X_CODEX_TURN_STATE_HEADER": {"value": "x-codex-turn-state", "source": "hardcoded const (line 125)", "default": "x-codex-turn-state"},
+          "X_CODEX_TURN_METADATA_HEADER": {"value": "x-codex-turn-metadata", "source": "hardcoded const (line 126)", "default": "x-codex-turn-metadata"},
+          "X_CODEX_PARENT_THREAD_ID_HEADER": {"value": "x-codex-parent-thread-id", "source": "hardcoded const (line 127)", "default": "x-codex-parent-thread-id"},
+          "X_CODEX_WINDOW_ID_HEADER": {"value": "x-codex-window-id", "source": "hardcoded const (line 128)", "default": "x-codex-window-id"},
+          "X_OPENAI_SUBAGENT_HEADER": {"value": "x-openai-subagent", "source": "hardcoded const (line 129)", "default": "x-openai-subagent"},
+          "X_RESPONSESAPI_INCLUDE_TIMING_METRICS_HEADER": {"value": "x-responsesapi-include-timing-metrics", "source": "hardcoded const (line 130-131)", "default": "x-responsesapi-include-timing-metrics"},
+          "RESPONSES_WEBSOCKETS_V2_BETA_HEADER_VALUE": {"value": "responses_websockets=2026-02-06", "source": "hardcoded const (line 132)", "default": "responses_websockets=2026-02-06"},
+          "RESPONSES_ENDPOINT": {"value": "/responses", "source": "hardcoded const (line 133)", "default": "/responses"},
+          "RESPONSES_COMPACT_ENDPOINT": {"value": "/responses/compact", "source": "hardcoded const (line 134)", "default": "/responses/compact"},
+          "MEMORIES_SUMMARIZE_ENDPOINT": {"value": "/memories/trace_summarize", "source": "hardcoded const (line 135)", "default": "/memories/trace_summarize"}
+        }
+      }
+    },
+    {
+      "id": "SRC-0010/entity/responses-api-request",
+      "src": "SRC-0010",
+      "composition": "entity",
+      "terms": {
+        "object": "ResponsesApiRequest — тело запроса к Responses API (HTTP и WebSocket). Формируется из Prompt и контекста turn'а, содержит модель, inputs, tools, reasoning, store-флаг, stream-флаг, include, service_tier, prompt_cache_key, text, client_metadata",
+        "attributes": [
+          "model: slug модели (ModelInfo.slug)",
+          "instructions: текст инструкций (Prompt.base_instructions.text)",
+          "input: отформатированные input items (Prompt.get_formatted_input)",
+          "tools: JSON tools (create_tools_json_for_responses_api)",
+          "tool_choice: 'auto' (hardcoded)",
+          "parallel_tool_calls: Prompt.parallel_tool_calls",
+          "reasoning: Option<Reasoning{effort, summary}> — None если model не supports_reasoning_summaries",
+          "store: bool — provider.is_azure_responses_endpoint()",
+          "stream: true (hardcoded)",
+          "include: ['reasoning.encrypted_content'] если reasoning Some, иначе пустой вектор",
+          "service_tier: Option<String> — 'priority' при ServiceTier::Fast, иначе service_tier.to_string() или None",
+          "prompt_cache_key: Option<String> — conversation_id",
+          "text: result of create_text_param_for_request(verbosity, output_schema)",
+          "client_metadata: HashMap с X_CODEX_INSTALLATION_ID_HEADER → installation_id"
+        ],
+        "relationships": [
+          {"to": "SRC-0010/entity/prompt", "rel": "built_from", "card": "N:1"},
+          {"to": "SRC-0010/entity/model-client-session", "rel": "produced_by", "card": "N:1", "note": "build_responses_request"},
+          {"to": "SRC-0010/entity/last-response", "rel": "compared_with", "card": "N:1", "note": "get_incremental_items для incremental delta detection"}
+        ],
+        "enumerations": {
+          "service_tier_serialization": ["Fast → 'priority'", "other → ServiceTier::to_string()"],
+          "reasoning_summary_handling": ["None → summary=None", "other → summary=Some(config)"]
+        },
+        "data_flows": [
+          {"source": "Prompt.input", "transform": "get_formatted_input (+ reserialize_shell_outputs при Freeform apply_patch)", "sink": "ResponsesApiRequest.input"},
+          {"source": "ModelInfo.default_reasoning_level + effort + ModelInfo.supports_reasoning_summaries", "transform": "effort.or(default_reasoning_level); Reasoning построен только если supports_reasoning_summaries", "sink": "ResponsesApiRequest.reasoning"},
+          {"source": "ModelInfo.support_verbosity + state.model_verbosity + ModelInfo.default_verbosity", "transform": "если !support_verbosity — None + warn; иначе model_verbosity.or(default_verbosity)", "sink": "verbosity для text param"}
+        ],
+        "config": {
+          "tool_choice": {"value": "auto", "source": "hardcoded (client.rs:861)", "default": "auto"},
+          "stream": {"value": true, "source": "hardcoded (client.rs:865)", "default": true},
+          "include_reasoning_encrypted_content": {"value": "reasoning.encrypted_content", "source": "hardcoded (client.rs:836)", "default": null, "note": "включается в include когда reasoning is Some"}
+        }
+      }
+    }
+  ]
+}

@@ -1,0 +1,770 @@
+{
+  "src": "SRC-0014",
+  "schema_version": "2.0",
+  "lens": "structural",
+  "compositions": [
+    {
+      "id": "SRC-0014/entity/tool-call",
+      "src": "SRC-0014",
+      "composition": "entity",
+      "terms": {
+        "object": "ToolCall — запрос на выполнение инструмента, построенный из item модели",
+        "attributes": [
+          "tool_name: ToolName (имя инструмента, возможно с namespace)",
+          "call_id: String (идентификатор вызова от модели)",
+          "payload: ToolPayload (параметры вызова по вариантам)"
+        ],
+        "relationships": [
+          {"to": "SRC-0014/entity/tool-payload", "rel": "has", "card": "1:1"},
+          {"to": "SRC-0014/entity/tool-invocation", "rel": "converts_to", "card": "1:1"},
+          {"to": "SRC-0014/entity/tool-name", "rel": "has", "card": "1:1"}
+        ],
+        "enumerations": null,
+        "data_flows": [
+          {"source": "ResponseItem::FunctionCall", "transform": "ToolRouter.build_tool_call — различать MCP vs Function по resolve_mcp_tool_info", "sink": "ToolCall.payload = Mcp или Function"},
+          {"source": "ResponseItem::ToolSearchCall (execution=client)", "transform": "parse arguments as SearchToolCallParams", "sink": "ToolCall.payload = ToolSearch"},
+          {"source": "ResponseItem::CustomToolCall", "transform": "ToolName.plain(name)", "sink": "ToolCall.payload = Custom"},
+          {"source": "ResponseItem::LocalShellCall", "transform": "Exec action → ShellToolCallParams с SandboxPermissions::UseDefault", "sink": "ToolCall.payload = LocalShell, tool_name='local_shell'"}
+        ],
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0014/entity/tool-payload",
+      "src": "SRC-0014",
+      "composition": "entity",
+      "terms": {
+        "object": "ToolPayload — полезная нагрузка вызова инструмента, 5 вариантов по типу транспорта",
+        "attributes": [
+          "Function.arguments: String (JSON-строка аргументов функции)",
+          "ToolSearch.arguments: SearchToolCallParams",
+          "Custom.input: String",
+          "LocalShell.params: ShellToolCallParams",
+          "Mcp.server: String (имя MCP-сервера)",
+          "Mcp.tool: String (имя инструмента у сервера)",
+          "Mcp.raw_arguments: String"
+        ],
+        "relationships": [
+          {"to": "SRC-0014/entity/tool-call", "rel": "part_of", "card": "1:1"},
+          {"to": "SRC-0014/entity/tool-invocation", "rel": "part_of", "card": "1:1"}
+        ],
+        "enumerations": {
+          "payload_variants": ["Function", "ToolSearch", "Custom", "LocalShell", "Mcp"]
+        },
+        "data_flows": [
+          {"source": "ToolPayload.*", "transform": "log_payload() — вернуть текст для логирования (arguments / query / input / command.join(' ') / raw_arguments)", "sink": "telemetry log_payload"}
+        ],
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0014/entity/tool-invocation",
+      "src": "SRC-0014",
+      "composition": "entity",
+      "terms": {
+        "object": "ToolInvocation — контекст одного выполнения инструмента с сессией, ходом и трекером",
+        "attributes": [
+          "session: Arc<Session>",
+          "turn: Arc<TurnContext>",
+          "tracker: SharedTurnDiffTracker (Arc<Mutex<TurnDiffTracker>>)",
+          "call_id: String",
+          "tool_name: ToolName",
+          "payload: ToolPayload"
+        ],
+        "relationships": [
+          {"to": "SRC-0014/entity/tool-payload", "rel": "has", "card": "1:1"},
+          {"to": "SRC-0014/entity/tool-handler", "rel": "passed_to", "card": "N:1"}
+        ],
+        "enumerations": null,
+        "data_flows": [
+          {"source": "ToolCall + Session + TurnContext + tracker", "transform": "ToolRouter.dispatch_tool_call_with_code_mode_result — собрать ToolInvocation", "sink": "ToolRegistry.dispatch_any(invocation)"}
+        ],
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0014/entity/tool-output",
+      "src": "SRC-0014",
+      "composition": "entity",
+      "terms": {
+        "object": "ToolOutput — результат выполнения инструмента (trait) с 5 методами представления",
+        "attributes": [
+          "log_preview(): String — короткое превью для telemetry",
+          "success_for_logging(): bool — отметка успеха для логов",
+          "to_response_item(call_id, payload): ResponseInputItem — представление для модели",
+          "post_tool_use_response(call_id, payload): Option<JsonValue> — данные для PostToolUse hook (default: None)",
+          "code_mode_result(payload): JsonValue — представление для code_mode (default: производное от to_response_item)"
+        ],
+        "relationships": [
+          {"to": "SRC-0014/entity/tool-handler", "rel": "produced_by", "card": "N:1"},
+          {"to": "SRC-0014/entity/any-tool-result", "rel": "wrapped_in", "card": "1:1"}
+        ],
+        "enumerations": {
+          "implementors": ["CallToolResult", "McpToolOutput", "ToolSearchOutput", "FunctionToolOutput", "ApplyPatchToolOutput", "AbortedToolOutput", "ExecCommandToolOutput"]
+        },
+        "data_flows": [
+          {"source": "ToolOutput", "transform": "to_response_item(call_id, payload)", "sink": "ResponseInputItem вариант по типу payload"},
+          {"source": "ToolOutput", "transform": "telemetry_preview(log_preview())", "sink": "otel.log_tool_result"}
+        ],
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0014/entity/mcp-tool-output",
+      "src": "SRC-0014",
+      "composition": "entity",
+      "terms": {
+        "object": "McpToolOutput — результат MCP-вызова с замером времени и настройкой image detail",
+        "attributes": [
+          "result: CallToolResult",
+          "wall_time: Duration",
+          "original_image_detail_supported: bool"
+        ],
+        "relationships": [
+          {"to": "SRC-0014/entity/tool-output", "rel": "implements", "card": "N:1"}
+        ],
+        "enumerations": null,
+        "data_flows": [
+          {"source": "McpToolOutput.result + wall_time", "transform": "response_payload() — sanitize_original_image_detail + prepend 'Wall time: {secs:.4} seconds\\nOutput:'", "sink": "FunctionCallOutputPayload"}
+        ],
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0014/entity/function-tool-output",
+      "src": "SRC-0014",
+      "composition": "entity",
+      "terms": {
+        "object": "FunctionToolOutput — результат Function-инструмента с опциональным success-флагом",
+        "attributes": [
+          "body: Vec<FunctionCallOutputContentItem>",
+          "success: Option<bool>",
+          "post_tool_use_response: Option<JsonValue>"
+        ],
+        "relationships": [
+          {"to": "SRC-0014/entity/tool-output", "rel": "implements", "card": "N:1"}
+        ],
+        "enumerations": null,
+        "data_flows": [
+          {"source": "String text", "transform": "from_text(text, success) — обернуть в InputText content item", "sink": "FunctionToolOutput"},
+          {"source": "Vec<FunctionCallOutputContentItem>", "transform": "from_content(content, success)", "sink": "FunctionToolOutput"}
+        ],
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0014/entity/exec-command-tool-output",
+      "src": "SRC-0014",
+      "composition": "entity",
+      "terms": {
+        "object": "ExecCommandToolOutput — результат unified exec с сырыми байтами вывода, кодом выхода и токен-бюджетом",
+        "attributes": [
+          "event_call_id: String",
+          "chunk_id: String",
+          "wall_time: Duration",
+          "raw_output: Vec<u8> (raw bytes до усечения)",
+          "max_output_tokens: Option<usize>",
+          "process_id: Option<i32>",
+          "exit_code: Option<i32>",
+          "original_token_count: Option<usize>",
+          "session_command: Option<Vec<String>>"
+        ],
+        "relationships": [
+          {"to": "SRC-0014/entity/tool-output", "rel": "implements", "card": "N:1"}
+        ],
+        "enumerations": null,
+        "data_flows": [
+          {"source": "raw_output bytes", "transform": "truncated_output() — String::from_utf8_lossy + formatted_truncate_text(TruncationPolicy::Tokens(resolve_max_tokens(max_output_tokens)))", "sink": "truncated String для модели"},
+          {"source": "chunk_id + wall_time + exit_code + process_id + original_token_count + truncated_output", "transform": "response_text() — собрать секции через '\\n'", "sink": "ответ модели"},
+          {"source": "ExecCommandToolOutput", "transform": "code_mode_result — UnifiedExecCodeModeResult(chunk_id?, wall_time_seconds, exit_code?, session_id=process_id?, original_token_count?, output)", "sink": "JsonValue для code_mode"}
+        ],
+        "config": {
+          "max_output_tokens": {"value": null, "source": "max_output_tokens field, resolved via resolve_max_tokens()", "default": "resolve_max_tokens(None)"}
+        }
+      }
+    },
+    {
+      "id": "SRC-0014/entity/tool-search-output",
+      "src": "SRC-0014",
+      "composition": "entity",
+      "terms": {
+        "object": "ToolSearchOutput — результат поиска инструментов с перечнем найденных",
+        "attributes": [
+          "tools: Vec<ToolSearchOutputTool>"
+        ],
+        "relationships": [
+          {"to": "SRC-0014/entity/tool-output", "rel": "implements", "card": "N:1"}
+        ],
+        "enumerations": null,
+        "data_flows": [
+          {"source": "ToolSearchOutput.tools", "transform": "to_response_item — status='completed', execution='client'", "sink": "ResponseInputItem::ToolSearchOutput"}
+        ],
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0014/entity/apply-patch-tool-output",
+      "src": "SRC-0014",
+      "composition": "entity",
+      "terms": {
+        "object": "ApplyPatchToolOutput — результат применения патча (текстовая сводка)",
+        "attributes": [
+          "text: String"
+        ],
+        "relationships": [
+          {"to": "SRC-0014/entity/tool-output", "rel": "implements", "card": "N:1"}
+        ],
+        "enumerations": null,
+        "data_flows": [
+          {"source": "text", "transform": "to_response_item — обернуть в InputText + success=Some(true)", "sink": "ResponseInputItem::FunctionCallOutput"},
+          {"source": "ApplyPatchToolOutput", "transform": "code_mode_result — пустой JsonObject", "sink": "JsonValue::Object(empty)"}
+        ],
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0014/entity/aborted-tool-output",
+      "src": "SRC-0014",
+      "composition": "entity",
+      "terms": {
+        "object": "AbortedToolOutput — результат прерванного по отмене инструмента",
+        "attributes": [
+          "message: String"
+        ],
+        "relationships": [
+          {"to": "SRC-0014/entity/tool-output", "rel": "implements", "card": "N:1"}
+        ],
+        "enumerations": null,
+        "data_flows": [
+          {"source": "message + payload.variant", "transform": "to_response_item — ToolSearch→empty list, Mcp→CallToolResult::from_error_text, остальные→function_tool_response с success=None", "sink": "ResponseInputItem"}
+        ],
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0014/entity/any-tool-result",
+      "src": "SRC-0014",
+      "composition": "entity",
+      "terms": {
+        "object": "AnyToolResult — обёртка результата любого инструмента с сохранением call_id и payload",
+        "attributes": [
+          "call_id: String",
+          "payload: ToolPayload",
+          "result: Box<dyn ToolOutput>"
+        ],
+        "relationships": [
+          {"to": "SRC-0014/entity/tool-output", "rel": "wraps", "card": "1:1"},
+          {"to": "SRC-0014/entity/tool-call", "rel": "references_via_call_id", "card": "1:1"}
+        ],
+        "enumerations": null,
+        "data_flows": [
+          {"source": "AnyToolResult", "transform": "into_response() — result.to_response_item(call_id, payload)", "sink": "ResponseInputItem"},
+          {"source": "AnyToolResult", "transform": "code_mode_result() — result.code_mode_result(payload)", "sink": "JsonValue"}
+        ],
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0014/entity/tool-handler",
+      "src": "SRC-0014",
+      "composition": "entity",
+      "terms": {
+        "object": "ToolHandler — trait обработчика инструмента с kind, mutating-флагом и методом handle",
+        "attributes": [
+          "kind(): ToolKind (Function | Mcp)",
+          "matches_kind(payload): bool — совместим ли payload с kind",
+          "is_mutating(invocation): bool — изменяет ли окружение пользователя (default: false, должен возвращать true при сомнении)",
+          "pre_tool_use_payload(invocation): Option<PreToolUsePayload> (default: None)",
+          "post_tool_use_payload(call_id, payload, result): Option<PostToolUsePayload> (default: None)",
+          "handle(invocation): Result<Self::Output, FunctionCallError>"
+        ],
+        "relationships": [
+          {"to": "SRC-0014/entity/tool-invocation", "rel": "handles", "card": "1:N"},
+          {"to": "SRC-0014/entity/tool-output", "rel": "produces", "card": "1:1"},
+          {"to": "SRC-0014/entity/tool-registry", "rel": "registered_in", "card": "N:1"},
+          {"to": "SRC-0014/entity/pre-post-tool-use-payload", "rel": "produces", "card": "1:N"}
+        ],
+        "enumerations": {
+          "kind": ["Function", "Mcp"],
+          "handler_kinds": ["AgentJobs", "ApplyPatch", "CloseAgentV1", "CloseAgentV2", "CodeModeExecute", "CodeModeWait", "DynamicTool", "FollowupTaskV2", "JsRepl", "JsReplReset", "ListAgentsV2", "ListDir", "Mcp", "McpResource", "Plan", "RequestPermissions", "RequestUserInput", "ResumeAgentV1", "SendInputV1", "SendMessageV2", "Shell", "ShellCommand", "SpawnAgentV1", "SpawnAgentV2", "TestSync", "ToolSearch", "ToolSuggest", "UnifiedExec", "ViewImage", "WaitAgentV1", "WaitAgentV2"]
+        },
+        "data_flows": [
+          {"source": "ToolInvocation", "transform": "handler.handle_any(invocation) — await result, обернуть в AnyToolResult", "sink": "AnyToolResult"}
+        ],
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0014/entity/tool-registry",
+      "src": "SRC-0014",
+      "composition": "entity",
+      "terms": {
+        "object": "ToolRegistry — реестр обработчиков инструментов с диспатчем по ToolName и hooks lifecycle",
+        "attributes": [
+          "handlers: HashMap<ToolName, Arc<dyn AnyToolHandler>>"
+        ],
+        "relationships": [
+          {"to": "SRC-0014/entity/tool-handler", "rel": "contains", "card": "1:N"},
+          {"to": "SRC-0014/entity/tool-router", "rel": "part_of", "card": "1:1"}
+        ],
+        "enumerations": null,
+        "data_flows": [
+          {"source": "ToolInvocation", "transform": "dispatch_any — resolve handler по tool_name, проверить matches_kind, PreToolUse hook, tool_call_gate (если mutating), handle_any, PostToolUse hook, AfterToolUse hook", "sink": "AnyToolResult или FunctionCallError"},
+          {"source": "active_turn.turn_state", "transform": "tool_calls += 1 (saturating_add)", "sink": "turn_state.tool_calls"},
+          {"source": "MCP payload", "transform": "mcp_connection_manager.server_origin(server)", "sink": "mcp_server_origin tag для otel"}
+        ],
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0014/entity/tool-registry-builder",
+      "src": "SRC-0014",
+      "composition": "entity",
+      "terms": {
+        "object": "ToolRegistryBuilder — билдер реестра: собирает specs и handlers, строит ToolRegistry",
+        "attributes": [
+          "handlers: HashMap<ToolName, Arc<dyn AnyToolHandler>>",
+          "specs: Vec<ConfiguredToolSpec>"
+        ],
+        "relationships": [
+          {"to": "SRC-0014/entity/tool-registry", "rel": "builds", "card": "1:1"},
+          {"to": "SRC-0014/entity/configured-tool-spec", "rel": "accumulates", "card": "1:N"}
+        ],
+        "enumerations": null,
+        "data_flows": [
+          {"source": "ToolSpec", "transform": "push_spec(spec) — supports_parallel_tool_calls=false; push_spec_with_parallel_support(spec, flag)", "sink": "specs Vec"},
+          {"source": "handler instance", "transform": "register_handler(name, handler) — warn при перезаписи существующего имени", "sink": "handlers HashMap"},
+          {"source": "builder state", "transform": "build() — вернуть (specs, ToolRegistry)", "sink": "(Vec<ConfiguredToolSpec>, ToolRegistry)"}
+        ],
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0014/entity/tool-router",
+      "src": "SRC-0014",
+      "composition": "entity",
+      "terms": {
+        "object": "ToolRouter — маршрутизатор вызовов инструментов: строит ToolCall из ResponseItem и диспатчит через ToolRegistry",
+        "attributes": [
+          "registry: ToolRegistry",
+          "specs: Vec<ConfiguredToolSpec> (все спеки с флагом параллелизма)",
+          "model_visible_specs: Vec<ToolSpec> (спеки для показа модели)",
+          "parallel_mcp_server_names: HashSet<String> (имена MCP-серверов с поддержкой параллелизма)"
+        ],
+        "relationships": [
+          {"to": "SRC-0014/entity/tool-registry", "rel": "owns", "card": "1:1"},
+          {"to": "SRC-0014/entity/configured-tool-spec", "rel": "stores", "card": "1:N"},
+          {"to": "SRC-0014/entity/tool-call", "rel": "builds_and_dispatches", "card": "1:N"},
+          {"to": "SRC-0014/entity/tool-call-runtime", "rel": "used_by", "card": "1:1"}
+        ],
+        "enumerations": null,
+        "data_flows": [
+          {"source": "ToolsConfig + ToolRouterParams", "transform": "from_config — build_specs_with_discoverable_tools → builder.build(); model_visible_specs = filter is_code_mode_nested_tool при code_mode_only_enabled", "sink": "ToolRouter"},
+          {"source": "ResponseItem", "transform": "build_tool_call — FunctionCall→resolve_mcp_tool_info или Function payload; ToolSearchCall(execution=client)→ToolSearch payload; CustomToolCall→Custom; LocalShellCall(Exec)→LocalShell", "sink": "Option<ToolCall>"},
+          {"source": "ToolCall", "transform": "dispatch_tool_call_with_code_mode_result — если source=Direct и turn.tools_config.js_repl_tools_only и tool не js_repl/js_repl_reset → ошибка; иначе ToolInvocation → registry.dispatch_any", "sink": "AnyToolResult"}
+        ],
+        "config": {
+          "code_mode_only_enabled": {"value": null, "source": "ToolsConfig.code_mode_only_enabled", "default": null},
+          "js_repl_tools_only": {"value": null, "source": "turn.tools_config.js_repl_tools_only", "default": null}
+        }
+      }
+    },
+    {
+      "id": "SRC-0014/entity/tool-call-runtime",
+      "src": "SRC-0014",
+      "composition": "entity",
+      "terms": {
+        "object": "ToolCallRuntime — исполнитель tool call с поддержкой параллелизма через RwLock (параллельные = read, последовательные = write)",
+        "attributes": [
+          "router: Arc<ToolRouter>",
+          "session: Arc<Session>",
+          "turn_context: Arc<TurnContext>",
+          "tracker: SharedTurnDiffTracker",
+          "parallel_execution: Arc<RwLock<()>> (read-lock для supports_parallel, write-lock иначе)"
+        ],
+        "relationships": [
+          {"to": "SRC-0014/entity/tool-router", "rel": "uses", "card": "1:1"},
+          {"to": "SRC-0014/entity/tool-call", "rel": "executes", "card": "1:N"}
+        ],
+        "enumerations": null,
+        "data_flows": [
+          {"source": "ToolCall + CancellationToken", "transform": "handle_tool_call_with_source — spawn с tokio::select над cancellation и dispatch; read/write guard parallel_execution по tool_supports_parallel; Instant::now() для замера; trace_span с call_id/tool_name", "sink": "AnyToolResult или FunctionCallError"},
+          {"source": "cancellation_token", "transform": "при отмене — aborted_response с wall time (min 0.1 сек)", "sink": "AnyToolResult с AbortedToolOutput"},
+          {"source": "FunctionCallError Fatal", "transform": "handle_tool_call преобразует в CodexErr::Fatal", "sink": "Err(CodexErr)"},
+          {"source": "FunctionCallError другие", "transform": "failure_response — ResponseInputItem по типу payload с success=Some(false)", "sink": "ResponseInputItem"}
+        ],
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0014/entity/tool-orchestrator",
+      "src": "SRC-0014",
+      "composition": "entity",
+      "terms": {
+        "object": "ToolOrchestrator — оркестратор approvals + sandbox selection + retry: approval → select sandbox → attempt → retry с эскалированной песочницей при denial",
+        "attributes": [
+          "sandbox: SandboxManager"
+        ],
+        "relationships": [
+          {"to": "SRC-0014/entity/orchestrator-run-result", "rel": "produces", "card": "1:1"},
+          {"to": "SRC-0014/entity/exec-approval-requirement", "rel": "uses", "card": "1:1"},
+          {"to": "SRC-0014/entity/sandbox-attempt", "rel": "builds", "card": "1:N"}
+        ],
+        "enumerations": null,
+        "data_flows": [
+          {"source": "ToolRuntime + Rq + ToolCtx + TurnContext + AskForApproval", "transform": "run: 1) определить ExecApprovalRequirement (Skip/Forbidden/NeedsApproval); 2) при NeedsApproval — start_approval_async, routes_approval_to_guardian → source User/AutomatedReviewer; 3) select_initial sandbox по policy/preference; 4) run_attempt; 5) при Denied и escalate_on_failure — retry approval (если не bypass) → retry с SandboxType::None", "sink": "OrchestratorRunResult<Out>"},
+          {"source": "ReviewDecision", "transform": "Denied/Abort → Rejected(guardian_rejection_message или 'rejected by user'); TimedOut → Rejected(guardian_timeout_message); NetworkPolicyAmendment.action Allow/Deny", "sink": "Ok/Err(ToolError::Rejected)"},
+          {"source": "network_policy_decision", "transform": "network_approval_context_from_payload — если managed_network_active", "sink": "network_approval_context (Option)"},
+          {"source": "denial output", "transform": "retry_reason = host для network, иначе 'command failed; retry without sandbox?'", "sink": "approval retry_reason"}
+        ],
+        "config": {
+          "approval_policy": {"value": null, "source": "AskForApproval параметр run()", "default": null},
+          "use_legacy_landlock": {"value": null, "source": "turn_ctx.features.use_legacy_landlock()", "default": null},
+          "windows_sandbox_level": {"value": null, "source": "turn_ctx.windows_sandbox_level", "default": null},
+          "windows_sandbox_private_desktop": {"value": null, "source": "turn_ctx.config.permissions.windows_sandbox_private_desktop", "default": null}
+        }
+      }
+    },
+    {
+      "id": "SRC-0014/entity/orchestrator-run-result",
+      "src": "SRC-0014",
+      "composition": "entity",
+      "terms": {
+        "object": "OrchestratorRunResult — итог работы ToolOrchestrator: выход инструмента + отложенное сетевое approval",
+        "attributes": [
+          "output: Out (типовой результат ToolRuntime)",
+          "deferred_network_approval: Option<DeferredNetworkApproval>"
+        ],
+        "relationships": [
+          {"to": "SRC-0014/entity/tool-orchestrator", "rel": "produced_by", "card": "N:1"}
+        ],
+        "enumerations": null,
+        "data_flows": null,
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0014/entity/sandbox-attempt",
+      "src": "SRC-0014",
+      "composition": "entity",
+      "terms": {
+        "object": "SandboxAttempt — попытка исполнения в конкретной песочнице (initial или escalated)",
+        "attributes": [
+          "sandbox: SandboxType",
+          "policy: &SandboxPolicy",
+          "file_system_policy: &FileSystemSandboxPolicy",
+          "network_policy: NetworkSandboxPolicy",
+          "enforce_managed_network: bool (managed_network_active)",
+          "manager: &SandboxManager",
+          "sandbox_cwd: &AbsolutePathBuf",
+          "codex_linux_sandbox_exe: Option<&PathBuf> (None на escalated)",
+          "use_legacy_landlock: bool",
+          "windows_sandbox_level: WindowsSandboxLevel",
+          "windows_sandbox_private_desktop: bool"
+        ],
+        "relationships": [
+          {"to": "SRC-0014/entity/tool-orchestrator", "rel": "used_by", "card": "N:1"}
+        ],
+        "enumerations": {
+          "sandbox_override": ["BypassSandboxFirstAttempt", "NoOverride"]
+        },
+        "data_flows": [
+          {"source": "tool.sandbox_mode_for_first_attempt(req)", "transform": "BypassSandboxFirstAttempt → SandboxType::None; NoOverride → sandbox.select_initial(policy, preference, windows_level, managed_network_active)", "sink": "initial_sandbox"},
+          {"source": "initial denial", "transform": "escalated_attempt с SandboxType::None и codex_linux_sandbox_exe=None", "sink": "SandboxAttempt (retry)"}
+        ],
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0014/entity/exec-approval-requirement",
+      "src": "SRC-0014",
+      "composition": "entity",
+      "terms": {
+        "object": "ExecApprovalRequirement — требование approval перед выполнением (3 варианта)",
+        "attributes": [
+          "Skip.reason: причина пропуска approval",
+          "Forbidden.reason: String (почему запрещено — приводит к немедленной Rejected)",
+          "NeedsApproval.reason: String (причина для запроса approval)"
+        ],
+        "relationships": [
+          {"to": "SRC-0014/entity/tool-orchestrator", "rel": "consumed_by", "card": "N:1"}
+        ],
+        "enumerations": {
+          "variants": ["Skip", "Forbidden", "NeedsApproval"]
+        },
+        "data_flows": [
+          {"source": "tool.exec_approval_requirement(req)", "transform": "fallback на default_exec_approval_requirement(approval_policy, file_system_sandbox_policy)", "sink": "ExecApprovalRequirement"}
+        ],
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0014/entity/tool-event-emitter",
+      "src": "SRC-0014",
+      "composition": "entity",
+      "terms": {
+        "object": "ToolEmitter — эмиттер событий begin/success/failure для трёх видов инструментов (Shell, ApplyPatch, UnifiedExec)",
+        "attributes": [
+          "Shell.command: Vec<String>, cwd: AbsolutePathBuf, source: ExecCommandSource, parsed_cmd: Vec<ParsedCommand>, freeform: bool",
+          "ApplyPatch.changes: HashMap<PathBuf, FileChange>, auto_approved: bool",
+          "UnifiedExec.command: Vec<String>, cwd: AbsolutePathBuf, source: ExecCommandSource, parsed_cmd: Vec<ParsedCommand>, process_id: Option<String>"
+        ],
+        "relationships": [
+          {"to": "SRC-0014/entity/tool-event-ctx", "rel": "uses", "card": "N:1"},
+          {"to": "SRC-0014/entity/tool-event-stage", "rel": "emits", "card": "1:N"}
+        ],
+        "enumerations": {
+          "variants": ["Shell", "ApplyPatch", "UnifiedExec"]
+        },
+        "data_flows": [
+          {"source": "ToolEmitter::Shell/UnifiedExec", "transform": "emit_exec_stage — Begin→ExecCommandBegin; Success/Output→ExecCommandEnd с stdout/stderr/aggregated_output/exit_code/duration/formatted_output/status (Completed если exit_code==0 иначе Failed); Message/Rejected→exit_code=-1, status Failed/Declined", "sink": "EventMsg::ExecCommandBegin / ExecCommandEnd"},
+          {"source": "ToolEmitter::ApplyPatch", "transform": "Begin→turn_diff_tracker.on_patch_begin + PatchApplyBegin; Success/Output→emit_patch_end с PatchApplyStatus Completed если exit_code==0 иначе Failed; Rejected→PatchApplyStatus::Declined", "sink": "EventMsg::PatchApplyBegin / PatchApplyEnd + TurnDiff"},
+          {"source": "ExecToolCallOutput", "transform": "format_exec_output_for_model — Shell freeform→freeform formatter; иначе structured formatter", "sink": "content string для модели"},
+          {"source": "ToolError::Rejected('rejected by user')", "transform": "normalize — Shell/UnifiedExec→'exec command rejected by user'; ApplyPatch→'patch rejected by user'", "sink": "нормализованное сообщение"}
+        ],
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0014/entity/tool-event-ctx",
+      "src": "SRC-0014",
+      "composition": "entity",
+      "terms": {
+        "object": "ToolEventCtx — контекст эмиссии событий инструмента",
+        "attributes": [
+          "session: &Session",
+          "turn: &TurnContext",
+          "call_id: &str",
+          "turn_diff_tracker: Option<&SharedTurnDiffTracker>"
+        ],
+        "relationships": [
+          {"to": "SRC-0014/entity/tool-event-emitter", "rel": "passed_to", "card": "1:N"}
+        ],
+        "enumerations": null,
+        "data_flows": null,
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0014/entity/tool-event-stage",
+      "src": "SRC-0014",
+      "composition": "entity",
+      "terms": {
+        "object": "ToolEventStage — стадия жизненного цикла tool call для событий (Begin/Success/Failure)",
+        "attributes": [
+          "Begin",
+          "Success(ExecToolCallOutput)",
+          "Failure(ToolEventFailure)"
+        ],
+        "relationships": [
+          {"to": "SRC-0014/entity/tool-event-emitter", "rel": "dispatched_by", "card": "N:1"}
+        ],
+        "enumerations": {
+          "stages": ["Begin", "Success", "Failure"],
+          "failure_variants": ["Output(ExecToolCallOutput)", "Message(String)", "Rejected(String)"]
+        },
+        "data_flows": [
+          {"source": "Result<ExecToolCallOutput, ToolError>", "transform": "finish — Ok→Success(output) + content; Codex::Sandbox(Timeout|Denied)→Failure::Output; Codex(err)→Failure::Message('execution error: {err:?}'); Rejected→Failure::Rejected (нормализованный)", "sink": "ToolEventStage"},
+          {"source": "Success(output)", "transform": "exit_code==0 → Ok(content); иначе Err(RespondToModel(content))", "sink": "Result<String, FunctionCallError>"}
+        ],
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0014/entity/pre-post-tool-use-payload",
+      "src": "SRC-0014",
+      "composition": "entity",
+      "terms": {
+        "object": "PreToolUsePayload / PostToolUsePayload — данные для hook'ов lifecycle",
+        "attributes": [
+          "PreToolUsePayload.command: String",
+          "PostToolUsePayload.command: String",
+          "PostToolUsePayload.tool_response: Value (JsonValue)"
+        ],
+        "relationships": [
+          {"to": "SRC-0014/entity/tool-handler", "rel": "produced_by", "card": "N:1"},
+          {"to": "SRC-0014/entity/tool-registry", "rel": "consumed_by", "card": "N:1"}
+        ],
+        "enumerations": null,
+        "data_flows": [
+          {"source": "PreToolUsePayload.command", "transform": "run_pre_tool_use_hooks — если возвращает reason → FunctionCallError::RespondToModel('Command blocked by PreToolUse hook: {reason}. Command: {command}')", "sink": "блокировка вызова"},
+          {"source": "PostToolUsePayload", "transform": "run_post_tool_use_hooks — outcome.additional_contexts → record_additional_contexts; outcome.feedback_message или stop_reason → replacement_text; если should_stop и нет replacement → 'PostToolUse hook stopped execution'", "sink": "замена результата на FunctionToolOutput::from_text(replacement_text, None)"}
+        ],
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0014/entity/hook-tool-input",
+      "src": "SRC-0014",
+      "composition": "entity",
+      "terms": {
+        "object": "HookToolInput — wire-facing вход для hook'ов, отделён от внутреннего ToolPayload",
+        "attributes": [
+          "Function.arguments: String",
+          "Custom.input: String",
+          "LocalShell.params: HookToolInputLocalShell { command, workdir, timeout_ms, sandbox_permissions, prefix_rule, justification }",
+          "Mcp.server: String, tool: String, arguments: String"
+        ],
+        "relationships": [
+          {"to": "SRC-0014/entity/tool-payload", "rel": "mapped_from", "card": "1:1"}
+        ],
+        "enumerations": {
+          "variants": ["Function", "Custom", "LocalShell", "Mcp"],
+          "hook_tool_kinds": ["Function", "Custom", "LocalShell", "Mcp"]
+        },
+        "data_flows": [
+          {"source": "ToolPayload", "transform": "From<&ToolPayload> — Function/Custom прямо; ToolSearch→Function с json({query, limit}); LocalShell→HookToolInputLocalShell; Mcp прямо", "sink": "HookToolInput"},
+          {"source": "HookToolInput", "transform": "hook_tool_kind — вариант→HookToolKind::Function|Custom|LocalShell|Mcp", "sink": "HookToolKind"}
+        ],
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0014/entity/after-tool-use-hook-dispatch",
+      "src": "SRC-0014",
+      "composition": "entity",
+      "terms": {
+        "object": "AfterToolUseHookDispatch — параметры dispatch'а deprecated AfterToolUse hook",
+        "attributes": [
+          "invocation: &ToolInvocation",
+          "output_preview: String",
+          "success: bool",
+          "executed: bool",
+          "duration: Duration",
+          "mutating: bool"
+        ],
+        "relationships": [
+          {"to": "SRC-0014/entity/tool-invocation", "rel": "references", "card": "N:1"}
+        ],
+        "enumerations": {
+          "hook_result": ["Success", "FailedContinue", "FailedAbort"]
+        },
+        "data_flows": [
+          {"source": "AfterToolUseHookDispatch + invocation", "transform": "session.hooks().dispatch(HookPayload{ session_id, cwd, client, triggered_at=Utc::now(), hook_event: AfterToolUse{ turn_id, call_id, tool_name, tool_kind, tool_input, executed, success, duration_ms (saturating cast to u64), mutating, sandbox, sandbox_policy, output_preview } })", "sink": "Vec<HookOutcome>"},
+          {"source": "HookResult", "transform": "Success→Ok; FailedContinue→warn + продолжить; FailedAbort→warn + Some(FunctionCallError::Fatal('after_tool_use hook {name} failed and aborted operation: {error}'))", "sink": "Option<FunctionCallError>"}
+        ],
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0014/entity/configured-tool-spec",
+      "src": "SRC-0014",
+      "composition": "entity",
+      "terms": {
+        "object": "ConfiguredToolSpec — спецификация инструмента с флагом supports_parallel_tool_calls",
+        "attributes": [
+          "spec: ToolSpec (Function | Freeform | Namespace | ToolSearch | LocalShell | ImageGeneration | WebSearch)",
+          "supports_parallel_tool_calls: bool"
+        ],
+        "relationships": [
+          {"to": "SRC-0014/entity/tool-router", "rel": "stored_in", "card": "N:1"},
+          {"to": "SRC-0014/entity/tool-call", "rel": "matches", "card": "1:N"}
+        ],
+        "enumerations": {
+          "tool_spec_variants": ["Function", "Freeform", "Namespace", "ToolSearch", "LocalShell", "ImageGeneration", "WebSearch"]
+        },
+        "data_flows": [
+          {"source": "ToolsConfig + plan discoverable/mcp/dynamic", "transform": "build_specs_with_discoverable_tools — build_tool_registry_plan; для каждого spec push_spec или push_spec_with_parallel_support(true); для handlers — register_handler по ToolHandlerKind; для unavailable_called_tools — augment_tool_spec_for_code_mode если code_mode_enabled, register_handler unavailable_tool_handler", "sink": "ToolRegistryBuilder"},
+          {"source": "model_visible_specs", "transform": "при code_mode_only_enabled — отфильтровать is_code_mode_nested_tool", "sink": "ToolRouter.model_visible_specs"}
+        ],
+        "config": {
+          "DEFAULT_WAIT_TIMEOUT_MS": {"value": "DEFAULT_WAIT_TIMEOUT_MS", "source": "multi_agents_common::DEFAULT_WAIT_TIMEOUT_MS", "default": "значение в SRC multi_agents_common"},
+          "MIN_WAIT_TIMEOUT_MS": {"value": "MIN_WAIT_TIMEOUT_MS", "source": "multi_agents_common::MIN_WAIT_TIMEOUT_MS", "default": "значение в SRC multi_agents_common"},
+          "MAX_WAIT_TIMEOUT_MS": {"value": "MAX_WAIT_TIMEOUT_MS", "source": "multi_agents_common::MAX_WAIT_TIMEOUT_MS", "default": "значение в SRC multi_agents_common"}
+        }
+      }
+    },
+    {
+      "id": "SRC-0014/entity/tool-name",
+      "src": "SRC-0014",
+      "composition": "entity",
+      "terms": {
+        "object": "ToolName — имя инструмента: опциональный namespace + имя",
+        "attributes": [
+          "namespace: Option<String>",
+          "name: String"
+        ],
+        "relationships": [
+          {"to": "SRC-0014/entity/tool-call", "rel": "identifies", "card": "1:N"},
+          {"to": "SRC-0014/entity/configured-tool-spec", "rel": "addresses", "card": "1:N"}
+        ],
+        "enumerations": null,
+        "data_flows": [
+          {"source": "name String", "transform": "ToolName.plain(name) — namespace=None", "sink": "ToolName"},
+          {"source": "namespace + name", "transform": "ToolName.new(namespace, name)", "sink": "ToolName"},
+          {"source": "ToolName", "transform": "display() — человекочитаемое имя для логов", "sink": "display String"}
+        ],
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0014/entity/tool-call-source",
+      "src": "SRC-0014",
+      "composition": "entity",
+      "terms": {
+        "object": "ToolCallSource — источник вызова инструмента (Direct от модели, JsRepl, CodeMode)",
+        "attributes": null,
+        "relationships": [
+          {"to": "SRC-0014/entity/tool-router", "rel": "passed_to_dispatch", "card": "N:1"}
+        ],
+        "enumerations": {
+          "values": ["Direct", "JsRepl", "CodeMode"]
+        },
+        "data_flows": [
+          {"source": "ToolCallSource", "transform": "Direct + js_repl_tools_only + не js_repl/js_repl_reset → 'direct tool calls are disabled; use js_repl and codex.tool(...) instead'", "sink": "FunctionCallError::RespondToModel"}
+        ],
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0014/entity/exec-command-formatting",
+      "src": "SRC-0014",
+      "composition": "entity",
+      "terms": {
+        "object": "Exec Output Formatting — форматирование вывода команды для модели (структурированный JSON или свободный текст)",
+        "attributes": [
+          "duration_seconds: f32 (округляется до 0.1 секунды)",
+          "exit_code: i32",
+          "output: String (усечённый по TruncationPolicy)",
+          "total_lines: usize (в freeform — при усечении)"
+        ],
+        "relationships": [
+          {"to": "SRC-0014/entity/tool-event-emitter", "rel": "used_by", "card": "N:1"}
+        ],
+        "enumerations": null,
+        "data_flows": [
+          {"source": "ExecToolCallOutput + TruncationPolicy", "transform": "format_exec_output_for_model_structured — сериализовать ExecOutput{output, metadata:{exit_code, duration_seconds}} в JSON", "sink": "String (JSON)"},
+          {"source": "ExecToolCallOutput + TruncationPolicy", "transform": "format_exec_output_for_model_freeform — секции 'Exit code: {}', 'Wall time: {d} seconds', при усечении 'Total output lines: {n}', 'Output:', content; разделитель '\\n'", "sink": "String (plain text)"},
+          {"source": "ExecToolCallOutput", "transform": "build_content_with_timeout — если timed_out, prepend 'command timed out after {ms} milliseconds\\n{aggregated_output}', иначе aggregated_output.text", "sink": "content String"},
+          {"source": "content", "transform": "format_exec_output_str — formatted_truncate_text по TruncationPolicy", "sink": "усечённый String"}
+        ],
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0014/entity/telemetry-preview",
+      "src": "SRC-0014",
+      "composition": "entity",
+      "terms": {
+        "object": "Telemetry Preview — усечённое превью для логов событий (byte limit + line limit + truncation notice)",
+        "attributes": [
+          "TELEMETRY_PREVIEW_MAX_BYTES: usize",
+          "TELEMETRY_PREVIEW_MAX_LINES: usize",
+          "TELEMETRY_PREVIEW_TRUNCATION_NOTICE: '[... telemetry preview truncated ...]'"
+        ],
+        "relationships": [
+          {"to": "SRC-0014/entity/tool-output", "rel": "used_by", "card": "N:1"}
+        ],
+        "enumerations": null,
+        "data_flows": [
+          {"source": "content String", "transform": "telemetry_preview — take_bytes_at_char_boundary(content, MAX_BYTES); взять до MAX_LINES строк; если усечено (по байтам или строкам) → добавить TRUNCATION_NOTICE; если не усечено → вернуть content as-is", "sink": "preview String для log events"}
+        ],
+        "config": {
+          "TELEMETRY_PREVIEW_MAX_BYTES": {"value": 2048, "source": "hardcoded const в mod.rs ('2 * 1024 — 2 KiB')", "default": 2048},
+          "TELEMETRY_PREVIEW_MAX_LINES": {"value": 64, "source": "hardcoded const в mod.rs", "default": 64},
+          "TELEMETRY_PREVIEW_TRUNCATION_NOTICE": {"value": "[... telemetry preview truncated ...]", "source": "hardcoded const в mod.rs", "default": "[... telemetry preview truncated ...]"}
+        }
+      }
+    }
+  ]
+}

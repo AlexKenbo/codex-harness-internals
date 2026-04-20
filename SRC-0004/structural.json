@@ -1,0 +1,721 @@
+{
+  "src": "SRC-0004",
+  "schema_version": "2.0",
+  "lens": "structural",
+  "compositions": [
+    {
+      "id": "SRC-0004/entity/dynamic-tool-spec",
+      "src": "SRC-0004",
+      "composition": "entity",
+      "terms": {
+        "object": "DynamicToolSpec",
+        "attributes": [
+          "name: String",
+          "description: String",
+          "input_schema: JsonValue",
+          "defer_loading: bool (default false)"
+        ],
+        "relationships": [
+          {"to": "SRC-0004/entity/dynamic-tool-call-request", "rel": "referenced_by_tool_name", "card": "1:N"}
+        ],
+        "enumerations": null,
+        "data_flows": [
+          {"source": "wire JSON (camelCase: name, description, inputSchema, deferLoading | exposeToContext legacy)", "transform": "Deserialize via DynamicToolSpecDe; if deferLoading missing then defer_loading = !expose_to_context, else false", "sink": "DynamicToolSpec"}
+        ],
+        "config": {
+          "defer_loading": {"value": false, "source": "field default via #[serde(default)] / DynamicToolSpecDe fallback chain", "default": false}
+        }
+      }
+    },
+    {
+      "id": "SRC-0004/entity/dynamic-tool-call-request",
+      "src": "SRC-0004",
+      "composition": "entity",
+      "terms": {
+        "object": "DynamicToolCallRequest",
+        "attributes": [
+          "call_id: String",
+          "turn_id: String",
+          "tool: String",
+          "arguments: JsonValue"
+        ],
+        "relationships": [
+          {"to": "SRC-0004/entity/dynamic-tool-spec", "rel": "targets_tool_by_name", "card": "N:1"},
+          {"to": "SRC-0004/entity/dynamic-tool-response", "rel": "answered_by", "card": "1:1"}
+        ],
+        "enumerations": null,
+        "data_flows": [
+          {"source": "wire JSON (camelCase: callId, turnId, tool, arguments)", "transform": "Deserialize", "sink": "DynamicToolCallRequest"}
+        ],
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0004/entity/dynamic-tool-response",
+      "src": "SRC-0004",
+      "composition": "entity",
+      "terms": {
+        "object": "DynamicToolResponse",
+        "attributes": [
+          "content_items: Vec<DynamicToolCallOutputContentItem>",
+          "success: bool"
+        ],
+        "relationships": [
+          {"to": "SRC-0004/entity/dynamic-tool-call-output-content-item", "rel": "contains", "card": "1:N"},
+          {"to": "SRC-0004/entity/dynamic-tool-call-request", "rel": "responds_to", "card": "1:1"}
+        ],
+        "enumerations": null,
+        "data_flows": null,
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0004/entity/dynamic-tool-call-output-content-item",
+      "src": "SRC-0004",
+      "composition": "entity",
+      "terms": {
+        "object": "DynamicToolCallOutputContentItem",
+        "attributes": [
+          "type: enum (InputText | InputImage)",
+          "text: String (when InputText)",
+          "image_url: String (when InputImage)"
+        ],
+        "relationships": [
+          {"to": "SRC-0004/entity/dynamic-tool-response", "rel": "part_of", "card": "N:1"}
+        ],
+        "enumerations": {
+          "type": ["InputText", "InputImage"]
+        },
+        "data_flows": null,
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0004/entity/stream-output",
+      "src": "SRC-0004",
+      "composition": "entity",
+      "terms": {
+        "object": "StreamOutput<T>",
+        "attributes": [
+          "text: T (String or Vec<u8>)",
+          "truncated_after_lines: Option<u32>"
+        ],
+        "relationships": [
+          {"to": "SRC-0004/entity/exec-tool-call-output", "rel": "field_of", "card": "N:1"}
+        ],
+        "enumerations": null,
+        "data_flows": [
+          {"source": "raw command stdout/stderr bytes (Vec<u8>)", "transform": "from_utf8_lossy → bytes_to_string_smart (UTF-8 fast-path else detect_encoding via chardetng; IBM866→WINDOWS_1252 coerce when only smart-punctuation bytes 0x80-0x9F + ASCII)", "sink": "StreamOutput<String>.text"}
+        ],
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0004/entity/exec-tool-call-output",
+      "src": "SRC-0004",
+      "composition": "entity",
+      "terms": {
+        "object": "ExecToolCallOutput",
+        "attributes": [
+          "exit_code: i32 (default 0)",
+          "stdout: StreamOutput<String>",
+          "stderr: StreamOutput<String>",
+          "aggregated_output: StreamOutput<String>",
+          "duration: Duration (default ZERO)",
+          "timed_out: bool (default false)"
+        ],
+        "relationships": [
+          {"to": "SRC-0004/entity/stream-output", "rel": "has_streams", "card": "1:3"}
+        ],
+        "enumerations": null,
+        "data_flows": [
+          {"source": "command process exit + stdout + stderr + aggregated stream + elapsed time", "transform": "decode bytes via bytes_to_string_smart per stream", "sink": "ExecToolCallOutput"}
+        ],
+        "config": {
+          "exit_code_default": {"value": 0, "source": "Default impl", "default": 0},
+          "duration_default": {"value": "Duration::ZERO", "source": "Default impl", "default": "Duration::ZERO"},
+          "timed_out_default": {"value": false, "source": "Default impl", "default": false}
+        }
+      }
+    },
+    {
+      "id": "SRC-0004/entity/windows-1252-punct-bytes",
+      "src": "SRC-0004",
+      "composition": "entity",
+      "terms": {
+        "object": "WINDOWS_1252_PUNCT_BYTES",
+        "attributes": [
+          "bytes: [u8; 8] = [0x91, 0x92, 0x93, 0x94, 0x95, 0x96, 0x97, 0x99]"
+        ],
+        "relationships": [
+          {"to": "SRC-0004/entity/stream-output", "rel": "used_by_decoder", "card": "1:N"}
+        ],
+        "enumerations": {
+          "punctuation_bytes": [
+            "0x91 (left single quotation mark ‘)",
+            "0x92 (right single quotation mark ’)",
+            "0x93 (left double quotation mark “)",
+            "0x94 (right double quotation mark ”)",
+            "0x95 (bullet •)",
+            "0x96 (en dash –)",
+            "0x97 (em dash —)",
+            "0x99 (trade mark sign ™)"
+          ]
+        },
+        "data_flows": null,
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0004/entity/request-id",
+      "src": "SRC-0004",
+      "composition": "entity",
+      "terms": {
+        "object": "RequestId",
+        "attributes": [
+          "value: enum (String or Integer i64)"
+        ],
+        "relationships": null,
+        "enumerations": {
+          "variant": ["String", "Integer"]
+        },
+        "data_flows": [
+          {"source": "MCP wire JSON (untagged: string or number)", "transform": "Deserialize untagged enum; Display formats via underlying value", "sink": "RequestId"}
+        ],
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0004/entity/mcp-tool",
+      "src": "SRC-0004",
+      "composition": "entity",
+      "terms": {
+        "object": "Tool",
+        "attributes": [
+          "name: String",
+          "title: Option<String>",
+          "description: Option<String>",
+          "input_schema: serde_json::Value",
+          "output_schema: Option<serde_json::Value>",
+          "annotations: Option<serde_json::Value>",
+          "icons: Option<Vec<serde_json::Value>>",
+          "meta: Option<serde_json::Value> (wire key _meta)"
+        ],
+        "relationships": [
+          {"to": "SRC-0004/entity/call-tool-result", "rel": "produces", "card": "1:N"}
+        ],
+        "enumerations": null,
+        "data_flows": [
+          {"source": "MCP server wire JSON (camelCase, alias snake_case for inputSchema/outputSchema)", "transform": "from_mcp_value: deserialize ToolSerde then convert into Tool", "sink": "Tool"}
+        ],
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0004/entity/mcp-resource",
+      "src": "SRC-0004",
+      "composition": "entity",
+      "terms": {
+        "object": "Resource",
+        "attributes": [
+          "annotations: Option<serde_json::Value>",
+          "description: Option<String>",
+          "mime_type: Option<String> (wire key mimeType, alias mime_type)",
+          "name: String",
+          "size: Option<i64>",
+          "title: Option<String>",
+          "uri: String",
+          "icons: Option<Vec<serde_json::Value>>",
+          "meta: Option<serde_json::Value> (wire key _meta)"
+        ],
+        "relationships": [
+          {"to": "SRC-0004/entity/resource-content", "rel": "read_returns", "card": "1:1"}
+        ],
+        "enumerations": null,
+        "data_flows": [
+          {"source": "MCP server wire JSON (camelCase + snake_case alias)", "transform": "from_mcp_value: deserialize ResourceSerde with deserialize_lossy_opt_i64 for size (i64 from Number; coerce u64 if fits, otherwise None)", "sink": "Resource"}
+        ],
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0004/entity/resource-content",
+      "src": "SRC-0004",
+      "composition": "entity",
+      "terms": {
+        "object": "ResourceContent",
+        "attributes": [
+          "variant: enum (Text or Blob)",
+          "uri: String",
+          "mime_type: Option<String>",
+          "text: String (when Text variant)",
+          "blob: String (when Blob variant)",
+          "meta: Option<serde_json::Value> (wire key _meta)"
+        ],
+        "relationships": [
+          {"to": "SRC-0004/entity/mcp-resource", "rel": "content_of", "card": "1:1"}
+        ],
+        "enumerations": {
+          "variant": ["Text", "Blob"]
+        },
+        "data_flows": null,
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0004/entity/resource-template",
+      "src": "SRC-0004",
+      "composition": "entity",
+      "terms": {
+        "object": "ResourceTemplate",
+        "attributes": [
+          "annotations: Option<serde_json::Value>",
+          "uri_template: String (wire key uriTemplate, alias uri_template)",
+          "name: String",
+          "title: Option<String>",
+          "description: Option<String>",
+          "mime_type: Option<String> (wire key mimeType, alias mime_type)"
+        ],
+        "relationships": null,
+        "enumerations": null,
+        "data_flows": [
+          {"source": "MCP server wire JSON", "transform": "from_mcp_value: deserialize ResourceTemplateSerde then convert", "sink": "ResourceTemplate"}
+        ],
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0004/entity/call-tool-result",
+      "src": "SRC-0004",
+      "composition": "entity",
+      "terms": {
+        "object": "CallToolResult",
+        "attributes": [
+          "content: Vec<serde_json::Value>",
+          "structured_content: Option<serde_json::Value>",
+          "is_error: Option<bool>",
+          "meta: Option<serde_json::Value> (wire key _meta)"
+        ],
+        "relationships": [
+          {"to": "SRC-0004/entity/mcp-tool", "rel": "result_of_tool_call", "card": "1:1"}
+        ],
+        "enumerations": null,
+        "data_flows": null,
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0004/entity/memory-citation",
+      "src": "SRC-0004",
+      "composition": "entity",
+      "terms": {
+        "object": "MemoryCitation",
+        "attributes": [
+          "entries: Vec<MemoryCitationEntry>",
+          "rollout_ids: Vec<String>"
+        ],
+        "relationships": [
+          {"to": "SRC-0004/entity/memory-citation-entry", "rel": "contains", "card": "1:N"}
+        ],
+        "enumerations": null,
+        "data_flows": null,
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0004/entity/memory-citation-entry",
+      "src": "SRC-0004",
+      "composition": "entity",
+      "terms": {
+        "object": "MemoryCitationEntry",
+        "attributes": [
+          "path: String",
+          "line_start: u32",
+          "line_end: u32",
+          "note: String"
+        ],
+        "relationships": [
+          {"to": "SRC-0004/entity/memory-citation", "rel": "part_of", "card": "N:1"}
+        ],
+        "enumerations": null,
+        "data_flows": null,
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0004/entity/history-entry",
+      "src": "SRC-0004",
+      "composition": "entity",
+      "terms": {
+        "object": "HistoryEntry",
+        "attributes": [
+          "conversation_id: String",
+          "ts: u64",
+          "text: String"
+        ],
+        "relationships": null,
+        "enumerations": null,
+        "data_flows": null,
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0004/entity/parsed-command",
+      "src": "SRC-0004",
+      "composition": "entity",
+      "terms": {
+        "object": "ParsedCommand",
+        "attributes": [
+          "type: enum (read | list_files | search | unknown)",
+          "cmd: String (all variants)",
+          "name: String (Read variant)",
+          "path: PathBuf (Read variant; absolute when possible, else relative resolved against cwd)",
+          "path: Option<String> (ListFiles, Search variants)",
+          "query: Option<String> (Search variant)"
+        ],
+        "relationships": null,
+        "enumerations": {
+          "type": ["read", "list_files", "search", "unknown"]
+        },
+        "data_flows": [
+          {"source": "raw shell command string", "transform": "parse into one of 4 variants tagged by type (snake_case)", "sink": "ParsedCommand"}
+        ],
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0004/entity/plan-item-arg",
+      "src": "SRC-0004",
+      "composition": "entity",
+      "terms": {
+        "object": "PlanItemArg",
+        "attributes": [
+          "step: String",
+          "status: StepStatus"
+        ],
+        "relationships": [
+          {"to": "SRC-0004/entity/update-plan-args", "rel": "part_of", "card": "N:1"}
+        ],
+        "enumerations": {
+          "status": ["pending", "in_progress", "completed"]
+        },
+        "data_flows": null,
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0004/entity/update-plan-args",
+      "src": "SRC-0004",
+      "composition": "entity",
+      "terms": {
+        "object": "UpdatePlanArgs",
+        "attributes": [
+          "explanation: Option<String>",
+          "plan: Vec<PlanItemArg>"
+        ],
+        "relationships": [
+          {"to": "SRC-0004/entity/plan-item-arg", "rel": "contains", "card": "1:N"}
+        ],
+        "enumerations": null,
+        "data_flows": [
+          {"source": "TODO/checklist tool call (codex-vscode/todo-mcp/src/main.rs)", "transform": "deny_unknown_fields deserialize", "sink": "UpdatePlanArgs"}
+        ],
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0004/entity/permission-grant-scope",
+      "src": "SRC-0004",
+      "composition": "entity",
+      "terms": {
+        "object": "PermissionGrantScope",
+        "attributes": [
+          "scope: enum (turn | session)"
+        ],
+        "relationships": [
+          {"to": "SRC-0004/entity/request-permissions-response", "rel": "field_of", "card": "1:N"}
+        ],
+        "enumerations": {
+          "scope": ["turn", "session"]
+        },
+        "data_flows": null,
+        "config": {
+          "default_scope": {"value": "turn", "source": "#[default] on Turn variant", "default": "turn"}
+        }
+      }
+    },
+    {
+      "id": "SRC-0004/entity/request-permission-profile",
+      "src": "SRC-0004",
+      "composition": "entity",
+      "terms": {
+        "object": "RequestPermissionProfile",
+        "attributes": [
+          "network: Option<NetworkPermissions>",
+          "file_system: Option<FileSystemPermissions>"
+        ],
+        "relationships": [
+          {"to": "SRC-0004/entity/request-permissions-args", "rel": "field_of", "card": "1:1"},
+          {"to": "SRC-0004/entity/request-permissions-response", "rel": "field_of", "card": "1:1"},
+          {"to": "SRC-0004/entity/request-permissions-event", "rel": "field_of", "card": "1:1"}
+        ],
+        "enumerations": null,
+        "data_flows": [
+          {"source": "PermissionProfile (crate::models)", "transform": "From conversion (network, file_system passthrough); is_empty when both None", "sink": "RequestPermissionProfile"},
+          {"source": "RequestPermissionProfile", "transform": "From conversion to PermissionProfile", "sink": "PermissionProfile"}
+        ],
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0004/entity/request-permissions-args",
+      "src": "SRC-0004",
+      "composition": "entity",
+      "terms": {
+        "object": "RequestPermissionsArgs",
+        "attributes": [
+          "reason: Option<String>",
+          "permissions: RequestPermissionProfile"
+        ],
+        "relationships": [
+          {"to": "SRC-0004/entity/request-permission-profile", "rel": "contains", "card": "1:1"}
+        ],
+        "enumerations": null,
+        "data_flows": null,
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0004/entity/request-permissions-response",
+      "src": "SRC-0004",
+      "composition": "entity",
+      "terms": {
+        "object": "RequestPermissionsResponse",
+        "attributes": [
+          "permissions: RequestPermissionProfile",
+          "scope: PermissionGrantScope (default turn)"
+        ],
+        "relationships": [
+          {"to": "SRC-0004/entity/request-permission-profile", "rel": "contains", "card": "1:1"},
+          {"to": "SRC-0004/entity/permission-grant-scope", "rel": "uses", "card": "1:1"}
+        ],
+        "enumerations": null,
+        "data_flows": null,
+        "config": {
+          "scope_default": {"value": "turn", "source": "#[serde(default)] + PermissionGrantScope default", "default": "turn"}
+        }
+      }
+    },
+    {
+      "id": "SRC-0004/entity/request-permissions-event",
+      "src": "SRC-0004",
+      "composition": "entity",
+      "terms": {
+        "object": "RequestPermissionsEvent",
+        "attributes": [
+          "call_id: String (Responses API call id for the associated tool call, if available)",
+          "turn_id: String (default empty for backwards compatibility)",
+          "reason: Option<String>",
+          "permissions: RequestPermissionProfile"
+        ],
+        "relationships": [
+          {"to": "SRC-0004/entity/request-permission-profile", "rel": "contains", "card": "1:1"}
+        ],
+        "enumerations": null,
+        "data_flows": null,
+        "config": {
+          "turn_id_default": {"value": "", "source": "#[serde(default)] for backwards compatibility", "default": ""}
+        }
+      }
+    },
+    {
+      "id": "SRC-0004/entity/request-user-input-question-option",
+      "src": "SRC-0004",
+      "composition": "entity",
+      "terms": {
+        "object": "RequestUserInputQuestionOption",
+        "attributes": [
+          "label: String",
+          "description: String"
+        ],
+        "relationships": [
+          {"to": "SRC-0004/entity/request-user-input-question", "rel": "option_of", "card": "N:1"}
+        ],
+        "enumerations": null,
+        "data_flows": null,
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0004/entity/request-user-input-question",
+      "src": "SRC-0004",
+      "composition": "entity",
+      "terms": {
+        "object": "RequestUserInputQuestion",
+        "attributes": [
+          "id: String",
+          "header: String",
+          "question: String",
+          "is_other: bool (wire key isOther, default false)",
+          "is_secret: bool (wire key isSecret, default false)",
+          "options: Option<Vec<RequestUserInputQuestionOption>>"
+        ],
+        "relationships": [
+          {"to": "SRC-0004/entity/request-user-input-question-option", "rel": "has_options", "card": "1:N"},
+          {"to": "SRC-0004/entity/request-user-input-args", "rel": "part_of", "card": "N:1"},
+          {"to": "SRC-0004/entity/request-user-input-event", "rel": "part_of", "card": "N:1"}
+        ],
+        "enumerations": null,
+        "data_flows": null,
+        "config": {
+          "is_other_default": {"value": false, "source": "#[serde(rename = isOther, default)]", "default": false},
+          "is_secret_default": {"value": false, "source": "#[serde(rename = isSecret, default)]", "default": false}
+        }
+      }
+    },
+    {
+      "id": "SRC-0004/entity/request-user-input-args",
+      "src": "SRC-0004",
+      "composition": "entity",
+      "terms": {
+        "object": "RequestUserInputArgs",
+        "attributes": [
+          "questions: Vec<RequestUserInputQuestion>"
+        ],
+        "relationships": [
+          {"to": "SRC-0004/entity/request-user-input-question", "rel": "contains", "card": "1:N"}
+        ],
+        "enumerations": null,
+        "data_flows": null,
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0004/entity/request-user-input-answer",
+      "src": "SRC-0004",
+      "composition": "entity",
+      "terms": {
+        "object": "RequestUserInputAnswer",
+        "attributes": [
+          "answers: Vec<String>"
+        ],
+        "relationships": [
+          {"to": "SRC-0004/entity/request-user-input-response", "rel": "value_of", "card": "N:1"}
+        ],
+        "enumerations": null,
+        "data_flows": null,
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0004/entity/request-user-input-response",
+      "src": "SRC-0004",
+      "composition": "entity",
+      "terms": {
+        "object": "RequestUserInputResponse",
+        "attributes": [
+          "answers: HashMap<String (question_id), RequestUserInputAnswer>"
+        ],
+        "relationships": [
+          {"to": "SRC-0004/entity/request-user-input-question", "rel": "answers_keyed_by_question_id", "card": "1:N"},
+          {"to": "SRC-0004/entity/request-user-input-answer", "rel": "values", "card": "1:N"}
+        ],
+        "enumerations": null,
+        "data_flows": null,
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0004/entity/request-user-input-event",
+      "src": "SRC-0004",
+      "composition": "entity",
+      "terms": {
+        "object": "RequestUserInputEvent",
+        "attributes": [
+          "call_id: String (Responses API call id for the associated tool call, if available)",
+          "turn_id: String (default empty for backwards compatibility)",
+          "questions: Vec<RequestUserInputQuestion>"
+        ],
+        "relationships": [
+          {"to": "SRC-0004/entity/request-user-input-question", "rel": "contains", "card": "1:N"}
+        ],
+        "enumerations": null,
+        "data_flows": null,
+        "config": {
+          "turn_id_default": {"value": "", "source": "#[serde(default)] for backwards compatibility", "default": ""}
+        }
+      }
+    },
+    {
+      "id": "SRC-0004/entity/user-input",
+      "src": "SRC-0004",
+      "composition": "entity",
+      "terms": {
+        "object": "UserInput",
+        "attributes": [
+          "type: enum (text | image | local_image | skill | mention) [non_exhaustive]",
+          "text: String (Text variant)",
+          "text_elements: Vec<TextElement> (Text variant, default [])",
+          "image_url: String (Image variant; pre-encoded data URI)",
+          "path: PathBuf (LocalImage variant; converted to Image base64 data URL during request serialization)",
+          "name: String (Skill, Mention variants)",
+          "path: PathBuf (Skill variant; path to SKILL.md)",
+          "path: String (Mention variant; e.g. app://<connector-id> or plugin://<plugin-name>@<marketplace-name>)"
+        ],
+        "relationships": [
+          {"to": "SRC-0004/entity/text-element", "rel": "contains_in_text_variant", "card": "1:N"}
+        ],
+        "enumerations": {
+          "type": ["text", "image", "local_image", "skill", "mention"]
+        },
+        "data_flows": [
+          {"source": "user message (text or image or skill selection or mention or local image path)", "transform": "tag by type variant; LocalImage→Image base64 data URL during request serialization", "sink": "UserInput"}
+        ],
+        "config": {
+          "MAX_USER_INPUT_TEXT_CHARS": {"value": 1048576, "source": "pub const MAX_USER_INPUT_TEXT_CHARS: usize = 1 << 20", "default": 1048576}
+        }
+      }
+    },
+    {
+      "id": "SRC-0004/entity/text-element",
+      "src": "SRC-0004",
+      "composition": "entity",
+      "terms": {
+        "object": "TextElement",
+        "attributes": [
+          "byte_range: ByteRange (byte range in the parent text buffer that this element occupies)",
+          "placeholder: Option<String> (optional human-readable placeholder for the element, displayed in the UI)"
+        ],
+        "relationships": [
+          {"to": "SRC-0004/entity/byte-range", "rel": "uses", "card": "1:1"},
+          {"to": "SRC-0004/entity/user-input", "rel": "span_within_text_variant", "card": "N:1"}
+        ],
+        "enumerations": null,
+        "data_flows": [
+          {"source": "UI-defined spans within UserInput.Text.text", "transform": "byte ranges into the UTF-8 text buffer; placeholder fallback to text.get(byte_range.start..byte_range.end) when None", "sink": "TextElement (used to render or persist rich input markers like image placeholders across history and resume without mutating the literal text)"}
+        ],
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0004/entity/byte-range",
+      "src": "SRC-0004",
+      "composition": "entity",
+      "terms": {
+        "object": "ByteRange",
+        "attributes": [
+          "start: usize (start byte offset, inclusive, within the UTF-8 text buffer)",
+          "end: usize (end byte offset, exclusive, within the UTF-8 text buffer)"
+        ],
+        "relationships": [
+          {"to": "SRC-0004/entity/text-element", "rel": "describes_span_of", "card": "1:1"}
+        ],
+        "enumerations": null,
+        "data_flows": [
+          {"source": "std::ops::Range<usize>", "transform": "From conversion: start=range.start, end=range.end", "sink": "ByteRange"}
+        ],
+        "config": null
+      }
+    }
+  ]
+}

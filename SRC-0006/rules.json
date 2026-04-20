@@ -1,0 +1,617 @@
+{
+  "src": "SRC-0006",
+  "schema_version": "2.0",
+  "lens": "rule",
+  "compositions": [
+    {
+      "id": "SRC-0006/rule/log-queue-capacity",
+      "src": "SRC-0006",
+      "composition": "rule",
+      "terms": {
+        "condition": "Очередь LogDbCommand между tracing-слоем и run_inserter ограничена ёмкостью LOG_QUEUE_CAPACITY=512 сообщений; при переполнении новое сообщение try_send отбрасывается без блокировки горячего пути",
+        "numbers": [
+          {"value": 512, "kind": "queue_capacity", "name": "LOG_QUEUE_CAPACITY"}
+        ],
+        "formula": null,
+        "gwt": {
+          "given": "LOG_QUEUE_CAPACITY=512; в очереди уже 512 необработанных LogEntry",
+          "when": "tracing event генерирует ещё одну LogEntry → sender.try_send",
+          "then": "try_send возвращает Err, событие отбрасывается (let _ = try_send), горячий путь продолжает работу без блокировки"
+        }
+      }
+    },
+    {
+      "id": "SRC-0006/rule/log-batch-flush",
+      "src": "SRC-0006",
+      "composition": "rule",
+      "terms": {
+        "condition": "Буфер LogEntry в run_inserter сбрасывается в SQLite при достижении LOG_BATCH_SIZE=128 записей ИЛИ по тикеру каждые LOG_FLUSH_INTERVAL=2 секунды ИЛИ при явном LogDbCommand::Flush",
+        "numbers": [
+          {"value": 128, "kind": "batch_size", "name": "LOG_BATCH_SIZE"},
+          {"value": 2, "kind": "interval_seconds", "name": "LOG_FLUSH_INTERVAL"}
+        ],
+        "formula": "trigger_flush = (buffer.len() >= LOG_BATCH_SIZE) OR (tick LOG_FLUSH_INTERVAL) OR (LogDbCommand::Flush)",
+        "gwt": {
+          "given": "LOG_BATCH_SIZE=128, LOG_FLUSH_INTERVAL=2s; буфер содержит 127 записей",
+          "when": "поступает 128-я LogEntry в буфер",
+          "then": "buffer.len()=128 >= 128 → flush(state_db, &mut buffer): split_off(0) и state_db.insert_logs(entries)"
+        }
+      }
+    },
+    {
+      "id": "SRC-0006/rule/process-uuid-format",
+      "src": "SRC-0006",
+      "composition": "rule",
+      "terms": {
+        "condition": "process_uuid формируется один раз на процесс (OnceLock) в формате 'pid:<process_id>:<uuid_v4>' и подставляется во все LogEntry для различения параллельных процессов в одной БД",
+        "numbers": null,
+        "formula": "process_uuid = format!('pid:{pid}:{process_uuid}', pid=std::process::id(), process_uuid=Uuid::new_v4())",
+        "gwt": {
+          "given": "std::process::id() = 12345; Uuid::new_v4() = 'a3b1...d9'",
+          "when": "current_process_log_uuid() инициализируется впервые (OnceLock get_or_init)",
+          "then": "PROCESS_LOG_UUID = 'pid:12345:a3b1...d9'; все последующие вызовы возвращают тот же uuid"
+        }
+      }
+    },
+    {
+      "id": "SRC-0006/rule/agent-job-status-enum",
+      "src": "SRC-0006",
+      "composition": "rule",
+      "terms": {
+        "condition": "AgentJobStatus может принимать ровно одно из 5 значений: pending, running, completed, failed, cancelled. Любая другая строка при парсинге вызывает anyhow ошибку 'invalid agent job status: <value>'",
+        "numbers": [
+          {"value": 5, "kind": "enum_size", "name": "AgentJobStatus values count"}
+        ],
+        "formula": null,
+        "gwt": {
+          "given": "AgentJobStatus::parse получает строку 'archived'",
+          "when": "match по value не нашёл соответствия",
+          "then": "Err(anyhow::anyhow!('invalid agent job status: archived'))"
+        }
+      }
+    },
+    {
+      "id": "SRC-0006/rule/agent-job-status-final",
+      "src": "SRC-0006",
+      "composition": "rule",
+      "terms": {
+        "condition": "AgentJob считается финальным (is_final = true) только в статусах Completed, Failed, Cancelled. Pending и Running — не финальные",
+        "numbers": [
+          {"value": 3, "kind": "final_states_count"}
+        ],
+        "formula": "is_final(status) = matches!(status, Completed | Failed | Cancelled)",
+        "gwt": {
+          "given": "AgentJobStatus::Running",
+          "when": "is_final()",
+          "then": "false (не входит в {Completed, Failed, Cancelled})"
+        }
+      }
+    },
+    {
+      "id": "SRC-0006/rule/agent-job-item-status-enum",
+      "src": "SRC-0006",
+      "composition": "rule",
+      "terms": {
+        "condition": "AgentJobItemStatus может принимать ровно одно из 4 значений: pending, running, completed, failed. Любая другая строка → anyhow ошибка 'invalid agent job item status: <value>'",
+        "numbers": [
+          {"value": 4, "kind": "enum_size", "name": "AgentJobItemStatus values count"}
+        ],
+        "formula": null,
+        "gwt": {
+          "given": "AgentJobItemStatus::parse получает 'cancelled' (отсутствует в item enum, есть только в job enum)",
+          "when": "match по value",
+          "then": "Err(anyhow::anyhow!('invalid agent job item status: cancelled'))"
+        }
+      }
+    },
+    {
+      "id": "SRC-0006/rule/backfill-status-enum",
+      "src": "SRC-0006",
+      "composition": "rule",
+      "terms": {
+        "condition": "BackfillStatus может принимать ровно одно из 3 значений: pending, running, complete. Любая другая строка → anyhow ошибка 'invalid backfill status: <value>'",
+        "numbers": [
+          {"value": 3, "kind": "enum_size", "name": "BackfillStatus values count"}
+        ],
+        "formula": null,
+        "gwt": {
+          "given": "BackfillStatus::parse получает 'failed'",
+          "when": "match по value",
+          "then": "Err(anyhow::anyhow!('invalid backfill status: failed'))"
+        }
+      }
+    },
+    {
+      "id": "SRC-0006/rule/backfill-state-default",
+      "src": "SRC-0006",
+      "composition": "rule",
+      "terms": {
+        "condition": "BackfillState::default = { status: Pending, last_watermark: None, last_success_at: None }. При отсутствии записи в SQLite используется этот дефолт",
+        "numbers": null,
+        "formula": null,
+        "gwt": {
+          "given": "В БД нет записи backfill_state",
+          "when": "BackfillState::default()",
+          "then": "BackfillState { status: BackfillStatus::Pending, last_watermark: None, last_success_at: None }"
+        }
+      }
+    },
+    {
+      "id": "SRC-0006/rule/directional-thread-spawn-edge-status-enum",
+      "src": "SRC-0006",
+      "composition": "rule",
+      "terms": {
+        "condition": "DirectionalThreadSpawnEdgeStatus принимает ровно одно из 2 значений: Open, Closed. Сериализация snake_case → 'open', 'closed'",
+        "numbers": [
+          {"value": 2, "kind": "enum_size"}
+        ],
+        "formula": null,
+        "gwt": {
+          "given": "DirectionalThreadSpawnEdgeStatus::Open",
+          "when": "as_ref() / display через strum (serialize_all = 'snake_case')",
+          "then": "'open'"
+        }
+      }
+    },
+    {
+      "id": "SRC-0006/rule/sort-key-enum",
+      "src": "SRC-0006",
+      "composition": "rule",
+      "terms": {
+        "condition": "SortKey принимает ровно одно из 2 значений: CreatedAt, UpdatedAt. Используется в anchor_from_item для выбора компонента ts из ThreadMetadata",
+        "numbers": [
+          {"value": 2, "kind": "enum_size"}
+        ],
+        "formula": "ts(item, sort_key) = match sort_key { CreatedAt => item.created_at, UpdatedAt => item.updated_at }",
+        "gwt": {
+          "given": "ThreadMetadata { created_at: 2024-01-01T00:00:00Z, updated_at: 2024-06-01T00:00:00Z }; SortKey::UpdatedAt",
+          "when": "anchor_from_item(item, SortKey::UpdatedAt)",
+          "then": "Anchor { ts: 2024-06-01T00:00:00Z, id: <Uuid из item.id> }"
+        }
+      }
+    },
+    {
+      "id": "SRC-0006/rule/legacy-epoch-millis-conversion",
+      "src": "SRC-0006",
+      "composition": "rule",
+      "terms": {
+        "condition": "При чтении timestamps из state DB: если значение < MIN_EPOCH_MILLIS (1_577_836_800_000 = 2020-01-01 в миллисекундах), оно интерпретируется как legacy second-precision и умножается на 1000 для получения миллисекунд. Это позволяет старым state DB с секундной точностью корректно сортироваться после новых записей в миллисекундах",
+        "numbers": [
+          {"value": 1577836800000, "kind": "threshold_millis", "name": "MIN_EPOCH_MILLIS (2020-01-01 UTC)"},
+          {"value": 1000, "kind": "multiplier"}
+        ],
+        "formula": "millis = if value < MIN_EPOCH_MILLIS { value.saturating_mul(1000) } else { value }",
+        "gwt": {
+          "given": "значение из БД value=1_700_000_000 (legacy seconds, ~ноябрь 2023); MIN_EPOCH_MILLIS=1_577_836_800_000",
+          "when": "epoch_millis_to_datetime(1_700_000_000)",
+          "then": "1_700_000_000 < 1_577_836_800_000 → millis = 1_700_000_000 * 1000 = 1_700_000_000_000; DateTime = 2023-11-14T22:13:20Z"
+        }
+      }
+    },
+    {
+      "id": "SRC-0006/rule/datetime-canonicalization",
+      "src": "SRC-0006",
+      "composition": "rule",
+      "terms": {
+        "condition": "Все DateTime сохраняемые в state DB канонизируются до миллисекундной точности через round-trip: dt → epoch_millis → DateTime. При ошибке round-trip возвращается исходный dt",
+        "numbers": null,
+        "formula": "canonicalize_datetime(dt) = epoch_millis_to_datetime(datetime_to_epoch_millis(dt)).unwrap_or(dt)",
+        "gwt": {
+          "given": "dt = 2024-06-01T12:34:56.789012Z (с микросекундной точностью)",
+          "when": "canonicalize_datetime(dt): timestamp_millis() = 1717245296789, обратно → 2024-06-01T12:34:56.789Z",
+          "then": "результат = 2024-06-01T12:34:56.789Z (микросекунды и наносекунды отброшены)"
+        }
+      }
+    },
+    {
+      "id": "SRC-0006/rule/tokens-used-non-negative",
+      "src": "SRC-0006",
+      "composition": "rule",
+      "terms": {
+        "condition": "ThreadMetadata.tokens_used никогда не становится отрицательным: при применении EventMsg::TokenCount значение принудительно ограничивается max(0, total_tokens)",
+        "numbers": [
+          {"value": 0, "kind": "lower_bound", "name": "minimum tokens_used"}
+        ],
+        "formula": "tokens_used = max(0, info.total_token_usage.total_tokens)",
+        "gwt": {
+          "given": "EventMsg::TokenCount(token_count) с info.total_token_usage.total_tokens = -5 (теоретически возможный мусор)",
+          "when": "apply_event_msg обрабатывает TokenCount",
+          "then": "metadata.tokens_used = max(0, -5) = 0"
+        }
+      }
+    },
+    {
+      "id": "SRC-0006/rule/session-meta-thread-id-match",
+      "src": "SRC-0006",
+      "composition": "rule",
+      "terms": {
+        "condition": "SessionMeta line применяется только если meta.id совпадает с metadata.id (canonical thread id). Это защита от forked rollouts, которые могут содержать SessionMeta исходной (родительской) сессии",
+        "numbers": null,
+        "formula": null,
+        "gwt": {
+          "given": "metadata.id = 'thread-A'; пришла RolloutItem::SessionMeta с meta.id = 'thread-B' (forked from)",
+          "when": "apply_session_meta_from_item(metadata, meta_line)",
+          "then": "проверка metadata.id != meta_line.meta.id → return; метаданные не обновляются (origin/forked session ignored)"
+        }
+      }
+    },
+    {
+      "id": "SRC-0006/rule/turn-context-cwd-precedence",
+      "src": "SRC-0006",
+      "composition": "rule",
+      "terms": {
+        "condition": "При apply_turn_context: cwd обновляется ТОЛЬКО если metadata.cwd пуст (as_os_str().is_empty()). model/reasoning_effort/sandbox_policy/approval_mode обновляются ВСЕГДА. SessionMeta cwd имеет приоритет над TurnContext cwd",
+        "numbers": null,
+        "formula": null,
+        "gwt": {
+          "given": "metadata.cwd = '/child/worktree' (из SessionMeta); поступает TurnContext с cwd='/parent/workspace'",
+          "when": "apply_turn_context(metadata, turn_ctx)",
+          "then": "metadata.cwd остаётся '/child/worktree' (turn_context_does_not_override_session_cwd test); sandbox_policy/approval_mode из TurnContext применяются"
+        }
+      }
+    },
+    {
+      "id": "SRC-0006/rule/first-user-message-only-from-event-msg",
+      "src": "SRC-0006",
+      "composition": "rule",
+      "terms": {
+        "condition": "first_user_message и title устанавливаются только из RolloutItem::EventMsg::UserMessage, не из RolloutItem::ResponseItem (apply_response_item = no-op). Это исключает попадание ResponseItem ролей 'user' (system-generated) в человеко-видимый title",
+        "numbers": null,
+        "formula": null,
+        "gwt": {
+          "given": "metadata.first_user_message=None, title=''; пришёл RolloutItem::ResponseItem(Message{role: 'user', content: 'hello from response item'})",
+          "when": "apply_rollout_item",
+          "then": "metadata.first_user_message=None, title='' (response_item_user_messages_do_not_set_title_or_first_user_message test)"
+        }
+      }
+    },
+    {
+      "id": "SRC-0006/rule/first-user-message-write-once",
+      "src": "SRC-0006",
+      "composition": "rule",
+      "terms": {
+        "condition": "first_user_message устанавливается единожды (write-once): только если metadata.first_user_message.is_none(). Title устанавливается из UserMessage только если title.is_empty(). Последующие UserMessage не перезаписывают эти поля",
+        "numbers": null,
+        "formula": null,
+        "gwt": {
+          "given": "metadata.first_user_message = Some('first'); пришла EventMsg::UserMessage с message='second'",
+          "when": "apply_event_msg",
+          "then": "metadata.first_user_message остаётся Some('first') — write-once семантика"
+        }
+      }
+    },
+    {
+      "id": "SRC-0006/rule/image-only-user-message-placeholder",
+      "src": "SRC-0006",
+      "composition": "rule",
+      "terms": {
+        "condition": "Если UserMessage содержит пустой текст, но имеет images (Some non-empty) или local_images (non-empty), first_user_message устанавливается в '[Image]' (IMAGE_ONLY_USER_MESSAGE_PLACEHOLDER). title не устанавливается. Если нет ни текста, ни images — first_user_message остаётся None",
+        "numbers": null,
+        "formula": "preview = if non_empty_text { Some(text) } else if has_images { Some('[Image]') } else { None }",
+        "gwt": {
+          "given": "EventMsg::UserMessage с message='', images=Some(['https://example.com/image.png']), local_images=[]",
+          "when": "apply_event_msg → user_message_preview",
+          "then": "metadata.first_user_message = Some('[Image]'); metadata.title = '' (event_msg_image_only_user_message_sets_image_placeholder_preview test)"
+        }
+      }
+    },
+    {
+      "id": "SRC-0006/rule/thread-name-update-replaces-title-only",
+      "src": "SRC-0006",
+      "composition": "rule",
+      "terms": {
+        "condition": "EventMsg::ThreadNameUpdated заменяет title на trim(thread_name) только если thread_name присутствует и непустой после trim. first_user_message при этом не меняется. Это позволяет переименовать сессию без перезаписи исторического первого сообщения",
+        "numbers": null,
+        "formula": null,
+        "gwt": {
+          "given": "metadata.title='actual user request', first_user_message=Some('actual user request'); поступает ThreadNameUpdated(thread_name=Some('saved-session'))",
+          "when": "apply_event_msg",
+          "then": "metadata.title='saved-session'; first_user_message=Some('actual user request') (thread_name_update_replaces_title_without_changing_first_user_message test)"
+        }
+      }
+    },
+    {
+      "id": "SRC-0006/rule/strip-user-message-prefix",
+      "src": "SRC-0006",
+      "composition": "rule",
+      "terms": {
+        "condition": "Перед использованием user.message в title и first_user_message ищется маркер USER_MESSAGE_BEGIN: если найден — берётся substring после маркера и обрезаются пробелы; если не найден — обрезаются пробелы",
+        "numbers": null,
+        "formula": "stripped = match text.find(USER_MESSAGE_BEGIN) { Some(idx) => text[idx + USER_MESSAGE_BEGIN.len()..].trim(), None => text.trim() }",
+        "gwt": {
+          "given": "user.message = '<USER_MESSAGE_BEGIN> actual user request' (формат теста event_msg_user_messages_set_title_and_first_user_message)",
+          "when": "strip_user_message_prefix(user.message)",
+          "then": "результат = 'actual user request'; metadata.title = 'actual user request'; first_user_message = Some('actual user request')"
+        }
+      }
+    },
+    {
+      "id": "SRC-0006/rule/git-info-prefer-existing",
+      "src": "SRC-0006",
+      "composition": "rule",
+      "terms": {
+        "condition": "При reconciling новой ThreadMetadata из rollout с существующей записью БД: для каждого из git_sha, git_branch, git_origin_url — если existing значение Some, оно копируется в self (новая) запись. Это сохраняет git-данные, ранее зафиксированные в БД, при последующих обновлениях из rollout",
+        "numbers": [
+          {"value": 3, "kind": "preserved_fields_count", "name": "git_sha + git_branch + git_origin_url"}
+        ],
+        "formula": null,
+        "gwt": {
+          "given": "self.git_sha=None; existing.git_sha=Some('abc123'); existing.git_branch=Some('main'); existing.git_origin_url=None",
+          "when": "self.prefer_existing_git_info(&existing)",
+          "then": "self.git_sha=Some('abc123'); self.git_branch=Some('main'); self.git_origin_url остаётся None (existing.git_origin_url=None — не копируется)"
+        }
+      }
+    },
+    {
+      "id": "SRC-0006/rule/diff-fields-coverage",
+      "src": "SRC-0006",
+      "composition": "rule",
+      "terms": {
+        "condition": "ThreadMetadata.diff_fields(other) сравнивает ровно 22 поля по очереди и возвращает имена полей, в которых обнаружены различия: id, rollout_path, created_at, updated_at, source, agent_nickname, agent_role, agent_path, model_provider, model, reasoning_effort, cwd, cli_version, title, sandbox_policy, approval_mode, tokens_used, first_user_message, archived_at, git_sha, git_branch, git_origin_url",
+        "numbers": [
+          {"value": 22, "kind": "compared_fields_count"}
+        ],
+        "formula": null,
+        "gwt": {
+          "given": "base = metadata_for_test() с title='hello'; other = base.clone() с tokens_used=2 и title='world'",
+          "when": "base.diff_fields(&other)",
+          "then": "diffs = vec!['title', 'tokens_used'] (порядок соответствует порядку проверок в коде; diff_fields_detects_changes test)"
+        }
+      }
+    },
+    {
+      "id": "SRC-0006/rule/cli-default-backfill",
+      "src": "SRC-0006",
+      "composition": "rule",
+      "terms": {
+        "condition": "logs_client CLI: дефолтное число строк backfill = 200; дефолтный poll интервал = 500 ms. При --backfill=0 backfill пропускается полностью",
+        "numbers": [
+          {"value": 200, "kind": "default", "name": "--backfill default"},
+          {"value": 500, "kind": "default_ms", "name": "--poll-ms default"},
+          {"value": 0, "kind": "skip_threshold", "name": "backfill=0 → skip"}
+        ],
+        "formula": null,
+        "gwt": {
+          "given": "запуск 'codex-state-logs' без --backfill и --poll-ms",
+          "when": "Args::parse()",
+          "then": "args.backfill = 200; args.poll_ms = 500; CLI запросит 200 последних строк в backfill, затем будет опрашивать каждые 500 ms"
+        }
+      }
+    },
+    {
+      "id": "SRC-0006/rule/codex-home-fallback",
+      "src": "SRC-0006",
+      "composition": "rule",
+      "terms": {
+        "condition": "logs_client определяет CODEX_HOME по приоритету: явный --db (override path) → --codex-home (CLI или env CODEX_HOME) → home_dir().join('.codex') → PathBuf::from('.codex')",
+        "numbers": null,
+        "formula": "codex_home = args.db.or_else(|| args.codex_home.or_else(default_codex_home))",
+        "gwt": {
+          "given": "запуск без --db и --codex-home; env CODEX_HOME не установлен; home_dir() = '/home/user'",
+          "when": "resolve_db_path(args)",
+          "then": "codex_home = '/home/user/.codex'; db_path = logs_db_path('/home/user/.codex')"
+        }
+      }
+    },
+    {
+      "id": "SRC-0006/rule/timestamp-parsing",
+      "src": "SRC-0006",
+      "composition": "rule",
+      "terms": {
+        "condition": "logs_client --from/--to принимает либо unix-секунды (i64), либо RFC3339. Парсер сначала пробует i64, при неудаче — DateTime::parse_from_rfc3339; иначе ошибка 'expected RFC3339 or unix seconds, got <value>'",
+        "numbers": null,
+        "formula": "parse_timestamp(value) = value.parse::<i64>().ok().or_else(|| DateTime::parse_from_rfc3339(value).ok().map(|dt| dt.timestamp()))",
+        "gwt": {
+          "given": "value = '2024-01-15T10:30:00Z'",
+          "when": "parse_timestamp(value)",
+          "then": "i64 parse fail → RFC3339 parse OK → DateTime → .timestamp() = 1705314600"
+        }
+      }
+    },
+    {
+      "id": "SRC-0006/rule/log-level-formatting",
+      "src": "SRC-0006",
+      "composition": "rule",
+      "terms": {
+        "condition": "logs_client форматирует level: padded до 5 символов (format!('{:<5}')), затем окрашивается в зависимости от case-insensitive значения. Маппинг цветов фиксирован: error=red+bold, warn=yellow+bold, info=green+bold, debug=blue+bold, trace=magenta+bold, остальные=bold",
+        "numbers": [
+          {"value": 5, "kind": "padding_width", "name": "level field padding"},
+          {"value": 5, "kind": "mapped_levels_count", "name": "error/warn/info/debug/trace"}
+        ],
+        "formula": null,
+        "gwt": {
+          "given": "level='Error' (mixed case)",
+          "when": "formatter::level('Error')",
+          "then": "padded='Error'; eq_ignore_ascii_case('error')=true → padded.red().bold().to_string()"
+        }
+      }
+    },
+    {
+      "id": "SRC-0006/rule/apply-patch-heuristic",
+      "src": "SRC-0006",
+      "composition": "rule",
+      "terms": {
+        "condition": "logs_client применяет эвристику apply_patch форматирования к message только если message содержит подстроку 'ToolCall: apply_patch'. В этом режиме строки префиксированные '+' окрашиваются зелёным+bold, '-' красным+bold, остальные bold",
+        "numbers": null,
+        "formula": "if message.contains('ToolCall: apply_patch') -> формат diff (+/-)",
+        "gwt": {
+          "given": "message = 'ToolCall: apply_patch\\n+added line\\n-removed line\\nunchanged'",
+          "when": "heuristic_formatting(message)",
+          "then": "matcher::apply_patch=true → formatter::apply_patch: '+added line' green+bold; '-removed line' red+bold; 'unchanged' bold; 'ToolCall: apply_patch' bold"
+        }
+      }
+    },
+    {
+      "id": "SRC-0006/rule/db-versions",
+      "src": "SRC-0006",
+      "composition": "rule",
+      "terms": {
+        "condition": "Версии встроенных миграций фиксированы константами: STATE_DB_VERSION=5, LOGS_DB_VERSION=2. Имена файлов БД: STATE_DB_FILENAME='state', LOGS_DB_FILENAME='logs'",
+        "numbers": [
+          {"value": 5, "kind": "schema_version", "name": "STATE_DB_VERSION"},
+          {"value": 2, "kind": "schema_version", "name": "LOGS_DB_VERSION"}
+        ],
+        "formula": null,
+        "gwt": {
+          "given": "Codex компилируется с STATE_DB_VERSION=5",
+          "when": "запуск StateRuntime::init(codex_home, ...)",
+          "then": "ожидается state DB с миграциями вплоть до версии 5; БД с версией <5 будет мигрирована до 5; БД с версией >5 (от parallel newer binary) откроется благодаря ignore_missing=true"
+        }
+      }
+    },
+    {
+      "id": "SRC-0006/rule/migration-ignore-missing",
+      "src": "SRC-0006",
+      "composition": "rule",
+      "terms": {
+        "condition": "Runtime migrator (для state и logs DB) выставляет ignore_missing=true. Это позволяет старшему бинарнику открыть БД, которая уже была мигрирована более новым бинарником, работающим параллельно. Известные миграции по-прежнему валидируются по checksum",
+        "numbers": null,
+        "formula": null,
+        "gwt": {
+          "given": "БД содержит applied миграции v1..v7; встроенный набор бинарника v1..v5 (ignore_missing=true)",
+          "when": "runtime_state_migrator() применяется",
+          "then": "v6, v7 игнорируются (отсутствуют в встроенном наборе); v1..v5 валидируются по checksum; БД открыта успешно"
+        }
+      }
+    },
+    {
+      "id": "SRC-0006/rule/reasoning-effort-unknown-graceful",
+      "src": "SRC-0006",
+      "composition": "rule",
+      "terms": {
+        "condition": "При парсинге ThreadRow.reasoning_effort из SQLite: значение Option<String> парсится через .parse::<ReasoningEffort>(), при ошибке (неизвестное значение) → None. БД с записями неизвестного будущего значения не приводит к ошибке — поле просто становится None",
+        "numbers": null,
+        "formula": "reasoning_effort = row_value.and_then(|v| v.parse::<ReasoningEffort>().ok())",
+        "gwt": {
+          "given": "ThreadRow.reasoning_effort = Some('future') (неизвестное в текущей версии codex_protocol значение)",
+          "when": "TryFrom<ThreadRow> for ThreadMetadata",
+          "then": "metadata.reasoning_effort = None (thread_row_ignores_unknown_reasoning_effort_values test)"
+        }
+      }
+    },
+    {
+      "id": "SRC-0006/rule/first-user-message-empty-string-to-none",
+      "src": "SRC-0006",
+      "composition": "rule",
+      "terms": {
+        "condition": "При чтении ThreadRow из SQLite: пустая строка first_user_message конвертируется в Option::None. Это нормализует представление между БД (где null хранится как пустая строка) и in-memory моделью (Option<String>)",
+        "numbers": null,
+        "formula": "first_user_message = (!row.first_user_message.is_empty()).then_some(row.first_user_message)",
+        "gwt": {
+          "given": "ThreadRow.first_user_message = '' (пустая строка)",
+          "when": "TryFrom<ThreadRow>",
+          "then": "ThreadMetadata.first_user_message = None"
+        }
+      }
+    },
+    {
+      "id": "SRC-0006/rule/sqlite-home-env",
+      "src": "SRC-0006",
+      "composition": "rule",
+      "terms": {
+        "condition": "Для override директории SQLite state database определена константа SQLITE_HOME_ENV = 'CODEX_SQLITE_HOME'. Эта env-переменная задаёт корневой путь для state DB",
+        "numbers": null,
+        "formula": null,
+        "gwt": {
+          "given": "Установлена env CODEX_SQLITE_HOME='/var/lib/codex'",
+          "when": "Codex использует SQLITE_HOME_ENV для определения home directory state DB",
+          "then": "state DB ищется/создаётся по пути '/var/lib/codex' вместо CODEX_HOME default"
+        }
+      }
+    },
+    {
+      "id": "SRC-0006/rule/db-metric-tags",
+      "src": "SRC-0006",
+      "composition": "rule",
+      "terms": {
+        "condition": "Стандартизованные имена и теги метрик БД: codex.db.error (теги [stage]) — ошибки операций; codex.db.backfill (теги [status]) — метрики backfill; codex.db.backfill.duration_ms (теги [status]) — длительность backfill",
+        "numbers": [
+          {"value": 3, "kind": "metric_names_count"}
+        ],
+        "formula": null,
+        "gwt": {
+          "given": "backfill завершился со status='complete' за 12345 ms",
+          "when": "эмиссия метрики codex.db.backfill.duration_ms",
+          "then": "метрика codex.db.backfill.duration_ms=12345 с тегом status=complete"
+        }
+      }
+    },
+    {
+      "id": "SRC-0006/rule/log-thread-id-resolution",
+      "src": "SRC-0006",
+      "composition": "rule",
+      "terms": {
+        "condition": "Резолюция thread_id для LogEntry: сначала проверяется поле события (MessageVisitor.thread_id из 'thread_id' field записи); если None — обходится event scope от root к leaf, и берётся последний непустой SpanLogContext.thread_id. Глубоко вложенные span'ы перезаписывают значение из родительских",
+        "numbers": null,
+        "formula": "thread_id = event_visitor.thread_id.or_else(|| event_thread_id(event, &ctx))",
+        "gwt": {
+          "given": "Span 'feedback-thread' с thread_id='thread-1'; внутри tracing::info!(foo=2, 'thread-scoped') без thread_id field",
+          "when": "on_event(event, ctx)",
+          "then": "MessageVisitor.thread_id=None → event_thread_id обходит scope → находит SpanLogContext.thread_id=Some('thread-1') → LogEntry.thread_id=Some('thread-1') (sqlite_feedback_logs_match_feedback_formatter_shape test)"
+        }
+      }
+    },
+    {
+      "id": "SRC-0006/rule/feedback-log-body-format",
+      "src": "SRC-0006",
+      "composition": "rule",
+      "terms": {
+        "condition": "feedback_log_body = конкатенация контекста от root span к leaf, формат 'span1{fields}:span2{fields}: <event-fields>'. Span с непустыми formatted_fields оборачивается в '{...}'. Span без SpanLogContext добавляется только по имени metadata. Между header и event-fields разделитель ' ' (пробел), между span'ами — ':'",
+        "numbers": null,
+        "formula": null,
+        "gwt": {
+          "given": "Span 'feedback-thread{thread_id=thread-1, turn=1}' содержит event 'thread-scoped{foo=2}'",
+          "when": "format_feedback_log_body(event, ctx)",
+          "then": "result = 'feedback-thread{thread_id=thread-1, turn=1}: thread-scoped{foo=2}' (соответствует SQLite формату из теста sqlite_feedback_logs_match_feedback_formatter_shape)"
+        }
+      }
+    },
+    {
+      "id": "SRC-0006/rule/empty-args-filtered",
+      "src": "SRC-0006",
+      "composition": "rule",
+      "terms": {
+        "condition": "При построении LogFilter из CLI Args: пустые элементы --module/--file/--thread-id (строки == '') фильтруются и не попадают в фильтр. Это позволяет пустые '' аргументы трактовать как 'не задано'",
+        "numbers": null,
+        "formula": "module_like = args.module.iter().filter(|m| !m.is_empty()).cloned().collect()",
+        "gwt": {
+          "given": "args.module = ['core', '', 'state']",
+          "when": "build_filter(args)",
+          "then": "filter.module_like = ['core', 'state'] (пустая строка отброшена)"
+        }
+      }
+    },
+    {
+      "id": "SRC-0006/rule/system-time-clock-skew",
+      "src": "SRC-0006",
+      "composition": "rule",
+      "terms": {
+        "condition": "При формировании ts/ts_nanos для LogEntry: SystemTime::now().duration_since(UNIX_EPOCH); если SystemTime раньше UNIX_EPOCH (clock skew) — используется Duration::from_secs(0)",
+        "numbers": [
+          {"value": 0, "kind": "fallback_seconds"}
+        ],
+        "formula": "now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_else(|_| Duration::from_secs(0))",
+        "gwt": {
+          "given": "Системные часы установлены раньше 1970-01-01 (теоретический сценарий)",
+          "when": "LogDbLayer::on_event формирует LogEntry",
+          "then": "now = Duration::from_secs(0); LogEntry.ts=0, ts_nanos=0"
+        }
+      }
+    },
+    {
+      "id": "SRC-0006/rule/thread-id-format-row-fallback",
+      "src": "SRC-0006",
+      "composition": "rule",
+      "terms": {
+        "condition": "При форматировании LogRow для печати: отсутствие thread_id заменяется на '-'; отсутствие message заменяется на ''. Никогда не выводится 'null' / 'None'",
+        "numbers": null,
+        "formula": null,
+        "gwt": {
+          "given": "LogRow с thread_id=None, message=None",
+          "when": "format_row(&row, compact=false)",
+          "then": "thread_id='-', message=''; вывод 'timestamp INFO  [-] target - '"
+        }
+      }
+    }
+  ]
+}

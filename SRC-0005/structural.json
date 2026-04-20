@@ -1,0 +1,495 @@
+{
+  "src": "SRC-0005",
+  "schema_version": "2.0",
+  "lens": "structural",
+  "compositions": [
+    {
+      "id": "SRC-0005/entity/state-runtime",
+      "src": "SRC-0005",
+      "composition": "entity",
+      "terms": {
+        "object": "StateRuntime",
+        "attributes": [
+          "codex_home: PathBuf (доменное расположение конфигурации/данных пользователя)",
+          "default_provider: String (модель-провайдер по умолчанию для новых тредов)",
+          "thread_updated_at_millis: AtomicI64 (high-water mark monotonic millis для порядка курсора thread list)"
+        ],
+        "relationships": [
+          {"to": "SRC-0005/entity/thread", "rel": "manages", "card": "1:N"},
+          {"to": "SRC-0005/entity/log-entry", "rel": "manages", "card": "1:N"},
+          {"to": "SRC-0005/entity/agent-job", "rel": "manages", "card": "1:N"},
+          {"to": "SRC-0005/entity/stage1-output", "rel": "manages", "card": "1:N"},
+          {"to": "SRC-0005/entity/job", "rel": "manages", "card": "1:N"},
+          {"to": "SRC-0005/entity/backfill-state", "rel": "manages", "card": "1:1"},
+          {"to": "SRC-0005/entity/remote-control-enrollment", "rel": "manages", "card": "1:N"},
+          {"to": "SRC-0005/entity/thread-spawn-edge", "rel": "manages", "card": "1:N"}
+        ],
+        "data_flows": [
+          {"source": "init(codex_home, default_provider)", "transform": "create dirs, remove legacy db files (state и logs), open and migrate state DB и logs DB, load max thread updated_at_ms", "sink": "Arc<StateRuntime>"},
+          {"source": "init", "transform": "run_logs_startup_maintenance: delete logs older than 10 days, WAL checkpoint(TRUNCATE), incremental_vacuum", "sink": "logs DB (очищенная)"}
+        ],
+        "enumerations": null,
+        "config": {
+          "codex_home": {"value": null, "source": "init parameter (caller)", "default": null},
+          "default_provider": {"value": null, "source": "init parameter (caller)", "default": null},
+          "log_retention_days": {"value": 10, "source": "hardcoded LOG_RETENTION_DAYS", "default": 10}
+        }
+      }
+    },
+    {
+      "id": "SRC-0005/entity/thread",
+      "src": "SRC-0005",
+      "composition": "entity",
+      "terms": {
+        "object": "Thread (сессия/беседа агента)",
+        "attributes": [
+          "id: ThreadId (доменный идентификатор треда)",
+          "rollout_path: путь к файлу rollout (.jsonl истории сессии)",
+          "created_at: момент создания",
+          "updated_at: момент последнего обновления",
+          "source: происхождение треда (cli, sub_agent: thread_spawn и др.)",
+          "agent_nickname: прозвище агента",
+          "agent_role: роль агента",
+          "agent_path: канонический путь к определению агента",
+          "model_provider: провайдер модели",
+          "model: имя модели (gpt-5 в тестах)",
+          "reasoning_effort: усилие рассуждения (low/medium/high)",
+          "cwd: рабочая директория",
+          "cli_version: версия CLI",
+          "title: заголовок треда (видимый пользователю)",
+          "sandbox_policy: политика sandbox (read-only и др.)",
+          "approval_mode: режим аппрувов (on-request и др.)",
+          "tokens_used: израсходованные токены",
+          "first_user_message: первое сообщение пользователя (для preview списка)",
+          "archived_at: момент архивации (NULL = активен)",
+          "git_sha: git-коммит",
+          "git_branch: git-ветка",
+          "git_origin_url: git origin URL",
+          "memory_mode: режим памяти треда (enabled/disabled/polluted)"
+        ],
+        "relationships": [
+          {"to": "SRC-0005/entity/log-entry", "rel": "owns_logs", "card": "1:N"},
+          {"to": "SRC-0005/entity/dynamic-tool", "rel": "has_tools", "card": "1:N"},
+          {"to": "SRC-0005/entity/thread-spawn-edge", "rel": "spawn_parent_or_child", "card": "1:N"},
+          {"to": "SRC-0005/entity/stage1-output", "rel": "produces_memory", "card": "1:0..1"},
+          {"to": "SRC-0005/entity/agent-job-item", "rel": "assigned_to_item", "card": "1:N"}
+        ],
+        "data_flows": [
+          {"source": "RolloutItem (SessionMeta/EventMsg/Compacted/TurnContext/ResponseItem)", "transform": "apply_rollout_items: build/load metadata, merge updates, prefer existing git info, override updated_at либо file_modified_time_utc(rollout_path)", "sink": "threads row"},
+          {"source": "SessionSource::SubAgent::ThreadSpawn(parent_thread_id)", "transform": "thread_spawn_parent_thread_id_from_source_str", "sink": "thread_spawn_edges (parent→child, status='Open')"},
+          {"source": "session meta dynamic_tools[]", "transform": "persist_dynamic_tools: insert per position once (ON CONFLICT DO NOTHING)", "sink": "thread_dynamic_tools"},
+          {"source": "session meta memory_mode (последний)", "transform": "extract_memory_mode (rev find), set_thread_memory_mode", "sink": "threads.memory_mode"}
+        ],
+        "enumerations": {
+          "memory_mode": ["enabled", "disabled", "polluted"],
+          "session_source_examples": ["cli", "sub_agent: thread_spawn"],
+          "directional_thread_spawn_edge_status": ["Open", "Closed"]
+        },
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0005/entity/dynamic-tool",
+      "src": "SRC-0005",
+      "composition": "entity",
+      "terms": {
+        "object": "DynamicTool (динамический инструмент треда)",
+        "attributes": [
+          "thread_id: владелец-тред",
+          "position: порядок инструмента (i64, начиная с 0)",
+          "name: имя инструмента",
+          "description: описание",
+          "input_schema: JSON-схема входа",
+          "defer_loading: отложенная загрузка (bool)"
+        ],
+        "relationships": [
+          {"to": "SRC-0005/entity/thread", "rel": "belongs_to", "card": "N:1"}
+        ],
+        "data_flows": [
+          {"source": "session meta dynamic_tools[]", "transform": "сериализация input_schema в строку JSON, insert по (thread_id, position) один раз", "sink": "thread_dynamic_tools row"},
+          {"source": "thread_dynamic_tools rows ORDER BY position ASC", "transform": "десериализация input_schema из строки в Value", "sink": "Vec<DynamicToolSpec> для get_dynamic_tools"}
+        ],
+        "enumerations": null,
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0005/entity/thread-spawn-edge",
+      "src": "SRC-0005",
+      "composition": "entity",
+      "terms": {
+        "object": "ThreadSpawnEdge (направленная связь parent→child между тредами)",
+        "attributes": [
+          "parent_thread_id: тред-инициатор спавна",
+          "child_thread_id: спавненный дочерний тред (уникален — один родитель на ребёнка)",
+          "status: lifecycle статус ребра (Open/Closed)"
+        ],
+        "relationships": [
+          {"to": "SRC-0005/entity/thread", "rel": "parent_of", "card": "N:1"},
+          {"to": "SRC-0005/entity/thread", "rel": "child_of", "card": "1:1"}
+        ],
+        "data_flows": [
+          {"source": "upsert_thread_spawn_edge(parent, child, status)", "transform": "INSERT ON CONFLICT(child_thread_id) DO UPDATE → меняет parent и status", "sink": "thread_spawn_edges row"},
+          {"source": "session source 'sub_agent: thread_spawn { parent_thread_id }'", "transform": "insert_thread_spawn_edge_from_source_if_absent → status='Open' по умолчанию", "sink": "thread_spawn_edges row"},
+          {"source": "list_thread_spawn_descendants_with_status (CTE рекурсивный)", "transform": "обход дерева потомков breadth-first по depth ASC, child_thread_id ASC", "sink": "Vec<ThreadId>"}
+        ],
+        "enumerations": {
+          "status": ["Open", "Closed"]
+        },
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0005/entity/log-entry",
+      "src": "SRC-0005",
+      "composition": "entity",
+      "terms": {
+        "object": "LogEntry (запись лога процесса/треда)",
+        "attributes": [
+          "ts: timestamp (epoch seconds)",
+          "ts_nanos: дробная часть timestamp (наносекунды)",
+          "level: уровень лога (INFO и др.)",
+          "target: цель/категория записи (например, 'cli')",
+          "feedback_log_body: тело отрендеренной строки лога (видимое в /feedback и query_logs); fallback на message для legacy callers",
+          "thread_id: тред (NULL = threadless)",
+          "process_uuid: идентификатор процесса (NULL допустимо)",
+          "module_path: путь к модулю",
+          "file: файл-источник лога",
+          "line: номер строки",
+          "estimated_bytes: учётный размер записи для бюджетов (length(feedback_log_body) + level + target + module_path + file)"
+        ],
+        "relationships": [
+          {"to": "SRC-0005/entity/thread", "rel": "scoped_to_thread_or_threadless", "card": "N:1"}
+        ],
+        "data_flows": [
+          {"source": "insert_logs(entries[])", "transform": "вычислить estimated_bytes на запись; INSERT batch в logs; в той же транзакции — prune_logs_after_insert", "sink": "logs table"},
+          {"source": "query_logs(LogQuery)", "transform": "push_log_filters → ORDER BY id (ASC/DESC) → LIMIT", "sink": "Vec<LogRow>"},
+          {"source": "query_feedback_logs_for_threads(thread_ids[])", "transform": "CTE: requested_threads + latest_processes (последний process_uuid с непустым) + feedback_logs (тред или threadless того же latest process) + cumulative_estimated_bytes ≤ 10 MiB; форматирование строк format_feedback_log_line", "sink": "Vec<u8> (строки в порядке возрастания ts)"},
+          {"source": "delete_logs_before(cutoff_ts)", "transform": "DELETE FROM logs WHERE ts < cutoff_ts", "sink": "logs table"}
+        ],
+        "enumerations": null,
+        "config": {
+          "log_partition_size_limit_bytes": {"value": 10485760, "source": "hardcoded LOG_PARTITION_SIZE_LIMIT_BYTES (10 * 1024 * 1024)", "default": 10485760},
+          "log_partition_row_limit": {"value": 1000, "source": "hardcoded LOG_PARTITION_ROW_LIMIT", "default": 1000},
+          "log_retention_days": {"value": 10, "source": "hardcoded LOG_RETENTION_DAYS", "default": 10}
+        }
+      }
+    },
+    {
+      "id": "SRC-0005/entity/log-query",
+      "src": "SRC-0005",
+      "composition": "entity",
+      "terms": {
+        "object": "LogQuery (фильтр выборки логов)",
+        "attributes": [
+          "level_upper: точное совпадение уровня (UPPER(level))",
+          "from_ts / to_ts: интервал по ts",
+          "module_like[]: подстрочные фильтры по module_path",
+          "file_like[]: подстрочные фильтры по file",
+          "thread_ids[]: список тредов",
+          "include_threadless: bool — включать строки с thread_id IS NULL",
+          "after_id: id > after_id (cursor)",
+          "search: подстрока в feedback_log_body (INSTR > 0)",
+          "descending: bool — порядок ORDER BY id",
+          "limit: ограничение размера выдачи"
+        ],
+        "relationships": [
+          {"to": "SRC-0005/entity/log-entry", "rel": "filters", "card": "1:N"}
+        ],
+        "data_flows": [
+          {"source": "query_logs / max_log_id", "transform": "push_log_filters: добавляет WHERE-блоки по non-null полям", "sink": "SQL WHERE clause"}
+        ],
+        "enumerations": null,
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0005/entity/agent-job",
+      "src": "SRC-0005",
+      "composition": "entity",
+      "terms": {
+        "object": "AgentJob (задание batch-агенту по строкам CSV)",
+        "attributes": [
+          "id: идентификатор задания",
+          "name: имя задания",
+          "status: статус (Pending/Running/Completed/Failed/Cancelled)",
+          "instruction: текст инструкции для агента",
+          "auto_export: bool — авто-экспорт результатов",
+          "max_runtime_seconds: лимит времени выполнения (опционально)",
+          "output_schema_json: JSON-схема результата (опционально)",
+          "input_headers_json: заголовки входного CSV (JSON-массив)",
+          "input_csv_path: путь к входному CSV",
+          "output_csv_path: путь к выходному CSV",
+          "created_at / updated_at / started_at / completed_at: моменты жизненного цикла",
+          "last_error: последняя ошибка (для failed/cancelled)"
+        ],
+        "relationships": [
+          {"to": "SRC-0005/entity/agent-job-item", "rel": "contains", "card": "1:N"}
+        ],
+        "data_flows": [
+          {"source": "create_agent_job(params, items[])", "transform": "сериализовать input_headers_json и output_schema_json; INSERT agent_jobs + INSERT agent_job_items[] в одной транзакции (status=Pending для job и items)", "sink": "agent_jobs + agent_job_items rows"},
+          {"source": "mark_agent_job_running/completed/failed/cancelled", "transform": "UPDATE agent_jobs SET status, updated_at, started_at|completed_at, last_error", "sink": "agent_jobs row"},
+          {"source": "mark_agent_job_cancelled", "transform": "UPDATE WHERE status IN (Pending, Running) → возвращает true если строка изменена", "sink": "agent_jobs row"},
+          {"source": "get_agent_job_progress(job_id)", "transform": "SELECT COUNT и SUM(CASE status=...) per status", "sink": "AgentJobProgress {total/pending/running/completed/failed}"}
+        ],
+        "enumerations": {
+          "AgentJobStatus": ["Pending", "Running", "Completed", "Failed", "Cancelled"]
+        },
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0005/entity/agent-job-item",
+      "src": "SRC-0005",
+      "composition": "entity",
+      "terms": {
+        "object": "AgentJobItem (строка задания, обрабатываемая отдельно)",
+        "attributes": [
+          "job_id: parent job",
+          "item_id: уникальный ID элемента в рамках job",
+          "row_index: порядок входной строки в CSV",
+          "source_id: внешний идентификатор источника (опционально)",
+          "row_json: JSON входной строки",
+          "status: Pending/Running/Completed/Failed",
+          "assigned_thread_id: тред-исполнитель (NULL когда не назначен)",
+          "attempt_count: счётчик попыток (i64, +1 при каждом переводе в Running)",
+          "result_json: результат выполнения (JSON)",
+          "last_error: последняя ошибка",
+          "created_at / updated_at / completed_at / reported_at: моменты жизненного цикла"
+        ],
+        "relationships": [
+          {"to": "SRC-0005/entity/agent-job", "rel": "belongs_to", "card": "N:1"},
+          {"to": "SRC-0005/entity/thread", "rel": "assigned_to", "card": "N:0..1"}
+        ],
+        "data_flows": [
+          {"source": "mark_agent_job_item_running / mark_agent_job_item_running_with_thread", "transform": "UPDATE WHERE status=Pending: status=Running, assigned_thread_id (NULL или thread_id), attempt_count+=1, last_error=NULL", "sink": "agent_job_items row"},
+          {"source": "mark_agent_job_item_pending(error?)", "transform": "UPDATE WHERE status=Running: status=Pending, assigned_thread_id=NULL, last_error=error", "sink": "agent_job_items row"},
+          {"source": "set_agent_job_item_thread", "transform": "UPDATE WHERE status=Running: assigned_thread_id=thread_id", "sink": "agent_job_items row"},
+          {"source": "report_agent_job_item_result(reporting_thread_id, result_json)", "transform": "UPDATE WHERE status=Running AND assigned_thread_id=reporting_thread_id: status=Completed, result_json=serialize(result), reported_at=completed_at=updated_at=now, assigned_thread_id=NULL", "sink": "agent_job_items row (атомарное завершение)"},
+          {"source": "mark_agent_job_item_completed", "transform": "UPDATE WHERE status=Running AND result_json IS NOT NULL: status=Completed, completed_at=updated_at=now", "sink": "agent_job_items row"},
+          {"source": "mark_agent_job_item_failed(error)", "transform": "UPDATE WHERE status=Running: status=Failed, last_error=error, completed_at=updated_at=now", "sink": "agent_job_items row"},
+          {"source": "list_agent_job_items(job_id, status?, limit?)", "transform": "SELECT WHERE job_id [AND status] ORDER BY row_index ASC [LIMIT]", "sink": "Vec<AgentJobItem>"}
+        ],
+        "enumerations": {
+          "AgentJobItemStatus": ["Pending", "Running", "Completed", "Failed"]
+        },
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0005/entity/backfill-state",
+      "src": "SRC-0005",
+      "composition": "entity",
+      "terms": {
+        "object": "BackfillState (singleton-состояние процесса backfill метаданных rollout)",
+        "attributes": [
+          "id: фиксированный singleton ключ (1)",
+          "status: Pending/Running/Complete",
+          "last_watermark: последняя обработанная позиция (например, 'sessions/2026/01/27/rollout-a.jsonl')",
+          "last_success_at: момент последнего успешного завершения",
+          "updated_at: момент последнего изменения (используется для lease)"
+        ],
+        "relationships": [],
+        "data_flows": [
+          {"source": "ensure_backfill_state_row", "transform": "INSERT id=1 status=Pending ON CONFLICT DO NOTHING", "sink": "backfill_state row"},
+          {"source": "try_claim_backfill(lease_seconds)", "transform": "UPDATE WHERE status != Complete AND (status != Running OR updated_at <= now-lease_seconds): status=Running, updated_at=now → возвращает true если rows_affected==1", "sink": "backfill_state (захват lease)"},
+          {"source": "checkpoint_backfill(watermark)", "transform": "UPDATE: status=Running, last_watermark=watermark, updated_at=now", "sink": "backfill_state row"},
+          {"source": "mark_backfill_complete(last_watermark?)", "transform": "UPDATE: status=Complete, last_watermark=COALESCE(arg, существующий), last_success_at=now, updated_at=now", "sink": "backfill_state row"}
+        ],
+        "enumerations": {
+          "BackfillStatus": ["Pending", "Running", "Complete"]
+        },
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0005/entity/remote-control-enrollment",
+      "src": "SRC-0005",
+      "composition": "entity",
+      "terms": {
+        "object": "RemoteControlEnrollment (привязка клиента к серверу remote-control)",
+        "attributes": [
+          "websocket_url: адрес WebSocket сервера remote-control",
+          "account_id: идентификатор аккаунта",
+          "app_server_client_name: имя клиента приложения (Option, NULL хранится как пустая строка)",
+          "server_id: идентификатор сервера в облаке",
+          "environment_id: идентификатор окружения",
+          "server_name: имя сервера",
+          "updated_at: момент upsert (epoch seconds)"
+        ],
+        "relationships": [],
+        "data_flows": [
+          {"source": "upsert_remote_control_enrollment(record)", "transform": "INSERT ON CONFLICT(websocket_url, account_id, app_server_client_name) DO UPDATE: server_id, environment_id, server_name, updated_at", "sink": "remote_control_enrollments row"},
+          {"source": "get_remote_control_enrollment(websocket_url, account_id, app_server_client_name?)", "transform": "SELECT по тройному ключу; преобразование пустой строки app_server_client_name → None", "sink": "Option<RemoteControlEnrollmentRecord>"},
+          {"source": "delete_remote_control_enrollment", "transform": "DELETE по тройному ключу; возвращает количество удалённых строк", "sink": "remote_control_enrollments"}
+        ],
+        "enumerations": null,
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0005/entity/stage1-output",
+      "src": "SRC-0005",
+      "composition": "entity",
+      "terms": {
+        "object": "Stage1Output (результат stage-1 экстракции памяти из треда)",
+        "attributes": [
+          "thread_id: тред-источник",
+          "source_updated_at: метка свежести входного треда (epoch seconds)",
+          "raw_memory: извлечённая память (текст)",
+          "rollout_summary: сжатое описание rollout",
+          "rollout_slug: slug для именования артефакта rollout summary (опционально)",
+          "generated_at: момент генерации",
+          "usage_count: счётчик упоминаний (для приоритезации)",
+          "last_usage: момент последнего использования",
+          "selected_for_phase2: bool — входил ли в последнюю успешную phase-2 выборку",
+          "selected_for_phase2_source_updated_at: snapshot timestamp той самой выборки (для retain/diff)"
+        ],
+        "relationships": [
+          {"to": "SRC-0005/entity/thread", "rel": "extracted_from", "card": "N:1"},
+          {"to": "SRC-0005/entity/job", "rel": "watermarks_via", "card": "N:1"}
+        ],
+        "data_flows": [
+          {"source": "mark_stage1_job_succeeded(raw_memory, rollout_summary, rollout_slug?)", "transform": "INSERT ON CONFLICT(thread_id) DO UPDATE WHERE excluded.source_updated_at >= existing.source_updated_at; затем enqueue_global_consolidation(source_updated_at)", "sink": "stage1_outputs row + jobs(memory_consolidate_global) bumped"},
+          {"source": "mark_stage1_job_succeeded_no_output", "transform": "DELETE существующего row; если удалили — enqueue_global_consolidation(input_watermark)", "sink": "stage1_outputs (удалено)"},
+          {"source": "record_stage1_output_usage(thread_ids[])", "transform": "UPDATE per thread_id: usage_count+=1, last_usage=now", "sink": "stage1_outputs (учёт цитирования)"},
+          {"source": "list_stage1_outputs_for_global(n)", "transform": "JOIN threads (memory_mode='enabled'), отфильтровать пустые raw_memory и rollout_summary, ORDER BY source_updated_at DESC, thread_id DESC LIMIT n", "sink": "Vec<Stage1Output>"},
+          {"source": "get_phase2_input_selection(n, max_unused_days)", "transform": "current = непустые memory-eligible с last_usage >= cutoff (или source_updated_at >= cutoff если last_usage NULL), ORDER BY usage_count DESC, COALESCE(last_usage, source_updated_at) DESC, source_updated_at DESC LIMIT n; previous = WHERE selected_for_phase2=1; вычислить retained_thread_ids и removed", "sink": "Phase2InputSelection {selected, previous_selected, retained_thread_ids, removed}"},
+          {"source": "prune_stage1_outputs_for_retention(max_unused_days, limit)", "transform": "DELETE WHERE selected_for_phase2=0 AND COALESCE(last_usage, source_updated_at) < now - max_unused_days, ORDER ASC LIMIT limit", "sink": "stage1_outputs (удалены устаревшие)"},
+          {"source": "mark_global_phase2_job_succeeded(selected_outputs[])", "transform": "сбросить selected_for_phase2=0 для всех; для каждой selected установить selected_for_phase2=1 и selected_for_phase2_source_updated_at=output.source_updated_at WHERE thread_id AND source_updated_at совпадают", "sink": "stage1_outputs (новый baseline)"},
+          {"source": "clear_memory_data", "transform": "DELETE FROM stage1_outputs + DELETE FROM jobs WHERE kind IN (memory_stage1, memory_consolidate_global) в одной транзакции", "sink": "stage1_outputs + jobs (очищено)"}
+        ],
+        "enumerations": null,
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0005/entity/job",
+      "src": "SRC-0005",
+      "composition": "entity",
+      "terms": {
+        "object": "Job (универсальная очередь задач с lease/retry: stage-1 per-thread, phase-2 global)",
+        "attributes": [
+          "kind: тип задачи (memory_stage1 / memory_consolidate_global)",
+          "job_key: ключ внутри типа (thread_id для stage1, 'global' для consolidate)",
+          "status: pending / running / done / error",
+          "worker_id: воркер-исполнитель",
+          "ownership_token: UUID, выданный при захвате (для exclusive ownership)",
+          "started_at / finished_at: моменты захвата/завершения",
+          "lease_until: lease deadline (epoch seconds)",
+          "retry_at: момент следующей попытки",
+          "retry_remaining: оставшиеся ретраи (по умолчанию 3)",
+          "last_error: последняя ошибка",
+          "input_watermark: текущая граница входных данных (source_updated_at)",
+          "last_success_watermark: граница последнего успеха"
+        ],
+        "relationships": [
+          {"to": "SRC-0005/entity/stage1-output", "rel": "watermarks", "card": "N:1"},
+          {"to": "SRC-0005/entity/thread", "rel": "scopes_to_thread (для memory_stage1 job_key=thread_id)", "card": "N:1"}
+        ],
+        "data_flows": [
+          {"source": "try_claim_stage1_job(thread_id, worker_id, source_updated_at, lease_seconds, max_running_jobs)", "transform": "BEGIN IMMEDIATE; skip if existing stage1_outputs.source_updated_at >= source_updated_at OR jobs.last_success_watermark >= source_updated_at; INSERT/UPSERT WHERE: глобальный count(running с lease > now) для этого kind < max_running_jobs, AND (NOT running OR lease истёк), AND (retry_at NULL OR <= started_at OR input_watermark advanced), AND (retry_remaining>0 OR input_watermark advanced); сброс retry_remaining=3 при advance watermark; иначе fallback диагностика → SkippedRunning/SkippedRetryBackoff/SkippedRetryExhausted", "sink": "jobs row Claimed{ownership_token} либо Skipped*"},
+          {"source": "claim_stage1_jobs_for_startup(current_thread_id, params)", "transform": "SELECT threads JOIN stage1_outputs LEFT JOIN jobs(kind=memory_stage1, job_key=thread.id), фильтры push_thread_filters + memory_mode='enabled' + threads.id != current + updated_at_ms BETWEEN max_age_cutoff AND idle_cutoff + (stage1_outputs.source_updated_at+1)*1000 <= updated_at_ms + (jobs.last_success_watermark+1)*1000 <= updated_at_ms; ORDER updated_at_ms DESC, id DESC LIMIT scan_limit; для каждой — try_claim_stage1_job; собирать до max_claimed", "sink": "Vec<Stage1JobClaim>"},
+          {"source": "mark_stage1_job_succeeded(...) / _no_output / _failed", "transform": "UPDATE WHERE status='running' AND ownership_token=?: status=done|error, last_success_watermark=input_watermark, retry_at=now+delay (для failed), retry_remaining-=1 (для failed)", "sink": "jobs row"},
+          {"source": "enqueue_global_consolidation(input_watermark)", "transform": "INSERT (kind=memory_consolidate_global, job_key='global', status=pending) ON CONFLICT DO UPDATE: status=pending (если не running), retry_at=NULL (если не running), retry_remaining=max(существ, 3), input_watermark = excluded если > existing иначе existing+1 (всегда продвигаем грязную метку)", "sink": "jobs(global) row"},
+          {"source": "try_claim_global_phase2_job(worker_id, lease_seconds)", "transform": "BEGIN IMMEDIATE; SELECT singleton row; SkippedNotDirty если input_watermark <= last_success_watermark или retry_remaining<=0 или retry_at>now; SkippedRunning если running с lease>now; UPDATE status=running, ownership_token, lease_until=now+lease_seconds (только когда условия валидны)", "sink": "jobs(global) Claimed{ownership_token, input_watermark} либо Skipped*"},
+          {"source": "heartbeat_global_phase2_job(token, lease_seconds)", "transform": "UPDATE lease_until=now+lease_seconds WHERE status=running AND ownership_token=?", "sink": "jobs(global) row"},
+          {"source": "mark_global_phase2_job_succeeded(token, completed_watermark, selected_outputs[])", "transform": "UPDATE: status=done, last_success_watermark=max(существ, completed_watermark); затем сброс/перезапись selected_for_phase2 по списку", "sink": "jobs(global) + stage1_outputs (новый baseline)"},
+          {"source": "mark_global_phase2_job_failed[_if_unowned](token, reason, retry_delay_seconds)", "transform": "UPDATE: status=error, retry_at=now+delay, retry_remaining-=1; вариант _if_unowned дополнительно матчит ownership_token IS NULL", "sink": "jobs(global) row"}
+        ],
+        "enumerations": {
+          "status": ["pending", "running", "done", "error"],
+          "kind": ["memory_stage1", "memory_consolidate_global"],
+          "Stage1JobClaimOutcome": ["Claimed{ownership_token}", "SkippedUpToDate", "SkippedRunning", "SkippedRetryBackoff", "SkippedRetryExhausted"],
+          "Phase2JobClaimOutcome": ["Claimed{ownership_token, input_watermark}", "SkippedNotDirty", "SkippedRunning"]
+        },
+        "config": {
+          "default_retry_remaining": {"value": 3, "source": "hardcoded DEFAULT_RETRY_REMAINING", "default": 3},
+          "memory_consolidation_job_key": {"value": "global", "source": "hardcoded MEMORY_CONSOLIDATION_JOB_KEY", "default": "global"},
+          "lease_seconds": {"value": null, "source": "param caller (try_claim_*_job, heartbeat)", "default": null},
+          "retry_delay_seconds": {"value": null, "source": "param caller (mark_*_job_failed)", "default": null},
+          "max_running_jobs": {"value": null, "source": "param caller (try_claim_stage1_job)", "default": null}
+        }
+      }
+    },
+    {
+      "id": "SRC-0005/entity/stage1-startup-claim-params",
+      "src": "SRC-0005",
+      "composition": "entity",
+      "terms": {
+        "object": "Stage1StartupClaimParams (параметры стартового скана stage-1 заданий)",
+        "attributes": [
+          "scan_limit: лимит SELECT-сканирования тредов",
+          "max_claimed: верхний предел числа захваченных claims",
+          "max_age_days: максимальный возраст треда в днях (updated_at_ms >= now - max_age_days)",
+          "min_rollout_idle_hours: минимальный простой rollout в часах (updated_at_ms <= now - min_rollout_idle_hours)",
+          "allowed_sources: фильтр по источникам сессий",
+          "lease_seconds: длительность lease на захват"
+        ],
+        "relationships": [
+          {"to": "SRC-0005/entity/job", "rel": "shapes", "card": "1:N"}
+        ],
+        "data_flows": [
+          {"source": "claim_stage1_jobs_for_startup(current_thread_id, params)", "transform": "интерпретация полей в SQL-фильтрах и циклах захвата", "sink": "stage-1 jobs Claimed"}
+        ],
+        "enumerations": null,
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0005/entity/state-database",
+      "src": "SRC-0005",
+      "composition": "entity",
+      "terms": {
+        "object": "StateDatabase (бизнес-граница: основное персистентное состояние)",
+        "attributes": [
+          "имя файла: '<STATE_DB_FILENAME>_<STATE_DB_VERSION>.sqlite' (версионированный)",
+          "путь: <codex_home>/<filename>",
+          "содержимое: threads, thread_dynamic_tools, thread_spawn_edges, agent_jobs, agent_job_items, stage1_outputs, jobs, backfill_state, remote_control_enrollments"
+        ],
+        "relationships": [
+          {"to": "SRC-0005/entity/thread", "rel": "stores", "card": "1:N"},
+          {"to": "SRC-0005/entity/agent-job", "rel": "stores", "card": "1:N"},
+          {"to": "SRC-0005/entity/stage1-output", "rel": "stores", "card": "1:N"},
+          {"to": "SRC-0005/entity/job", "rel": "stores", "card": "1:N"},
+          {"to": "SRC-0005/entity/backfill-state", "rel": "stores", "card": "1:1"},
+          {"to": "SRC-0005/entity/remote-control-enrollment", "rel": "stores", "card": "1:N"}
+        ],
+        "data_flows": [
+          {"source": "init", "transform": "remove_legacy_db_files (удалить файлы '<base>.sqlite' и '<base>_<digit+>.sqlite' с/без -wal/-shm/-journal сидекаров, кроме текущей версии); open SQLite, run migrator", "sink": "версионированный файл состояния (плюс пересоздание при апгрейде версии)"}
+        ],
+        "enumerations": null,
+        "config": {
+          "filename_template": {"value": "{base_name}_{version}.sqlite", "source": "hardcoded db_filename(base, version)", "default": "{base_name}_{version}.sqlite"},
+          "state_db_filename_base": {"value": "STATE_DB_FILENAME (импортирован из crate)", "source": "hardcoded crate::STATE_DB_FILENAME", "default": null},
+          "state_db_version": {"value": "STATE_DB_VERSION (импортирован из crate)", "source": "hardcoded crate::STATE_DB_VERSION", "default": null}
+        }
+      }
+    },
+    {
+      "id": "SRC-0005/entity/logs-database",
+      "src": "SRC-0005",
+      "composition": "entity",
+      "terms": {
+        "object": "LogsDatabase (бизнес-граница: отдельное хранилище логов)",
+        "attributes": [
+          "имя файла: '<LOGS_DB_FILENAME>_<LOGS_DB_VERSION>.sqlite' (версионированный)",
+          "путь: <codex_home>/<filename>",
+          "выделено отдельно от state DB для снижения lock contention",
+          "содержимое: logs"
+        ],
+        "relationships": [
+          {"to": "SRC-0005/entity/log-entry", "rel": "stores", "card": "1:N"}
+        ],
+        "data_flows": [
+          {"source": "init", "transform": "remove_legacy_db_files для logs; open + migrate; run_logs_startup_maintenance: удалить логи > LOG_RETENTION_DAYS, WAL checkpoint(TRUNCATE), incremental_vacuum", "sink": "версионированный logs.sqlite"}
+        ],
+        "enumerations": null,
+        "config": {
+          "logs_db_filename_base": {"value": "LOGS_DB_FILENAME (импортирован из crate)", "source": "hardcoded crate::LOGS_DB_FILENAME", "default": null},
+          "logs_db_version": {"value": "LOGS_DB_VERSION (импортирован из crate)", "source": "hardcoded crate::LOGS_DB_VERSION", "default": null}
+        }
+      }
+    }
+  ]
+}

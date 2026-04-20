@@ -1,0 +1,577 @@
+{
+  "src": "SRC-0011",
+  "schema_version": "2.0",
+  "lens": "rule",
+  "compositions": [
+    {
+      "id": "SRC-0011/rule/compact-user-message-token-budget",
+      "src": "SRC-0011",
+      "composition": "rule",
+      "terms": {
+        "condition": "При inline компакции новая история сохраняет только самые недавние user messages суммарно в пределах 20 000 токенов; самое старое urезается через truncate_text с оставшимся remaining бюджетом, всё что не влезло выкидывается",
+        "numbers": [
+          {"value": 20000, "kind": "token_limit", "name": "COMPACT_USER_MESSAGE_MAX_TOKENS", "source": "compact.rs hardcoded const"}
+        ],
+        "formula": "remaining = max_tokens; for msg in user_messages.rev(): tokens=approx_token_count(msg); if tokens<=remaining → push(msg), remaining-=tokens; else → push(truncate_text(msg, Tokens(remaining))), break",
+        "gwt": {
+          "given": "max_tokens=20000, user_messages имеют токены [5000, 8000, 10000, 3000] (oldest→newest)",
+          "when": "build_compacted_history итерирует в reverse",
+          "then": "отбираются newest→oldest: 3000 (remaining=17000), 10000 (remaining=7000), 8000>7000 → truncate_text(msg2, Tokens(7000)), break; сохранённые messages reversed → [truncated_8k, 10000, 3000]; message[0]=5000 утеряно"
+        }
+      }
+    },
+    {
+      "id": "SRC-0011/rule/resized-image-token-estimate",
+      "src": "SRC-0011",
+      "composition": "rule",
+      "terms": {
+        "condition": "Каждое inline image (base64 data URL с image/* MIME) в истории оценивается как фиксированные 7373 model-visible байта; при detail=Original применяется точная оценка по числу 32px patches, в прочих случаях — константа",
+        "numbers": [
+          {"value": 7373, "kind": "byte_estimate", "name": "RESIZED_IMAGE_BYTES_ESTIMATE"},
+          {"value": 32, "kind": "pixels_per_patch", "name": "ORIGINAL_IMAGE_PATCH_SIZE"},
+          {"value": 32, "kind": "cache_capacity", "name": "ORIGINAL_IMAGE_ESTIMATE_CACHE_SIZE"},
+          {"value": 1844, "kind": "tokens_equivalent", "name": "derived: 7373 bytes via 4-bytes/token ceiling ≈ 1844 tokens"}
+        ],
+        "formula": "resized: payload_bytes → subtract, add 7373\noriginal: patches_wide = (width + 31) / 32; patches_high = (height + 31) / 32; patch_count = patches_wide * patches_high; bytes = approx_bytes_for_tokens(patch_count)",
+        "gwt": {
+          "given": "image 512x512 with detail=Original",
+          "when": "estimate_original_image_bytes вызывается",
+          "then": "patches_wide = (512+31)/32 = 16; patches_high = 16; patch_count = 256; bytes = approx_bytes_for_tokens(256) (типично 256*4=1024 bytes); результат кэшируется по sha1(url) в LRU размером 32"
+        }
+      }
+    },
+    {
+      "id": "SRC-0011/rule/reasoning-length-estimate",
+      "src": "SRC-0011",
+      "composition": "rule",
+      "terms": {
+        "condition": "Токены Reasoning item (с encrypted_content) и Compaction item вычисляются из длины зашифрованного контента через base64-декод эвристику с константой-вычетом 650",
+        "numbers": [
+          {"value": 3, "kind": "base64_numerator"},
+          {"value": 4, "kind": "base64_denominator"},
+          {"value": 650, "kind": "subtraction_constant"}
+        ],
+        "formula": "estimate_reasoning_length(encoded_len) = ((encoded_len * 3) / 4).saturating_sub(650)",
+        "gwt": {
+          "given": "encrypted_content длиной encoded_len = 1000 байт (base64-encoded)",
+          "when": "estimate_response_item_model_visible_bytes для Reasoning{encrypted_content: Some(...)}",
+          "then": "(1000 * 3) / 4 = 750; 750 - 650 = 100 → результат i64 = 100"
+        }
+      }
+    },
+    {
+      "id": "SRC-0011/rule/process-item-truncation-budget",
+      "src": "SRC-0011",
+      "composition": "rule",
+      "terms": {
+        "condition": "При записи FunctionCallOutput и CustomToolCallOutput в ContextManager применяется truncate с политикой умноженной на 1.2 относительно базовой truncation_policy — это serialization budget",
+        "numbers": [
+          {"value": 1.2, "kind": "multiplier", "name": "serialization budget"}
+        ],
+        "formula": "policy_with_serialization_budget = policy * 1.2",
+        "gwt": {
+          "given": "truncate_function_output_payload вызван с TruncationPolicy::Tokens(10000)",
+          "when": "process_item для FunctionCallOutput",
+          "then": "эффективная политика = policy * 1.2 = Tokens(12000); дополнительные 20% покрывают накладные расходы сериализации"
+        }
+      }
+    },
+    {
+      "id": "SRC-0011/rule/history-soft-cap",
+      "src": "SRC-0011",
+      "composition": "rule",
+      "terms": {
+        "condition": "Когда history.jsonl превышает max_bytes hard cap, файл обрезается не до max_bytes а до soft cap = 0.8 * max_bytes, причём самая свежая строка всегда сохраняется (trim_target не меньше newest_entry_len); soft_cap clamped в [1, max_bytes]",
+        "numbers": [
+          {"value": 0.8, "kind": "ratio", "name": "HISTORY_SOFT_CAP_RATIO"}
+        ],
+        "formula": "soft_cap_bytes = floor(max_bytes * 0.8).clamp(1.0, max_bytes) as u64; trim_target = soft_cap_bytes.max(newest_entry_len)",
+        "gwt": {
+          "given": "max_bytes = 1_000_000 байт, newest_entry_len = 500 байт, current_len = 1_100_000 байт",
+          "when": "enforce_history_limit вызван",
+          "then": "soft_cap_bytes = floor(1_000_000 * 0.8) = 800_000; trim_target = max(800_000, 500) = 800_000; файл обрезается от начала пока size <= 800_000, самая свежая строка (500 байт) сохраняется"
+        }
+      }
+    },
+    {
+      "id": "SRC-0011/rule/history-lock-retry-policy",
+      "src": "SRC-0011",
+      "composition": "rule",
+      "terms": {
+        "condition": "Попытка захвата advisory lock (exclusive для append_entry, shared для lookup) повторяется максимум 10 раз с задержкой 100ms между попытками; общее время ожидания не превышает ~1 секунды",
+        "numbers": [
+          {"value": 10, "kind": "retry_count", "name": "MAX_RETRIES"},
+          {"value": 100, "kind": "milliseconds_sleep", "name": "RETRY_SLEEP"},
+          {"value": 1000, "kind": "derived_total_ms", "name": "max_total_wait = 10 * 100ms"}
+        ],
+        "formula": "for _ in 0..MAX_RETRIES { match try_lock { Ok → proceed; Err(WouldBlock) → sleep(100ms); Err(other) → return err }; } return Err(WouldBlock, 'could not acquire exclusive lock...')",
+        "gwt": {
+          "given": "history.jsonl захвачен эксклюзивным локом другого процесса на 2 секунды",
+          "when": "append_entry вызывает try_lock в цикле",
+          "then": "10 попыток * 100ms = 1s ожидания, все WouldBlock → возврат std::io::Error kind=WouldBlock 'could not acquire exclusive lock on history file after multiple attempts'"
+        }
+      }
+    },
+    {
+      "id": "SRC-0011/rule/history-file-permissions",
+      "src": "SRC-0011",
+      "composition": "rule",
+      "terms": {
+        "condition": "На unix-системах history.jsonl всегда имеет права 0o600 (rw------- owner-only); при открытии OpenOptions.mode(0o600), при обнаружении несоответствия — ensure_owner_only_permissions принудительно устанавливает 0o600",
+        "numbers": [
+          {"value": 384, "kind": "unix_mode_decimal", "name": "0o600"},
+          {"value": 511, "kind": "unix_mode_mask", "name": "0o777 (mask для сравнения)"}
+        ],
+        "formula": "current_mode = metadata.permissions().mode() & 0o777; if current_mode != 0o600 { perms.set_mode(0o600); set_permissions(perms) }",
+        "gwt": {
+          "given": "history.jsonl существует с правами 0o644",
+          "when": "append_entry вызывает ensure_owner_only_permissions",
+          "then": "current_mode = 0o644 & 0o777 = 0o644 ≠ 0o600 → set_mode(0o600) через spawn_blocking; после этого файл становится 0o600"
+        }
+      }
+    },
+    {
+      "id": "SRC-0011/rule/context-window-exceeded-trim-policy",
+      "src": "SRC-0011",
+      "composition": "rule",
+      "terms": {
+        "condition": "При inline compaction если stream вернул ContextWindowExceeded: если turn_input_len > 1 → trimming старейшего item для сохранения префиксного кэша и последних сообщений, продолжить цикл; если turn_input_len <= 1 → set_total_tokens_full, Error event, прервать",
+        "numbers": [
+          {"value": 1, "kind": "threshold_turn_input_len"}
+        ],
+        "formula": "if err == ContextWindowExceeded { if turn_input_len > 1 { history.remove_first_item(); truncated_count++; retries=0; continue } else { set_total_tokens_full; Error event; return err } }",
+        "gwt": {
+          "given": "inline compaction, история содержит 5 items, модель вернула ContextWindowExceeded",
+          "when": "цикл обработки",
+          "then": "turn_input_len=5 > 1 → remove_first_item (самый старый), truncated_count=1, retries=0, следующая итерация; если после 4 удалений остался 1 item и ошибка повторилась — ветвь <=1 срабатывает, компакция фейлится"
+        }
+      }
+    },
+    {
+      "id": "SRC-0011/rule/api-message-classification",
+      "src": "SRC-0011",
+      "composition": "rule",
+      "terms": {
+        "condition": "ResponseItem считается api-message (допускается к записи в историю record_items) тогда и только тогда когда: (a) это Message с ролью ≠ 'system', или (b) это любой из: FunctionCallOutput, FunctionCall, ToolSearchCall, ToolSearchOutput, CustomToolCall, CustomToolCallOutput, LocalShellCall, Reasoning, WebSearchCall, ImageGenerationCall, Compaction. GhostSnapshot и Other → НЕ api-message (но GhostSnapshot допускается отдельным условием is_ghost_snapshot в record_items)",
+        "numbers": null,
+        "formula": null,
+        "gwt": {
+          "given": "ResponseItem::Message{role='system', ...}",
+          "when": "is_api_message проверяет",
+          "then": "false → record_items пропускает (не записывает в self.items)"
+        }
+      }
+    },
+    {
+      "id": "SRC-0011/rule/model-generated-classification",
+      "src": "SRC-0011",
+      "composition": "rule",
+      "terms": {
+        "condition": "Элемент истории классифицируется is_model_generated = true если это: assistant Message, Reasoning, FunctionCall, ToolSearchCall, WebSearchCall, ImageGenerationCall, CustomToolCall, LocalShellCall, Compaction. false для: FunctionCallOutput, ToolSearchOutput, CustomToolCallOutput, GhostSnapshot, Other, и Message не-assistant ролей",
+        "numbers": null,
+        "formula": "items_after_last_model_generated_item = items[rposition(is_model_generated_item).map_or(len, +1)..]",
+        "gwt": {
+          "given": "history = [user_msg, assistant_msg, function_call, function_call_output, user_msg]",
+          "when": "items_after_last_model_generated_item",
+          "then": "last model-generated = function_call (index 2); start = 3; возвращается slice [function_call_output, user_msg] — это items добавленные после последнего model-emitted item, они ещё не учтены в last_token_usage.total_tokens"
+        }
+      }
+    },
+    {
+      "id": "SRC-0011/rule/codex-generated-classification",
+      "src": "SRC-0011",
+      "composition": "rule",
+      "terms": {
+        "condition": "Элемент считается codex_generated тогда и только тогда когда это FunctionCallOutput, ToolSearchOutput, CustomToolCallOutput, ИЛИ Message с ролью 'developer'. Используется remote compaction pre-trim для определения безопасно-удаляемого tail",
+        "numbers": null,
+        "formula": null,
+        "gwt": {
+          "given": "trim_function_call_history_to_fit_context_window: tail = last item = FunctionCallOutput",
+          "when": "is_codex_generated_item проверяет",
+          "then": "true → remove_last_item() вызывается, deleted_items++; если tail был бы user Message — is_codex_generated=false → break, триммирование останавливается чтобы не нарушить user/assistant boundary"
+        }
+      }
+    },
+    {
+      "id": "SRC-0011/rule/user-turn-boundary-classification",
+      "src": "SRC-0011",
+      "composition": "rule",
+      "terms": {
+        "condition": "Элемент считается user turn boundary (для rollback и token counting не-last reasoning) тогда и только тогда когда: (a) это user Message с content НЕ распознанным как contextual_user_message_content, ИЛИ (b) это assistant Message с content распознанным как InterAgentCommunication",
+        "numbers": null,
+        "formula": "is_user_turn_boundary(item) = matches!(Message{role, content}) AND ((role=='user' AND !is_contextual_user_message_content(content)) OR (role=='assistant' AND is_inter_agent_instruction_content(content)))",
+        "gwt": {
+          "given": "user Message с content=[InputText('<environment_context>...')]",
+          "when": "is_user_turn_boundary проверяет",
+          "then": "is_contextual_user_message_content(content)=true → is_user_turn_boundary=false; этот item НЕ считается за instruction turn, rollback через drop_last_n_user_turns его пропустит"
+        }
+      }
+    },
+    {
+      "id": "SRC-0011/rule/keep-compacted-history-item-matrix",
+      "src": "SRC-0011",
+      "composition": "rule",
+      "terms": {
+        "condition": "Фильтр remote compaction output по типу item: developer Message → drop (устаревшие/дубли инструкций); user Message → keep только если парсится как TurnItem::UserMessage ИЛИ TurnItem::HookPrompt; assistant Message → keep (future модели могут эмитить); прочие Message роли → drop; Compaction → keep; все остальные варианты (Reasoning, FunctionCall, FunctionCallOutput, ToolSearchCall, ToolSearchOutput, CustomToolCall, CustomToolCallOutput, LocalShellCall, WebSearchCall, ImageGenerationCall, GhostSnapshot, Other) → drop",
+        "numbers": null,
+        "formula": null,
+        "gwt": {
+          "given": "remote compaction вернул user-role Message с content session-prefix wrapper (не распознаётся как UserMessage/HookPrompt)",
+          "when": "should_keep_compacted_history_item проверяет",
+          "then": "parse_turn_item возвращает не UserMessage и не HookPrompt → false → item выкидывается из compacted_history"
+        }
+      }
+    },
+    {
+      "id": "SRC-0011/rule/initial-context-injection-policy",
+      "src": "SRC-0011",
+      "composition": "rule",
+      "terms": {
+        "condition": "Политика инжектирования initial_context в replacement history после компакции: BeforeLastUserMessage используется для mid-turn компакции (модель обучена видеть summary последним в истории) → initial_context вставляется выше последнего реального user message, reference_context_item = Some(turn_context.to_turn_context_item()). DoNotInject используется для pre-turn/manual компакции → reference_context_item = None, следующий обычный turn делает полную реинжекцию",
+        "numbers": null,
+        "formula": null,
+        "gwt": {
+          "given": "mid-turn auto-compact с InitialContextInjection::BeforeLastUserMessage",
+          "when": "run_compact_task_inner_impl завершает",
+          "then": "initial_context (полученный из sess.build_initial_context) вставляется через insert_initial_context_before_last_real_user_or_summary; reference_context_item = Some(turn_context.to_turn_context_item()) — при следующем regular turn settings будут diffиться относительно этого снимка, а не реинжектиться полностью"
+        }
+      }
+    },
+    {
+      "id": "SRC-0011/rule/initial-context-insertion-precedence",
+      "src": "SRC-0011",
+      "composition": "rule",
+      "terms": {
+        "condition": "Место вставки initial_context в compacted_history определяется приоритетом: (1) перед последним реальным user message (non-summary); (2) если реальных user messages нет — перед последним user-message-like item (включая summary), чтобы summary остался последним; (3) если user messages нет вообще — перед последним Compaction item (remote compaction может возвращать только compaction items); (4) если нет ни user messages ни compaction items — append в конец",
+        "numbers": null,
+        "formula": "insertion_index = last_real_user_index.or(last_user_or_summary_index).or(last_compaction_index); if Some → splice, else → extend",
+        "gwt": {
+          "given": "compacted_history = [compaction_item, summary_user_message]; initial_context = [env_msg, dev_msg]",
+          "when": "insert_initial_context_before_last_real_user_or_summary",
+          "then": "last_real_user_index=None (summary не считается реальным); last_user_or_summary_index=1 (summary); insertion_index=1 → splice initial_context на index 1 → [compaction_item, env_msg, dev_msg, summary_user_message]"
+        }
+      }
+    },
+    {
+      "id": "SRC-0011/rule/is-summary-message",
+      "src": "SRC-0011",
+      "composition": "rule",
+      "terms": {
+        "condition": "User message классифицируется как compaction summary если его текст начинается с префикса SUMMARY_PREFIX + '\\n'; такие сообщения исключаются из collect_user_messages (чтобы не учитывать их при сборке нового compacted history) и не считаются 'реальными' user messages при insert_initial_context",
+        "numbers": null,
+        "formula": "is_summary_message(message) = message.starts_with(format!(\"{SUMMARY_PREFIX}\\n\"))",
+        "gwt": {
+          "given": "SUMMARY_PREFIX (шаблонный текст, импортируется из templates/compact/summary_prefix.md); user message text = SUMMARY_PREFIX + '\\n' + last_assistant_content",
+          "when": "is_summary_message проверяет",
+          "then": "true → message исключается из collect_user_messages и last_real_user_index в insert_initial_context_before_last_real_user_or_summary"
+        }
+      }
+    },
+    {
+      "id": "SRC-0011/rule/image-data-url-discount-eligibility",
+      "src": "SRC-0011",
+      "composition": "rule",
+      "terms": {
+        "condition": "Inline image discount для token estimate применяется только когда URL: (1) начинается с 'data:' (case-insensitive); (2) имеет comma separator; (3) MIME-тип после 'data:' начинается с 'image/' (case-insensitive); (4) содержит параметр 'base64' (case-insensitive) среди '; separated параметров. При невыполнении любого условия parse_base64_image_data_url → None и discount не применяется",
+        "numbers": null,
+        "formula": "parse_base64_image_data_url = url.starts_with('data:') AND url.contains(',') AND mime_part.starts_with('image/') AND params.any(eq_ignore_case('base64'))",
+        "gwt": {
+          "given": "image_url = 'data:image/png;base64,iVBORw0KGgo...'",
+          "when": "parse_base64_image_data_url",
+          "then": "префикс 'data:' ok, comma найдена, metadata='data:image/png;base64', mime='image/png' starts_with 'image/' ok, params=['base64'] содержит 'base64' ok → Some(payload) → discount применяется"
+        }
+      }
+    },
+    {
+      "id": "SRC-0011/rule/trim-function-call-history-boundary",
+      "src": "SRC-0011",
+      "composition": "rule",
+      "terms": {
+        "condition": "Пред-remote-compaction trimming истории продолжается пока estimated_tokens_with_base_instructions > context_window И last item является codex_generated (FunctionCallOutput/ToolSearchOutput/CustomToolCallOutput/developer Message). Как только tail перестаёт быть codex_generated (встретился user/assistant message) — trimming останавливается даже если context_window всё ещё превышен",
+        "numbers": null,
+        "formula": "while estimated > context_window { let last = history.raw_items().last() else break; if !is_codex_generated_item(last) break; if !history.remove_last_item() break; deleted_items++ }",
+        "gwt": {
+          "given": "context_window=8000, history=[user_msg, assistant_msg, function_call, function_call_output, function_call_output]; estimated_tokens=9000",
+          "when": "trim_function_call_history_to_fit_context_window",
+          "then": "last=function_call_output → codex_generated → remove_last_item, deleted_items=1; повтор: last=function_call_output → remove, =2; повтор: last=function_call → is_codex_generated=false (FunctionCall не codex-generated) → break; возврат deleted_items=2"
+        }
+      }
+    },
+    {
+      "id": "SRC-0011/rule/environment-context-diff-policy",
+      "src": "SRC-0011",
+      "composition": "rule",
+      "terms": {
+        "condition": "При diff_from_turn_context_item: cwd эмитится только если изменился (Some если before.cwd != after.cwd, иначе None); current_date и timezone всегда копируются из after; network эмитится after-версия если отличается от before, иначе сохраняется before-версия; shell передаётся как параметр (не диффается); subagents всегда None в diff",
+        "numbers": null,
+        "formula": "cwd = if before.cwd.as_path()!=after.cwd.as_path() { Some(after.cwd) } else { None }; network = if before_network != after_network { after_network } else { before_network }",
+        "gwt": {
+          "given": "before.cwd=/a, after.cwd=/a, before.network=Some{allowed=[x]}, after.network=Some{allowed=[x,y]}, before.timezone='UTC', after.timezone='UTC'",
+          "when": "diff_from_turn_context_item",
+          "then": "cwd=None (не изменился); network=after_network (изменился — добавлен domain y); current_date/timezone взяты из after; subagents=None"
+        }
+      }
+    },
+    {
+      "id": "SRC-0011/rule/equals-except-shell",
+      "src": "SRC-0011",
+      "composition": "rule",
+      "terms": {
+        "condition": "Сравнение EnvironmentContext turn-to-turn игнорирует поле shell (Только initial environment_context содержит shell, далее оно не конфигурируется turn-to-turn). Сравниваются cwd, current_date, timezone, network, subagents. build_environment_update_item использует equals_except_shell чтобы решить нужен ли environment update item на turn",
+        "numbers": null,
+        "formula": "equals_except_shell = self.cwd==other.cwd AND self.current_date==other.current_date AND self.timezone==other.timezone AND self.network==other.network AND self.subagents==other.subagents",
+        "gwt": {
+          "given": "prev_context.shell=Bash, next_context.shell=Zsh, все прочие поля равны",
+          "when": "prev_context.equals_except_shell(&next_context)",
+          "then": "true → build_environment_update_item возвращает None → environment update на этом turn не эмитится"
+        }
+      }
+    },
+    {
+      "id": "SRC-0011/rule/realtime-transition-matrix",
+      "src": "SRC-0011",
+      "composition": "rule",
+      "terms": {
+        "condition": "Decision table для build_realtime_update_item по (previous_realtime_active, next.realtime_active): (Some(true), false) → realtime_end_message('inactive'); (Some(false), true) → realtime_start_message или realtime_start_message_with_instructions(custom); (None, true) → realtime_start_message или with_instructions(custom); (Some(true), true) → None; (Some(false), false) → None; (None, false) → если previous_turn_settings.realtime_active=Some(true) то realtime_end_message('inactive'), иначе None",
+        "numbers": null,
+        "formula": "match (prev.and_then(realtime_active), next.realtime_active) { (Some(true), false) → end('inactive'); (Some(false)|None, true) → start[_with_instructions]; (Some(true), true)|(Some(false), false) → None; (None, false) → if prev_turn_settings.realtime_active==Some(true) then end('inactive') else None }",
+        "gwt": {
+          "given": "previous TurnContextItem with realtime_active=Some(true), next TurnContext.realtime_active=false",
+          "when": "build_realtime_update_item",
+          "then": "match (Some(true), false) → Some(DeveloperInstructions::realtime_end_message('inactive')) — эмитится developer update section 'realtime stopped'"
+        }
+      }
+    },
+    {
+      "id": "SRC-0011/rule/personality-update-guards",
+      "src": "SRC-0011",
+      "composition": "rule",
+      "terms": {
+        "condition": "Personality update эмитится ТОЛЬКО когда все guards выполнены: (1) personality_feature_enabled = true (feature flag); (2) previous TurnContextItem != None; (3) next.model_info.slug == previous.model (модель НЕ сменилась — если сменилась, personality не эмитится отдельным сообщением, вероятно покрывается model-switch message); (4) next.personality Some; (5) next.personality != previous.personality; (6) model_info имеет non-empty personality message для выбранной personality",
+        "numbers": null,
+        "formula": "if !personality_feature_enabled → None; let previous = previous?; if next.model_info.slug != previous.model → None; if Some(personality) == next.personality AND next.personality != previous.personality → personality_message_for(model_info, personality) .map(DeveloperInstructions::personality_spec_message); else None",
+        "gwt": {
+          "given": "personality_feature_enabled=true, previous.model='gpt-5', next.model_info.slug='gpt-5', previous.personality=Some(Default), next.personality=Some(Friendly), model_info.model_messages содержит message для Friendly",
+          "when": "build_personality_update_item",
+          "then": "все guards пройдены → personality_message_for возвращает Some(message) → Some(DeveloperInstructions::personality_spec_message(message)) — developer update section 'personality changed' эмитится"
+        }
+      }
+    },
+    {
+      "id": "SRC-0011/rule/permissions-update-guards",
+      "src": "SRC-0011",
+      "composition": "rule",
+      "terms": {
+        "condition": "Permissions update эмитится только когда: (1) next.config.include_permissions_instructions = true; (2) previous TurnContextItem != None; (3) ИЗМЕНИЛСЯ хотя бы один из: prev.sandbox_policy vs next.sandbox_policy.get() ИЛИ prev.approval_policy vs next.approval_policy.value(). Тогда эмитится DeveloperInstructions::from_policy(sandbox, approval, reviewer, exec_policy, cwd, exec_permission_approvals_enabled, request_permissions_tool_enabled)",
+        "numbers": null,
+        "formula": "if !next.config.include_permissions_instructions → None; let prev = previous?; if prev.sandbox_policy==next.sandbox_policy.get() AND prev.approval_policy==next.approval_policy.value() → None; else Some(from_policy(...))",
+        "gwt": {
+          "given": "previous.sandbox_policy=DangerFullAccess, next.sandbox_policy=Restricted, include_permissions_instructions=true",
+          "when": "build_permissions_update_item",
+          "then": "sandbox_policy изменился → Some(DeveloperInstructions::from_policy(Restricted, approval, reviewer, exec_policy, cwd, feature_flags)) — developer update section 'permissions changed' эмитится"
+        }
+      }
+    },
+    {
+      "id": "SRC-0011/rule/developer-update-sections-order",
+      "src": "SRC-0011",
+      "composition": "rule",
+      "terms": {
+        "condition": "Developer update sections собираются и рендерятся в фиксированном порядке: (1) model_instructions_update ПЕРВЫМ чтобы model-specific guidance читалась до всех остальных context diffs на этом turn; (2) permissions_update; (3) collaboration_mode_update; (4) realtime_update; (5) personality_update. Sections с None отбрасываются через flatten; каждая оставшаяся сериализуется через DeveloperInstructions::into_text",
+        "numbers": null,
+        "formula": "developer_update_sections = [model_instructions, permissions, collaboration_mode, realtime, personality].into_iter().flatten().map(DeveloperInstructions::into_text).collect()",
+        "gwt": {
+          "given": "все 5 updates вернули Some",
+          "when": "build_settings_update_items",
+          "then": "ResponseItem::Message{role='developer', content=[InputText(model_msg), InputText(permissions_msg), InputText(collab_msg), InputText(realtime_msg), InputText(personality_msg)]} — один developer message с 5 секциями именно в этом порядке"
+        }
+      }
+    },
+    {
+      "id": "SRC-0011/rule/contextual-user-memory-exclusion",
+      "src": "SRC-0011",
+      "composition": "rule",
+      "terms": {
+        "condition": "Contextual user fragments классифицируются для memory stage-1 inputs: ИСКЛЮЧАЮТСЯ AGENTS_MD_FRAGMENT (AGENTS.md guidance) и SKILL_FRAGMENT (skill payload) — они являются prompt scaffolding а не conversation content и не улучшают resulting memory. СОХРАНЯЮТСЯ ENVIRONMENT_CONTEXT_FRAGMENT и SUBAGENT_NOTIFICATION_FRAGMENT — они несут useful execution context или subtask outcomes, должны оставаться видимыми для memory generation",
+        "numbers": null,
+        "formula": "is_memory_excluded_contextual_user_fragment(content_item) = AGENTS_MD_FRAGMENT.matches_text(text) OR SKILL_FRAGMENT.matches_text(text)",
+        "gwt": {
+          "given": "content_item = InputText{text='<agents_md>...project guidance...</agents_md>'}",
+          "when": "is_memory_excluded_contextual_user_fragment",
+          "then": "AGENTS_MD_FRAGMENT.matches_text = true → excluded = true → фрагмент не попадает в memory stage-1 inputs"
+        }
+      }
+    },
+    {
+      "id": "SRC-0011/rule/contextual-user-fragments-registry",
+      "src": "SRC-0011",
+      "composition": "rule",
+      "terms": {
+        "condition": "is_standard_contextual_user_text проверяет text против полного реестра CONTEXTUAL_USER_FRAGMENTS: AGENTS_MD_FRAGMENT, ENVIRONMENT_CONTEXT_FRAGMENT (<environment_context>...</environment_context>), SKILL_FRAGMENT, USER_SHELL_COMMAND_FRAGMENT (<user_shell_command>...</user_shell_command>), TURN_ABORTED_FRAGMENT (<turn_aborted>...</turn_aborted>), SUBAGENT_NOTIFICATION_FRAGMENT (<subagent_notification>...</subagent_notification>). text является контекстуальным если matches любой из них",
+        "numbers": [
+          {"value": 6, "kind": "registry_size", "name": "len(CONTEXTUAL_USER_FRAGMENTS)"}
+        ],
+        "formula": "is_standard_contextual_user_text(text) = CONTEXTUAL_USER_FRAGMENTS.iter().any(|def| def.matches_text(text))",
+        "gwt": {
+          "given": "text = '<turn_aborted>user interrupted</turn_aborted>'",
+          "when": "is_standard_contextual_user_text",
+          "then": "TURN_ABORTED_FRAGMENT.matches_text = true → is_standard_contextual_user_text = true → is_contextual_user_fragment = true → не user turn boundary, не реальное пользовательское сообщение"
+        }
+      }
+    },
+    {
+      "id": "SRC-0011/rule/parse-visible-hook-prompt-completeness",
+      "src": "SRC-0011",
+      "composition": "rule",
+      "terms": {
+        "condition": "parse_visible_hook_prompt_message распознаёт message как hook prompt item ТОЛЬКО когда ВСЕ ContentItem в message являются InputText И КАЖДЫЙ text либо (a) парсится как hook fragment через parse_hook_prompt_fragment, либо (b) совпадает с одним из standard contextual fragments. При встрече любого non-InputText ContentItem или non-контекстуального/non-hook text → возврат None. Кроме того, если собрано 0 hook fragments → возврат None",
+        "numbers": null,
+        "formula": "for ci in content { let InputText{text}=ci else return None; if let Some(fragment)=parse_hook_prompt_fragment(text) { fragments.push(fragment); continue } if is_standard_contextual_user_text(text) continue; return None } if fragments.is_empty() return None; Some(HookPromptItem::from_fragments(id, fragments))",
+        "gwt": {
+          "given": "message content = [InputText('<hook>v1:xyz</hook>'), InputText('<environment_context>...</environment_context>')]",
+          "when": "parse_visible_hook_prompt_message",
+          "then": "первый item: parse_hook_prompt_fragment → Some, push fragment; второй item: parse_hook_prompt_fragment=None, is_standard_contextual_user_text=true → continue; fragments len=1 → Some(HookPromptItem::from_fragments(id, [fragment]))"
+        }
+      }
+    },
+    {
+      "id": "SRC-0011/rule/history-version-bump-triggers",
+      "src": "SRC-0011",
+      "composition": "rule",
+      "terms": {
+        "condition": "ContextManager.history_version инкрементируется (saturating_add 1) в трёх операциях: (1) remove_last_item возвращающий true; (2) replace(items); (3) replace_last_turn_images когда хотя бы одно изображение было заменено (replaced=true). remove_first_item и record_items НЕ бампят history_version",
+        "numbers": [
+          {"value": 1, "kind": "increment"}
+        ],
+        "formula": "history_version = history_version.saturating_add(1) — only on: successful remove_last_item, replace, replace_last_turn_images with replaced=true",
+        "gwt": {
+          "given": "history_version = 5; вызван replace(new_items)",
+          "when": "replace завершился",
+          "then": "history_version = 5.saturating_add(1) = 6"
+        }
+      }
+    },
+    {
+      "id": "SRC-0011/rule/call-output-pairing-invariant",
+      "src": "SRC-0011",
+      "composition": "rule",
+      "terms": {
+        "condition": "Before sending to model, ensure: (1) Каждый FunctionCall/ToolSearchCall(Some)/CustomToolCall/LocalShellCall(Some) имеет соответствующий output по call_id — иначе синтезируется FunctionCallOutput/ToolSearchOutput/CustomToolCallOutput с payload 'aborted'. (2) Каждый FunctionCallOutput/CustomToolCallOutput/ToolSearchOutput(Some, non-server execution) имеет соответствующий call — иначе orphan удаляется и фиксируется error_or_panic. ToolSearchOutput с execution='server' сохраняется безусловно; ToolSearchOutput с call_id=None сохраняется",
+        "numbers": null,
+        "formula": "ensure_call_outputs_present: for call: if !has_output(call_id) → insert synthetic output at idx+1 with payload 'aborted'. remove_orphan_outputs: retain outputs where matching call exists (с exceptions для server execution и None call_id)",
+        "gwt": {
+          "given": "history = [FunctionCall{call_id='C1'}, FunctionCallOutput{call_id='C2'}]",
+          "when": "normalize_history",
+          "then": "ensure_call_outputs_present: C1 без output → insert synthetic FunctionCallOutput{call_id='C1', output=text('aborted')} после index 0; remove_orphan_outputs: C2 в FunctionCallOutput без парного FunctionCall → error_or_panic('Orphan function call output') и item удаляется; итог = [FunctionCall{C1}, synthetic_output{C1}]"
+        }
+      }
+    },
+    {
+      "id": "SRC-0011/rule/synthetic-output-payload",
+      "src": "SRC-0011",
+      "composition": "rule",
+      "terms": {
+        "condition": "Синтезируемые outputs для missing calls используют: FunctionCallOutputPayload::from_text('aborted') для FunctionCall и LocalShellCall и CustomToolCall; для ToolSearchCall — ToolSearchOutput{status='completed', execution='client', tools=Vec::new()}. Insertion position = idx+1 (сразу после call), items вставляются в reverse index order чтобы избежать сдвига индексов",
+        "numbers": null,
+        "formula": null,
+        "gwt": {
+          "given": "ToolSearchCall{call_id='T1'} без парного output на index 3",
+          "when": "ensure_call_outputs_present синтезирует",
+          "then": "synthetic ToolSearchOutput{call_id=Some('T1'), status='completed', execution='client', tools=[]} вставляется на позицию index 3+1 = 4 (в reverse-итерации по списку missing)"
+        }
+      }
+    },
+    {
+      "id": "SRC-0011/rule/image-unsupported-placeholder",
+      "src": "SRC-0011",
+      "composition": "rule",
+      "terms": {
+        "condition": "Когда input_modalities НЕ содержит InputModality::Image: (1) в Message.content каждый ContentItem::InputImage заменяется на ContentItem::InputText{text='image content omitted because you do not support image input'}; (2) в FunctionCallOutputContentItem::InputImage аналогично заменяется на InputText с тем же placeholder; (3) ImageGenerationCall.result очищается (result.clear()). Когда input_modalities содержит Image — никаких замен",
+        "numbers": null,
+        "formula": null,
+        "gwt": {
+          "given": "model input_modalities=[Text] (без Image); message.content=[InputImage{image_url='data:...'}, InputText('hello')]",
+          "when": "strip_images_when_unsupported",
+          "then": "content → [InputText{text='image content omitted because you do not support image input'}, InputText('hello')]"
+        }
+      }
+    },
+    {
+      "id": "SRC-0011/rule/compaction-strategy-memento",
+      "src": "SRC-0011",
+      "composition": "rule",
+      "terms": {
+        "condition": "Все отправляемые CodexCompactionEvent независимо от implementation (Responses/inline или ResponsesCompact/remote) хардкодят strategy = CompactionStrategy::Memento; это константа на стороне analytics трекинга",
+        "numbers": null,
+        "formula": null,
+        "gwt": {
+          "given": "CompactionAnalyticsAttempt.track вызывается при завершении компакции",
+          "when": "track формирует CodexCompactionEvent",
+          "then": "event.strategy = CompactionStrategy::Memento вне зависимости от trigger/reason/implementation"
+        }
+      }
+    },
+    {
+      "id": "SRC-0011/rule/compaction-status-from-result",
+      "src": "SRC-0011",
+      "composition": "rule",
+      "terms": {
+        "condition": "CompactionStatus вычисляется из результата: Ok → Completed; Err(CodexErr::Interrupted) → Interrupted; Err(CodexErr::TurnAborted) → Interrupted; прочие Err → Failed",
+        "numbers": null,
+        "formula": "match result { Ok(_) → Completed; Err(Interrupted | TurnAborted) → Interrupted; Err(_) → Failed }",
+        "gwt": {
+          "given": "run_compact_task_inner_impl вернул Err(CodexErr::Stream('stream closed before response.completed'))",
+          "when": "compaction_status_from_result(result)",
+          "then": "не Interrupted/TurnAborted → Failed"
+        }
+      }
+    },
+    {
+      "id": "SRC-0011/rule/analytics-gate",
+      "src": "SRC-0011",
+      "composition": "rule",
+      "terms": {
+        "condition": "Отправка CodexCompactionEvent управляется feature-флагом: если sess.enabled(Feature::GeneralAnalytics) = false на момент CompactionAnalyticsAttempt::begin → CompactionAnalyticsAttempt.enabled=false, track() возвращается без вызова analytics_events_client.track_compaction. Значение enabled фиксируется в begin и не перепроверяется в track",
+        "numbers": null,
+        "formula": null,
+        "gwt": {
+          "given": "на begin: sess.enabled(Feature::GeneralAnalytics)=false",
+          "when": "attempt.track(sess, status, error)",
+          "then": "self.enabled=false → ранний return из track; никакое событие не отправляется"
+        }
+      }
+    },
+    {
+      "id": "SRC-0011/rule/remote-compact-selection",
+      "src": "SRC-0011",
+      "composition": "rule",
+      "terms": {
+        "condition": "Выбор between inline и remote compaction основан на should_use_remote_compact_task(provider) = provider.supports_remote_compaction(). При true → использовать run_*_remote_compact_task (CompactionImplementation::ResponsesCompact); при false → run_*_compact_task (CompactionImplementation::Responses)",
+        "numbers": null,
+        "formula": "should_use_remote_compact_task(provider) = provider.supports_remote_compaction()",
+        "gwt": {
+          "given": "ModelProviderInfo с supports_remote_compaction()=true",
+          "when": "вызывающий код (например auto-compact) проверяет should_use_remote_compact_task",
+          "then": "true → вызывается run_inline_remote_auto_compact_task/run_remote_compact_task с implementation=ResponsesCompact"
+        }
+      }
+    },
+    {
+      "id": "SRC-0011/rule/history-persistence-gate",
+      "src": "SRC-0011",
+      "composition": "rule",
+      "terms": {
+        "condition": "append_entry уважает config.history.persistence: HistoryPersistence::SaveAll → продолжить запись; HistoryPersistence::None → тихо вернуть Ok(()) не записав ничего. enforce_history_limit соблюдает config.history.max_bytes: None или 0 → skip enforcement",
+        "numbers": [
+          {"value": 0, "kind": "no_enforcement_threshold"}
+        ],
+        "formula": null,
+        "gwt": {
+          "given": "config.history.persistence = HistoryPersistence::None",
+          "when": "append_entry('hello', thread_id, config)",
+          "then": "return Ok(()) без чтения timestamp, без открытия файла, без записи"
+        }
+      }
+    }
+  ]
+}

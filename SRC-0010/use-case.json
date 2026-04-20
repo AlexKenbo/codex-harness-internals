@@ -1,0 +1,557 @@
+{
+  "src": "SRC-0010",
+  "schema_version": "2.0",
+  "lens": "use_case",
+  "compositions": [
+    {
+      "id": "SRC-0010/uc.user/stream-model-turn",
+      "src": "SRC-0010",
+      "composition": "use_case",
+      "level": "user",
+      "strategic_domain": "модельный клиент — стриминг ответов модели",
+      "terms": {
+        "actor": "Caller (оркестратор turn'а Codex-сессии)",
+        "goal": "Получить streaming-ответ модели на один turn с prompt'ом, tools и reasoning-настройками",
+        "steps": [
+          "1. Caller вызывает ModelClient.new_session() для получения свежей turn-scoped сессии",
+          "2. Caller (опционально) вызывает preconnect_websocket для опережающего открытия WebSocket-соединения →triggers SRC-0010/uc.sub/preconnect-websocket",
+          "3. Caller (опционально) вызывает prewarm_websocket с prompt для v2-warmup запроса с generate=false →triggers SRC-0010/uc.sub/prewarm-websocket",
+          "4. Caller вызывает stream(prompt, model_info, session_telemetry, effort, summary, service_tier, turn_metadata_header)",
+          "5. Клиент проверяет wire_api = Responses и responses_websocket_enabled()",
+          "6. При включённом WebSocket — клиент вызывает stream_responses_websocket →triggers SRC-0010/uc.sub/stream-responses-websocket; при FallbackToHttp или WebSocket-off — переключается на stream_responses_api →triggers SRC-0010/uc.sub/stream-responses-http",
+          "7. Caller получает ResponseStream и потребляет события (OutputItemDone, Completed, другие) через futures::Stream",
+          "8. При Drop ModelClientSession — WebSocket-сессия сохраняется в cached_websocket_session родительского ModelClient для возможного переиспользования"
+        ],
+        "extensions (Cockburn)": [
+          {"step": 6, "condition": "WebSocket возвращает HTTP 426 Upgrade Required (WireApi рассматривает WebSocket как закрытый)", "action": "WebsocketStreamOutcome::FallbackToHttp → try_switch_fallback_transport активирует HTTP fallback для всей сессии, stream переключается на stream_responses_api"},
+          {"step": 6, "condition": "WebSocket/HTTP возвращает 401 Unauthorized", "action": "handle_unauthorized выполняет recovery шаг (если AuthManager имеет next recovery), при успехе loop retry с pending_retry флагом; при permanent failure — CodexErr::RefreshTokenFailed; при transient — CodexErr::Io"},
+          {"step": 6, "condition": "WebSocket connect timeout (истёк provider.websocket_connect_timeout())", "action": "ApiError::Transport(TransportError::Timeout); websocket session reset; возврат ошибки"},
+          {"step": 6, "condition": "переменная окружения CODEX_RS_SSE_FIXTURE установлена (test fixture)", "action": "responses_websocket_enabled возвращает false; stream_responses_api использует stream_from_fixture вместо реального HTTP"}
+        ],
+        "edge_cases": [
+          {"condition": "prompt.input is empty (для compact_conversation_history)", "action": "возврат пустого Vec<ResponseItem> без сетевого вызова"},
+          {"condition": "модель не supports_reasoning_summaries", "action": "reasoning = None, include не содержит 'reasoning.encrypted_content'"},
+          {"condition": "модель не support_verbosity, но model_verbosity установлен", "action": "warn-лог 'model_verbosity is set but ignored', verbosity = None"},
+          {"condition": "ResponseStream tx_event канал закрыт (receiver dropped)", "action": "фоновый task выходит ('return'), последующие события теряются"}
+        ],
+        "lifecycle": {
+          "entity": "SRC-0010/entity/model-client-session",
+          "states": ["created (new_session)", "preconnected (после preconnect_websocket)", "prewarmed (после prewarm_websocket)", "streaming (во время stream)", "dropped (cached обратно в ModelClient)"],
+          "transition": {
+            "from": "created",
+            "to": "dropped",
+            "guard": "turn завершён либо session vars (window_generation, force_http_fallback) invalidated cached websocket",
+            "side_effect": "websocket_session сохраняется в ModelClient.cached_websocket_session на drop, либо сбрасывается на Default при смене window_generation/fallback activation"
+          }
+        },
+        "ux": null,
+        "result": "Caller получил ResponseStream со всеми событиями модели до Completed; session_telemetry записала метрики (api_request, sse_event_completed с input/output/cached/reasoning/total tokens); LastResponse извлечён из ResponseEvent::Completed (response_id + items_added) и доступен для следующего incremental запроса в том же turn"
+      }
+    },
+    {
+      "id": "SRC-0010/uc.user/compact-conversation-history",
+      "src": "SRC-0010",
+      "composition": "use_case",
+      "level": "user",
+      "strategic_domain": "модельный клиент — компакция истории беседы",
+      "terms": {
+        "actor": "Caller (оркестратор Codex-сессии)",
+        "goal": "Сжать текущую историю беседы через Compact endpoint и получить новый список ResponseItem'ов, представляющих компактный transcript",
+        "steps": [
+          "1. Caller вызывает compact_conversation_history(prompt, model_info, effort, summary, session_telemetry)",
+          "2. ModelClient проверяет prompt.input.is_empty() — если пусто, сразу возвращает Ok(Vec::new())",
+          "3. ModelClient резолвит current_client_setup (auth + api_provider + api_auth)",
+          "4. ModelClient строит request_telemetry с endpoint RESPONSES_COMPACT_ENDPOINT='/responses/compact'",
+          "5. ModelClient формирует ApiCompactionInput: model, input (через get_formatted_input), instructions (base_instructions.text), tools JSON, parallel_tool_calls, reasoning (по supports_reasoning_summaries), text (verbosity + output_schema)",
+          "6. ModelClient строит extra_headers: x-codex-installation-id + identity headers + conversation headers",
+          "7. ApiCompactClient.compact_input(payload, extra_headers) отправляет unary HTTP POST",
+          "8. Caller получает Vec<ResponseItem> (компактный transcript) либо CodexErr от map_api_error"
+        ],
+        "extensions (Cockburn)": [
+          {"step": 2, "condition": "prompt.input.is_empty()", "action": "ранний возврат Ok(Vec::new()) без сетевого вызова и без резолва auth"},
+          {"step": 5, "condition": "model_info.supports_reasoning_summaries = false", "action": "reasoning = None; effort игнорируется"},
+          {"step": 5, "condition": "model_info.support_verbosity = false и state.model_verbosity is_some", "action": "warn лог 'model_verbosity is set but ignored'; verbosity = None"},
+          {"step": 7, "condition": "API возвращает ошибку", "action": "map_api_error → CodexErr"}
+        ],
+        "edge_cases": [
+          {"condition": "installation_id не конвертируется в HeaderValue", "action": "x-codex-installation-id header просто не добавляется (if let Ok)"},
+          {"condition": "effort = None", "action": "используется model_info.default_reasoning_level как effort"}
+        ],
+        "lifecycle": null,
+        "ux": null,
+        "result": "Caller получил Vec<ResponseItem> представляющий компактный transcript; telemetry зафиксирована с endpoint /responses/compact"
+      }
+    },
+    {
+      "id": "SRC-0010/uc.user/summarize-memories",
+      "src": "SRC-0010",
+      "composition": "use_case",
+      "level": "user",
+      "strategic_domain": "модельный клиент — суммаризация памяти",
+      "terms": {
+        "actor": "Caller (подсистема управления памятью Codex)",
+        "goal": "Построить summaries для набора нормализованных raw memories через endpoint /memories/trace_summarize",
+        "steps": [
+          "1. Caller вызывает summarize_memories(raw_memories, model_info, effort, session_telemetry)",
+          "2. ModelClient проверяет raw_memories.is_empty() — если пусто, возвращает Ok(Vec::new())",
+          "3. ModelClient резолвит current_client_setup",
+          "4. ModelClient строит request_telemetry с endpoint MEMORIES_SUMMARIZE_ENDPOINT='/memories/trace_summarize'",
+          "5. ModelClient формирует ApiMemorySummarizeInput: model.slug, raw_memories, reasoning (Some(Reasoning{effort: Some, summary: None}) если effort передан)",
+          "6. ApiMemoriesClient.summarize_input(payload, build_subagent_headers()) отправляет unary запрос с только subagent-заголовком",
+          "7. Caller получает Vec<ApiMemorySummarizeOutput>"
+        ],
+        "extensions (Cockburn)": [
+          {"step": 2, "condition": "raw_memories.is_empty()", "action": "ранний возврат Ok(Vec::new())"},
+          {"step": 5, "condition": "effort = None", "action": "reasoning = None (без reasoning config)"},
+          {"step": 6, "condition": "API возвращает ошибку", "action": "map_api_error → CodexErr"}
+        ],
+        "edge_cases": null,
+        "lifecycle": null,
+        "ux": null,
+        "result": "Caller получил summaries по каждой raw memory; telemetry зафиксирована с endpoint /memories/trace_summarize"
+      }
+    },
+    {
+      "id": "SRC-0010/uc.user/open-realtime-webrtc-call",
+      "src": "SRC-0010",
+      "composition": "use_case",
+      "level": "user",
+      "strategic_domain": "модельный клиент — realtime WebRTC-вызовы",
+      "terms": {
+        "actor": "Caller (подсистема Realtime Codex)",
+        "goal": "Открыть WebRTC Realtime-вызов: получить SDP answer клиенту и sideband headers для последующего WebSocket join (тот же in-progress call)",
+        "steps": [
+          "1. Caller вызывает create_realtime_call_with_headers(sdp, session_config, extra_headers)",
+          "2. ModelClient резолвит current_client_setup (auth + api_provider + api_auth)",
+          "3. ModelClient строит sideband_headers = extra_headers ∪ sideband_websocket_auth_headers(api_auth) (повторение API-auth material)",
+          "4. ApiRealtimeCallClient.create_with_session_and_headers(sdp, session_config, extra_headers) создаёт медиа-call через HTTP",
+          "5. Caller получает RealtimeWebrtcCallStart {sdp, call_id, sideband_headers} — sdp возвращается клиенту, call_id+sideband_headers удерживаются для sideband WebSocket controller"
+        ],
+        "extensions (Cockburn)": [
+          {"step": 4, "condition": "API возвращает ошибку", "action": "map_api_error → CodexErr"}
+        ],
+        "edge_cases": [
+          {"condition": "API-key auth sessions", "action": "sideband_headers содержат API bearer"},
+          {"condition": "ChatGPT-auth sessions", "action": "sideband_headers содержат bearer + account id; transceiver принимает эту call-create identity на прямом api.openai.com sideband пути"}
+        ],
+        "lifecycle": null,
+        "ux": null,
+        "result": "RealtimeWebrtcCallStart получен: sdp answer для клиента, call_id+sideband_headers для последующего sideband WebSocket join"
+      }
+    },
+    {
+      "id": "SRC-0010/uc.sub/stream-responses-websocket",
+      "src": "SRC-0010",
+      "composition": "use_case",
+      "level": "sub",
+      "strategic_domain": null,
+      "terms": {
+        "actor": "ModelClientSession (WebSocket transport path)",
+        "goal": "Отправить ResponsesApiRequest через WebSocket-соединение и получить stream событий ответа модели, с поддержкой incremental delta и sticky-routing",
+        "steps": [
+          "1. Резолвит current_client_setup для текущего attempt (auth может измениться после 401 recovery)",
+          "2. Строит request_auth_context из client_setup.auth + client_setup.api_auth + pending_retry",
+          "3. Определяет compression = Zstd если enable_request_compression && auth.is_chatgpt_auth && provider.is_openai(), иначе None",
+          "4. Строит ApiResponsesOptions (conversation_id, session_source, extra_headers с build_responses_headers+identity, compression, turn_state)",
+          "5. Строит ResponsesApiRequest через build_responses_request (model, input, tools, reasoning, store, stream=true, include, service_tier, prompt_cache_key=conversation_id, text, client_metadata)",
+          "6. Строит ResponseCreateWsRequest с client_metadata из build_ws_client_metadata + response_create_client_metadata(request_trace); при warmup=true ставит generate=Some(false)",
+          "7. Вызывает websocket_connection(WebsocketConnectParams...) — лениво открывает connection, либо переиспользует если !is_closed() →triggers SRC-0010/uc.sub/acquire-websocket-connection",
+          "8. prepare_websocket_request: если есть last_response с непустым response_id и новый request = incremental extension previous_request — оборачивает ResponseCreateWsRequest с previous_response_id + incremental_items; иначе полный payload",
+          "9. Сохраняет текущий request в websocket_session.last_request",
+          "10. Вызывает connection.stream_request(ws_request, connection_reused) — получает API stream",
+          "11. map_response_stream преобразует API stream в ResponseStream через tokio::spawn (оборачивает mpsc 1600 buffer) →triggers SRC-0010/uc.sub/map-response-stream",
+          "12. Сохраняет last_response_rx; возвращает WebsocketStreamOutcome::Stream(ResponseStream)"
+        ],
+        "extensions (Cockburn)": [
+          {"step": 7, "condition": "WebSocket handshake возвращает HTTP 426 UPGRADE_REQUIRED", "action": "возврат WebsocketStreamOutcome::FallbackToHttp (caller переключится на HTTP)"},
+          {"step": 7, "condition": "WebSocket handshake возвращает HTTP 401 UNAUTHORIZED", "action": "handle_unauthorized с session_telemetry; pending_retry = from_recovery(result); continue в loop с новым setup"},
+          {"step": 7, "condition": "WebSocket connect timeout (истёк provider.websocket_connect_timeout())", "action": "ApiError::Transport(TransportError::Timeout); reset_websocket_session (connection/last_request/last_response_rx = None, connection_reused=false); возврат ошибки"},
+          {"step": 7, "condition": "прочие ошибки handshake/connect", "action": "map_api_error → CodexErr"},
+          {"step": 8, "condition": "previous_request без input != current request без input (non-input fields изменились)", "action": "trace лог 'properties didn't match'; отправка полного payload без previous_response_id"},
+          {"step": 8, "condition": "current request.input не starts_with baseline (previous input + items_added)", "action": "trace лог 'items didn't match'; отправка полного payload"},
+          {"step": 8, "condition": "last_response.response_id is empty", "action": "trace лог 'no previous response id'; отправка полного payload"},
+          {"step": 10, "condition": "connection.stream_request возвращает ошибку", "action": "map_api_error → CodexErr"}
+        ],
+        "edge_cases": [
+          {"condition": "warmup=true", "action": "ws_payload.generate=Some(false) — запрос только подготавливает v2 соединение, без генерации ответа"},
+          {"condition": "auth_manager отсутствует", "action": "auth_recovery = None; любое 401 после первой попытки приведёт к recovery_not_run с reason='auth_manager_missing'"}
+        ],
+        "lifecycle": {
+          "entity": "SRC-0010/entity/websocket-session",
+          "states": ["no_connection (connection=None)", "connecting (inside websocket_connection call)", "connected (connection=Some, connection_reused=false)", "reused (connection_reused=true при следующем запросе если !is_closed)", "closed (conn.is_closed() вернула true → reconnect)"],
+          "transition": {
+            "from": "no_connection или closed",
+            "to": "connected",
+            "guard": "successful WebSocket handshake",
+            "side_effect": "last_request=None, last_response_rx=None при needs_new; connection_reused=false"
+          }
+        },
+        "ux": null,
+        "result": "Если успех — WebsocketStreamOutcome::Stream(ResponseStream) с привязанным last_response_rx; если 426 — FallbackToHttp; websocket_session.last_request обновлён (для incremental detection следующего запроса)"
+      }
+    },
+    {
+      "id": "SRC-0010/uc.sub/stream-responses-http",
+      "src": "SRC-0010",
+      "composition": "use_case",
+      "level": "sub",
+      "strategic_domain": null,
+      "terms": {
+        "actor": "ModelClientSession (HTTP SSE transport path)",
+        "goal": "Отправить ResponsesApiRequest через HTTP POST /responses и получить SSE stream событий ответа модели",
+        "steps": [
+          "1. Если CODEX_RS_SSE_FIXTURE установлена — warn лог 'Streaming from fixture'; используется codex_api::stream_from_fixture с provider.stream_idle_timeout(); возврат через map_response_stream (без last_request_rx)",
+          "2. Иначе: auth_recovery = AuthManager.unauthorized_recovery() если auth_manager is_some",
+          "3. Loop: current_client_setup → transport = ReqwestTransport::new(build_reqwest_client())",
+          "4. Строит streaming_telemetry (request_telemetry + sse_telemetry) через ApiTelemetry с endpoint RESPONSES_ENDPOINT='/responses'",
+          "5. Строит compression (см. UC WebSocket) + ApiResponsesOptions + ResponsesApiRequest",
+          "6. ApiResponsesClient.with_telemetry(request_telemetry, sse_telemetry).stream_request(request, options) — HTTP SSE",
+          "7. При успехе — map_response_stream → возвращает ResponseStream",
+          "8. При 401 UNAUTHORIZED — handle_unauthorized; pending_retry = from_recovery(result); continue loop",
+          "9. При прочих ошибках — map_api_error → CodexErr"
+        ],
+        "extensions (Cockburn)": [
+          {"step": 1, "condition": "CODEX_RS_SSE_FIXTURE окружение установлено", "action": "stream from fixture вместо реального HTTP; одна попытка, без loop"},
+          {"step": 6, "condition": "HTTP 401 UNAUTHORIZED", "action": "handle_unauthorized; pending_retry = from_recovery; continue"},
+          {"step": 6, "condition": "другие ошибки Transport/API", "action": "return map_api_error"}
+        ],
+        "edge_cases": [
+          {"condition": "auth_manager отсутствует", "action": "auth_recovery = None; 401 приведёт к recovery_not_run с 'auth_manager_missing'"},
+          {"condition": "первая попытка (pending_retry default)", "action": "retry_after_unauthorized = false в telemetry"}
+        ],
+        "lifecycle": null,
+        "ux": null,
+        "result": "ResponseStream с SSE-событиями; HTTP telemetry зафиксирована; при 401 — до одного retry после successful recovery"
+      }
+    },
+    {
+      "id": "SRC-0010/uc.sub/acquire-websocket-connection",
+      "src": "SRC-0010",
+      "composition": "use_case",
+      "level": "sub",
+      "strategic_domain": null,
+      "terms": {
+        "actor": "ModelClientSession.websocket_connection",
+        "goal": "Обеспечить доступное WebSocket-соединение для текущего запроса: либо переиспользовать существующее (если не closed), либо открыть новое и сбросить per-turn incremental state",
+        "steps": [
+          "1. Проверить websocket_session.connection: если Some, вызвать conn.is_closed().await; если None — needs_new=true",
+          "2. Если needs_new=true: сбросить last_request=None, last_response_rx=None",
+          "3. Выбрать turn_state: options.turn_state.clone() или Arc::clone(&self.turn_state)",
+          "4. Вызвать ModelClient.connect_websocket(session_telemetry, api_provider, api_auth, Some(turn_state), turn_metadata_header, auth_context, request_route_telemetry) →triggers SRC-0010/uc.sub/connect-websocket",
+          "5. При успехе: connection=Some(new_conn), connection_reused=false",
+          "6. Если needs_new=false: connection_reused=true (переиспользование)",
+          "7. Вернуть ref на connection либо ошибку 'websocket connection is unavailable'"
+        ],
+        "extensions (Cockburn)": [
+          {"step": 4, "condition": "connect возвращает ApiError::Transport(TransportError::Timeout)", "action": "reset_websocket_session; вернуть Err(Timeout)"},
+          {"step": 4, "condition": "connect возвращает любую другую ApiError", "action": "вернуть Err без reset (caller обработает 426/401/прочее)"}
+        ],
+        "edge_cases": [
+          {"condition": "conn.is_closed() true (сервер закрыл соединение)", "action": "ре-коннект как needs_new; incremental state сбрасывается"}
+        ],
+        "lifecycle": null,
+        "ux": null,
+        "result": "ApiWebSocketConnection ref доступен либо ApiError; websocket_session.connection_reused обновлён"
+      }
+    },
+    {
+      "id": "SRC-0010/uc.sub/connect-websocket",
+      "src": "SRC-0010",
+      "composition": "use_case",
+      "level": "sub",
+      "strategic_domain": null,
+      "terms": {
+        "actor": "ModelClient.connect_websocket",
+        "goal": "Открыть WebSocket-соединение с handshake headers и записать telemetry connect-события (connection duration, status, errors, auth context)",
+        "steps": [
+          "1. Построить handshake headers через build_websocket_headers(turn_state, turn_metadata_header) + default_headers + conversation_id + identity + OpenAI-Beta='responses_websockets=2026-02-06' + timing-metrics (если включены)",
+          "2. Построить websocket_telemetry через build_websocket_telemetry",
+          "3. Получить websocket_connect_timeout = provider.websocket_connect_timeout()",
+          "4. Зафиксировать Instant::now() — start",
+          "5. Выполнить tokio::time::timeout(timeout, ApiWebSocketResponsesClient::new(api_provider, api_auth).connect(headers, default_headers, turn_state, websocket_telemetry))",
+          "6. При timeout — result = Err(ApiError::Transport(TransportError::Timeout))",
+          "7. Записать session_telemetry.record_websocket_connect (elapsed, status, error_message, auth_header_attached, auth_header_name, retry_after_unauthorized, recovery_mode, recovery_phase, endpoint, connection_reused=false, request_id, cf_ray, auth_error, auth_error_code)",
+          "8. Эмитировать emit_feedback_request_tags_with_auth_env с FeedbackRequestTags (с auth_recovery_followup_success/status если retry_after_unauthorized)",
+          "9. Вернуть result (Ok(connection) или Err(ApiError))"
+        ],
+        "extensions (Cockburn)": [
+          {"step": 5, "condition": "tokio timeout истёк (> websocket_connect_timeout)", "action": "result = Err(TransportError::Timeout); все последующие шаги telemetry выполняются с этим err"}
+        ],
+        "edge_cases": [
+          {"condition": "retry_after_unauthorized=true", "action": "auth_recovery_followup_success = Some(result.is_ok()); auth_recovery_followup_status = Some(status) если Some, иначе None"}
+        ],
+        "lifecycle": null,
+        "ux": null,
+        "result": "ApiWebSocketConnection или ApiError; session_telemetry + feedback tags записаны с полным auth-контекстом"
+      }
+    },
+    {
+      "id": "SRC-0010/uc.sub/preconnect-websocket",
+      "src": "SRC-0010",
+      "composition": "use_case",
+      "level": "sub",
+      "strategic_domain": null,
+      "terms": {
+        "actor": "ModelClientSession.preconnect_websocket",
+        "goal": "Оппортунистически открыть WebSocket-соединение без отправки prompt — только connection setup, чтобы сократить latency первого stream-запроса turn'а",
+        "steps": [
+          "1. Если !responses_websocket_enabled() — ранний Ok(()) (noop)",
+          "2. Если websocket_session.connection уже Some — ранний Ok(()) (noop)",
+          "3. Резолвить current_client_setup; обернуть ошибку в ApiError::Stream('failed to build websocket prewarm client setup: {err}')",
+          "4. Построить AuthRequestTelemetryContext с pending_retry=default",
+          "5. Вызвать connect_websocket с endpoint RESPONSES_ENDPOINT →triggers SRC-0010/uc.sub/connect-websocket",
+          "6. При успехе: connection=Some(new_conn), connection_reused=false",
+          "7. Вернуть Ok(()) либо Err(ApiError)"
+        ],
+        "extensions (Cockburn)": [
+          {"step": 1, "condition": "provider !supports_websockets || disable_websockets || CODEX_RS_SSE_FIXTURE", "action": "noop (Ok(()))"},
+          {"step": 2, "condition": "connection уже установлено", "action": "noop"},
+          {"step": 3, "condition": "current_client_setup failed", "action": "ApiError::Stream с оборачивающим сообщением"}
+        ],
+        "edge_cases": null,
+        "lifecycle": null,
+        "ux": null,
+        "result": "WebSocket-соединение открыто и закешировано в websocket_session.connection до отправки prompt"
+      }
+    },
+    {
+      "id": "SRC-0010/uc.sub/prewarm-websocket",
+      "src": "SRC-0010",
+      "composition": "use_case",
+      "level": "sub",
+      "strategic_domain": null,
+      "terms": {
+        "actor": "ModelClientSession.prewarm_websocket",
+        "goal": "Отправить v2-only response.create c generate=false для прогрева соединения; ждать Completed перед первым реальным запросом turn'а чтобы тот мог переиспользовать connection и previous_response_id",
+        "steps": [
+          "1. Если !responses_websocket_enabled() — ранний Ok(()) (noop)",
+          "2. Если websocket_session.last_request уже Some — ранний Ok(()) (prewarm уже выполнялся)",
+          "3. Вызвать stream_responses_websocket с warmup=true и текущим W3C trace context →triggers SRC-0010/uc.sub/stream-responses-websocket",
+          "4. При WebsocketStreamOutcome::Stream — дождаться ResponseEvent::Completed в цикле while let Some(event); прочие события игнорировать",
+          "5. При ResponseEvent::Completed — break; Ok(())",
+          "6. При WebsocketStreamOutcome::FallbackToHttp — вызвать try_switch_fallback_transport; Ok(())",
+          "7. При Err на любом этапе — вернуть Err"
+        ],
+        "extensions (Cockburn)": [
+          {"step": 4, "condition": "ResponseEvent::Err во время ожидания Completed", "action": "вернуть Err (прекратить prewarm)"},
+          {"step": 6, "condition": "stream_responses_websocket вернул FallbackToHttp", "action": "try_switch_fallback_transport активирует HTTP fallback для сессии"}
+        ],
+        "edge_cases": [
+          {"condition": "WebSocket уже prewarmed в этом turn'е", "action": "idempotent noop (last_request уже установлен)"}
+        ],
+        "lifecycle": null,
+        "ux": null,
+        "result": "WebSocket готов к первому реальному запросу с reused connection и установленным previous_response_id; warmup v2-запрос завершился с Completed; либо fallback на HTTP активирован"
+      }
+    },
+    {
+      "id": "SRC-0010/uc.sub/prepare-incremental-request",
+      "src": "SRC-0010",
+      "composition": "use_case",
+      "level": "sub",
+      "strategic_domain": null,
+      "terms": {
+        "actor": "ModelClientSession.prepare_websocket_request (incremental detection)",
+        "goal": "Определить, является ли текущий ResponsesApiRequest incremental-расширением предыдущего, и если да — отправить только delta items с привязкой previous_response_id вместо полного payload",
+        "steps": [
+          "1. Получить last_response через get_last_response (try_recv из oneshot receiver)",
+          "2. Если last_response = None — вернуть ResponseCreateWsRequest(payload) без изменений",
+          "3. Вызвать get_incremental_items(request, Some(last_response), allow_empty_delta=true)",
+          "4. Сравнить previous_request без input с current request без input — должны быть равны",
+          "5. Построить baseline = previous_request.input + last_response.items_added",
+          "6. Проверить что request.input.starts_with(baseline) и (allow_empty_delta || baseline_len < request.input.len())",
+          "7. Вернуть delta = request.input[baseline_len..]",
+          "8. Если last_response.response_id empty — trace 'no previous response id'; вернуть полный payload",
+          "9. Иначе — вернуть ResponseCreateWsRequest с previous_response_id=Some(response_id) и input=incremental_items"
+        ],
+        "extensions (Cockburn)": [
+          {"step": 4, "condition": "previous_without_input != request_without_input", "action": "trace 'properties didn't match'; возврат None → полный payload"},
+          {"step": 6, "condition": "!request.input.starts_with(baseline) || !(allow_empty_delta || baseline_len < request.input.len())", "action": "trace 'items didn't match'; возврат None → полный payload"},
+          {"step": 8, "condition": "response_id пустой", "action": "trace 'no previous response id'; полный payload"}
+        ],
+        "edge_cases": [
+          {"condition": "allow_empty_delta=true (используется в prepare_websocket_request)", "action": "даже при baseline_len == request.input.len() возвращается пустой delta; для prewarm/continuation"}
+        ],
+        "lifecycle": null,
+        "ux": null,
+        "result": "Либо ResponseCreateWsRequest с полным input (если не incremental), либо с previous_response_id + delta input (экономия bandwidth и корректная привязка к предыдущему ответу)"
+      }
+    },
+    {
+      "id": "SRC-0010/uc.sub/handle-unauthorized",
+      "src": "SRC-0010",
+      "composition": "use_case",
+      "level": "sub",
+      "strategic_domain": null,
+      "terms": {
+        "actor": "handle_unauthorized (401 recovery coordinator)",
+        "goal": "Обработать 401 Unauthorized: если AuthManager имеет next recovery step — выполнить его (опционально refresh ChatGPT token), чтобы caller мог повторить запрос; записать все исходы в telemetry и feedback tags",
+        "steps": [
+          "1. extract_response_debug_context(&transport) — извлечь request_id, cf_ray, auth_error, auth_error_code",
+          "2. Если auth_recovery Some и recovery.has_next(): сохранить mode=recovery.mode_name(), phase=recovery.step_name()",
+          "3. Вызвать recovery.next().await",
+          "4. При Ok(step_result): record_auth_recovery(mode, phase, 'recovery_succeeded', debug, auth_state_changed=step_result.auth_state_changed()); emit_feedback_auth_recovery_tags; возврат Ok(UnauthorizedRecoveryExecution{mode, phase})",
+          "5. При Err(RefreshTokenError::Permanent(failed)): record_auth_recovery('recovery_failed_permanent', ...); возврат CodexErr::RefreshTokenFailed(failed)",
+          "6. При Err(RefreshTokenError::Transient(other)): record_auth_recovery('recovery_failed_transient', ...); возврат CodexErr::Io(other)",
+          "7. Если recovery None или !has_next(): вычислить (mode, phase, recovery_reason) из auth_recovery либо ('none','none','auth_manager_missing')",
+          "8. record_auth_recovery('recovery_not_run', debug, recovery_reason); emit_feedback_auth_recovery_tags",
+          "9. Возврат Err(map_api_error(ApiError::Transport(transport)))"
+        ],
+        "extensions (Cockburn)": [
+          {"step": 3, "condition": "Permanent refresh error", "action": "recovery_failed_permanent → CodexErr::RefreshTokenFailed, caller прекращает retry"},
+          {"step": 3, "condition": "Transient refresh error", "action": "recovery_failed_transient → CodexErr::Io, caller прекращает retry"},
+          {"step": 7, "condition": "auth_recovery = Some(r) но !r.has_next()", "action": "recovery_not_run с recovery_reason=r.unavailable_reason()"},
+          {"step": 7, "condition": "auth_recovery = None", "action": "recovery_not_run с mode='none', phase='none', reason='auth_manager_missing'"}
+        ],
+        "edge_cases": [
+          {"condition": "recovery_succeeded", "action": "auth_state_changed передаётся в telemetry; caller выполняет retry с pending_retry=from_recovery"}
+        ],
+        "lifecycle": {
+          "entity": "SRC-0010/entity/model-client (PendingUnauthorizedRetry state)",
+          "states": ["default (retry_after_unauthorized=false)", "from_recovery (retry_after_unauthorized=true, recovery_mode+phase установлены)"],
+          "transition": {
+            "from": "default",
+            "to": "from_recovery",
+            "guard": "handle_unauthorized вернул Ok(UnauthorizedRecoveryExecution)",
+            "side_effect": "следующая попытка транспорта использует pending_retry в AuthRequestTelemetryContext → telemetry отмечает retry_after_unauthorized"
+          }
+        },
+        "ux": null,
+        "result": "Либо Ok(UnauthorizedRecoveryExecution) для retry с telemetry флагами, либо CodexErr; все 4 исхода (succeeded/failed_permanent/failed_transient/not_run) записаны в session_telemetry и feedback tags"
+      }
+    },
+    {
+      "id": "SRC-0010/uc.sub/force-http-fallback",
+      "src": "SRC-0010",
+      "composition": "use_case",
+      "level": "sub",
+      "strategic_domain": null,
+      "terms": {
+        "actor": "ModelClient.force_http_fallback / ModelClientSession.try_switch_fallback_transport",
+        "goal": "Принудительно отключить WebSocket для всей Codex-сессии и сбросить WebSocket-состояние, чтобы последующие запросы шли через HTTP транспорт",
+        "steps": [
+          "1. websocket_enabled = responses_websocket_enabled()",
+          "2. activated = websocket_enabled && !disable_websockets.swap(true, Relaxed) — atomic переключение с возвратом previous value",
+          "3. Если activated=true: warn лог 'falling back to HTTP'; session_telemetry.counter('codex.transport.fallback_to_http', 1, [('from_wire_api','responses_websocket')])",
+          "4. store_cached_websocket_session(WebsocketSession::default()) — сбросить кеш",
+          "5. Вернуть activated",
+          "6. (try_switch_fallback_transport) также сбрасывает self.websocket_session на default"
+        ],
+        "extensions (Cockburn)": [
+          {"step": 2, "condition": "websocket_enabled=false (provider не поддерживает или CODEX_RS_SSE_FIXTURE)", "action": "activated=false; счётчик не инкрементируется"},
+          {"step": 2, "condition": "disable_websockets уже был true (fallback активирован ранее)", "action": "activated=false; noop по counter"}
+        ],
+        "edge_cases": [
+          {"condition": "concurrent force_http_fallback из нескольких сессий", "action": "atomic swap гарантирует ровно один caller получает activated=true"}
+        ],
+        "lifecycle": {
+          "entity": "SRC-0010/entity/model-client (disable_websockets + cached_websocket_session)",
+          "states": ["websocket_enabled (disable_websockets=false, provider.supports_websockets=true, no fixture)", "websocket_disabled (disable_websockets=true ИЛИ provider.supports_websockets=false ИЛИ CODEX_RS_SSE_FIXTURE)"],
+          "transition": {
+            "from": "websocket_enabled",
+            "to": "websocket_disabled",
+            "guard": "force_http_fallback вызван (обычно после 426 UPGRADE_REQUIRED или истощения retry budget)",
+            "side_effect": "счётчик telemetry +1 с тегом from_wire_api=responses_websocket; cached_websocket_session = default; все последующие stream_calls идут через HTTP"
+          }
+        },
+        "ux": null,
+        "result": "disable_websockets=true для остатка сессии; cached_websocket_session сброшен; counter 'codex.transport.fallback_to_http' инкрементирован ровно один раз; все последующие stream() вызовы используют stream_responses_api"
+      }
+    },
+    {
+      "id": "SRC-0010/uc.sub/map-response-stream",
+      "src": "SRC-0010",
+      "composition": "use_case",
+      "level": "sub",
+      "strategic_domain": null,
+      "terms": {
+        "actor": "map_response_stream (фоновый tokio task)",
+        "goal": "Преобразовать API stream (SSE или WebSocket) в ResponseStream, фиксируя token usage telemetry при Completed и отсылая LastResponse (response_id + накопленные OutputItemDone items) через oneshot channel для incremental detection следующего запроса",
+        "steps": [
+          "1. Создать mpsc::channel::<Result<ResponseEvent>>(1600) → (tx_event, rx_event)",
+          "2. Создать oneshot::channel::<LastResponse>() → (tx_last_response, rx_last_response)",
+          "3. Запустить tokio::spawn с логикой:",
+          "4. При ResponseEvent::OutputItemDone(item) — клонировать item в items_added, отправить Ok(OutputItemDone(item)) в tx_event",
+          "5. При ResponseEvent::Completed{response_id, token_usage} — если Some(usage): session_telemetry.sse_event_completed(input_tokens, output_tokens, Some(cached_input_tokens), Some(reasoning_output_tokens), total_tokens); отправить LastResponse{response_id.clone(), std::mem::take(items_added)} через tx_last_response; отправить Completed в tx_event",
+          "6. При прочих Ok(event) — отправить в tx_event",
+          "7. При Err — map_api_error; если !logged_error: session_telemetry.see_event_completed_failed(&mapped), logged_error=true; отправить Err в tx_event",
+          "8. При ошибке отправки tx_event (receiver dropped) — return (выход из task)",
+          "9. Вернуть (ResponseStream{rx_event}, rx_last_response) caller'у"
+        ],
+        "extensions (Cockburn)": [
+          {"step": 5, "condition": "token_usage = None", "action": "sse_event_completed не вызывается (нет usage метрик)"},
+          {"step": 7, "condition": "несколько Err подряд", "action": "see_event_completed_failed вызывается только один раз (logged_error=true)"},
+          {"step": 8, "condition": "tx_event.send завершается Err (rx_event dropped consumer'ом)", "action": "task завершается; последующие события теряются"}
+        ],
+        "edge_cases": [
+          {"condition": "stream завершился без Completed", "action": "tx_last_response не отправляется (Some(sender) всё ещё в tx_last_response.take()); rx_last_response в caller'e получит закрытый channel"}
+        ],
+        "lifecycle": null,
+        "ux": null,
+        "result": "ResponseStream готов для consumer (futures::Stream с buffer 1600); token usage зафиксирован в session_telemetry при Completed; LastResponse отправлен через oneshot для инкрементальной логики следующего запроса в turn'е"
+      }
+    },
+    {
+      "id": "SRC-0010/uc.sub/advance-window-generation",
+      "src": "SRC-0010",
+      "composition": "use_case",
+      "level": "sub",
+      "strategic_domain": null,
+      "terms": {
+        "actor": "ModelClient (window generation control)",
+        "goal": "Обновить window generation (часть идентификатора current window '{conversation_id}:{window_generation}') и инвалидировать кешированную WebSocket-сессию, поскольку предыдущий window больше не валиден для sticky routing",
+        "steps": [
+          "1. (set_window_generation) — window_generation.store(new_value, Relaxed); либо (advance_window_generation) — window_generation.fetch_add(1, Relaxed)",
+          "2. store_cached_websocket_session(WebsocketSession::default()) — сбросить кеш"
+        ],
+        "extensions (Cockburn)": [],
+        "edge_cases": null,
+        "lifecycle": {
+          "entity": "SRC-0010/entity/model-client (window_generation)",
+          "states": ["generation=N (x-codex-window-id='{conv_id}:N', WebSocket-сессия связана с window N)", "generation=N+1 (window invalidated, cached session cleared)"],
+          "transition": {
+            "from": "generation=N",
+            "to": "generation=N+1",
+            "guard": "set_window_generation или advance_window_generation вызван",
+            "side_effect": "cached_websocket_session = default (старые соединения не переиспользуются для нового window)"
+          }
+        },
+        "ux": null,
+        "result": "x-codex-window-id header в последующих запросах отражает новое generation; кешированная WebSocket-сессия сброшена (incremental state для старого window потерян)"
+      }
+    },
+    {
+      "id": "SRC-0010/uc.sub/reformat-freeform-apply-patch-output",
+      "src": "SRC-0010",
+      "composition": "use_case",
+      "level": "sub",
+      "strategic_domain": null,
+      "terms": {
+        "actor": "Prompt.get_formatted_input (+ reserialize_shell_outputs)",
+        "goal": "При наличии Freeform-типа apply_patch tool в prompt — преобразовать JSON-outputs соответствующих shell/apply_patch tool calls в структурированный текстовый формат (Exit code / Wall time / Total output lines / Output), поскольку Freeform вариант ожидает текст, а не JSON",
+        "steps": [
+          "1. Проверить есть ли в prompt.tools Freeform(f) с f.name=='apply_patch'",
+          "2. Если да — клонировать input и вызвать reserialize_shell_outputs(&mut input)",
+          "3. reserialize_shell_outputs: первым проходом собирать call_ids от LocalShellCall (call_id или id), CustomToolCall (name=apply_patch), FunctionCall (name in shell/container.exec/apply_patch)",
+          "4. При FunctionCallOutput/CustomToolCallOutput: если call_id в shell_call_ids — remove и распарсить output.text_content() через parse_structured_shell_output",
+          "5. При успешном парсинге (ExecOutputJson{output, metadata{exit_code, duration_seconds}}) — build_structured_output: секции 'Exit code: {N}' + 'Wall time: {D} seconds' + (если префикс 'Total output lines: <N>\\n\\n' — extract N и strip) 'Total output lines: {L}' + 'Output:' + <stripped_or_raw output>",
+          "6. Записать output.body = FunctionCallOutputBody::Text(structured)",
+          "7. Вернуть изменённый input"
+        ],
+        "extensions (Cockburn)": [
+          {"step": 1, "condition": "в prompt.tools нет Freeform apply_patch", "action": "reserialize_shell_outputs не вызывается; input возвращается без изменений"},
+          {"step": 5, "condition": "serde_json::from_str не может распарсить raw как ExecOutputJson", "action": "parse_structured_shell_output возвращает None; output.body остаётся неизменным"},
+          {"step": 5, "condition": "префикс 'Total output lines: <N>\\n' отсутствует или число не парсится в u32", "action": "strip_total_output_header возвращает None; секция Total output lines не добавляется; output остаётся без strip"}
+        ],
+        "edge_cases": [
+          {"condition": "одновременные LocalShellCall и FunctionCall для одного call_id", "action": "shell_call_ids HashSet удаляет дубликаты; matching output обрабатывается один раз"},
+          {"condition": "FunctionCall с name 'apply_patch'", "action": "обрабатывается как shell call (добавляется в shell_call_ids)"},
+          {"condition": "output.text_content() вернул None", "action": "output.body остаётся без изменений"}
+        ],
+        "lifecycle": null,
+        "ux": null,
+        "result": "Freeform apply_patch tool получает shell outputs в текстовом формате с секциями Exit code / Wall time / [Total output lines] / Output вместо raw JSON"
+      }
+    }
+  ]
+}

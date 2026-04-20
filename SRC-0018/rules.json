@@ -1,0 +1,1198 @@
+{
+  "src": "SRC-0018",
+  "schema_version": "2.0",
+  "lens": "rule",
+  "compositions": [
+    {
+      "id": "SRC-0018/rule/apply-patch-exit-code",
+      "src": "SRC-0018",
+      "composition": "rule",
+      "terms": {
+        "condition": "ApplyPatchRuntime.run проставляет exit_code = 0 при Ok(result) и exit_code = 1 при Err(result); ошибка apply_patch не sandbox-denied возвращается как ExecToolCallOutput с exit_code=1 (не Err)",
+        "numbers": [
+          {"value": 0, "kind": "exit_code_ok"},
+          {"value": 1, "kind": "exit_code_err"}
+        ],
+        "formula": "exit_code = if result.is_ok() { 0 } else { 1 }",
+        "gwt": {
+          "given": "codex_apply_patch::apply_patch(...) -> Ok(())",
+          "when": "ApplyPatchRuntime.run собирает ExecToolCallOutput",
+          "then": "exit_code == 0, timed_out == false, output содержит stdout/stderr"
+        }
+      }
+    },
+    {
+      "id": "SRC-0018/rule/apply-patch-sandbox-denied",
+      "src": "SRC-0018",
+      "composition": "rule",
+      "terms": {
+        "condition": "Если apply_patch вернул Err И is_likely_sandbox_denied(attempt.sandbox, &output) == true → ToolError::Codex(CodexErr::Sandbox(SandboxErr::Denied{output, network_policy_decision=None})); иначе exit_code=1 отдаётся как успех runtime",
+        "numbers": null,
+        "formula": null,
+        "gwt": null
+      }
+    },
+    {
+      "id": "SRC-0018/rule/apply-patch-preapproved-skip",
+      "src": "SRC-0018",
+      "composition": "rule",
+      "terms": {
+        "condition": "ApplyPatchRuntime.start_approval_async: если req.permissions_preapproved == true И retry_reason.is_none() → немедленно вернуть ReviewDecision::Approved (без guardian/session request)",
+        "numbers": null,
+        "formula": null,
+        "gwt": {
+          "given": "ApplyPatchRequest{permissions_preapproved=true}, retry_reason=None",
+          "when": "start_approval_async вызван",
+          "then": "вернуть ReviewDecision::Approved без обращения к guardian или session"
+        }
+      }
+    },
+    {
+      "id": "SRC-0018/rule/apply-patch-approval-routing",
+      "src": "SRC-0018",
+      "composition": "rule",
+      "terms": {
+        "condition": "Приоритет маршрутизации апрува apply_patch: (1) preapproved+no retry → Approved; (2) guardian_review_id=Some → review_approval_request(GuardianApprovalRequest::ApplyPatch{id, cwd, files, patch}); (3) retry_reason=Some → session.request_patch_approval с reason=Some(r); (4) default → with_cached_approval('apply_patch', keys=file_paths) + request_patch_approval без reason",
+        "numbers": null,
+        "formula": null,
+        "gwt": null
+      }
+    },
+    {
+      "id": "SRC-0018/rule/apply-patch-wants-no-sandbox-approval",
+      "src": "SRC-0018",
+      "composition": "rule",
+      "terms": {
+        "condition": "ApplyPatchRuntime.wants_no_sandbox_approval возвращает: AskForApproval::Never → false; Granular(g) → g.allows_sandbox_approval(); OnFailure → true; OnRequest → true; UnlessTrusted → true",
+        "numbers": null,
+        "formula": null,
+        "gwt": {
+          "given": "AskForApproval::Never",
+          "when": "wants_no_sandbox_approval вызван",
+          "then": "false — patch не запрашивает 'no sandbox' апрув"
+        }
+      }
+    },
+    {
+      "id": "SRC-0018/rule/file-system-sandbox-context-noop-for-none",
+      "src": "SRC-0018",
+      "composition": "rule",
+      "terms": {
+        "condition": "file_system_sandbox_context_for_attempt возвращает None, если attempt.sandbox == SandboxType::None; иначе Some(FileSystemSandboxContext{sandbox_policy, windows_sandbox_level, windows_sandbox_private_desktop, use_legacy_landlock, additional_permissions})",
+        "numbers": null,
+        "formula": null,
+        "gwt": {
+          "given": "SandboxAttempt{sandbox=SandboxType::None}",
+          "when": "file_system_sandbox_context_for_attempt(req, attempt)",
+          "then": "None — apply_patch выполняется без sandbox-обёртки"
+        }
+      }
+    },
+    {
+      "id": "SRC-0018/rule/emit-output-delta-empty-chunk",
+      "src": "SRC-0018",
+      "composition": "rule",
+      "terms": {
+        "condition": "emit_output_delta(ctx, stream, chunk): если chunk.is_empty() → return без отправки события; иначе отправить ExecCommandOutputDeltaEvent{call_id, stream, chunk=chunk.to_vec()} в session event bus",
+        "numbers": null,
+        "formula": null,
+        "gwt": {
+          "given": "chunk = []",
+          "when": "emit_output_delta",
+          "then": "event не отправлен, функция возвращается"
+        }
+      }
+    },
+    {
+      "id": "SRC-0018/rule/sandbox-command-nonempty",
+      "src": "SRC-0018",
+      "composition": "rule",
+      "terms": {
+        "condition": "build_sandbox_command отклоняет пустой command: split_first fails → ToolError::Rejected('command args are empty'); при len>=1 берёт program=command[0] и args=command[1..]",
+        "numbers": null,
+        "formula": null,
+        "gwt": {
+          "given": "command = []",
+          "when": "build_sandbox_command(command, cwd, env, additional_permissions)",
+          "then": "Err(ToolError::Rejected('command args are empty'))"
+        }
+      }
+    },
+    {
+      "id": "SRC-0018/rule/shell-lc-snapshot-wrap-gates",
+      "src": "SRC-0018",
+      "composition": "rule",
+      "terms": {
+        "condition": "maybe_wrap_shell_lc_with_snapshot переписывает argv только если все выполнено: (1) !cfg!(windows); (2) session_shell.shell_snapshot() == Some; (3) snapshot.path.exists(); (4) paths_match_after_normalization(snapshot.cwd, cwd); (5) command.len() >= 3; (6) command[1] == '-lc'. При любом нарушении — no-op (вернуть command as-is)",
+        "numbers": [
+          {"value": 3, "kind": "min_argv_len"}
+        ],
+        "formula": null,
+        "gwt": {
+          "given": "command=['bash','-c','echo hi'] (флаг '-c', не '-lc')",
+          "when": "maybe_wrap_shell_lc_with_snapshot",
+          "then": "вернуть command без изменений — no-op на проверке флага"
+        }
+      }
+    },
+    {
+      "id": "SRC-0018/rule/shell-lc-snapshot-wrap-script-format",
+      "src": "SRC-0018",
+      "composition": "rule",
+      "terms": {
+        "condition": "Формат rewritten_script: без overrides → 'if . \\'{snapshot_path}\\' >/dev/null 2>&1; then :; fi\\n\\nexec \\'{original_shell}\\' -c \\'{original_script}\\'{trailing_args}'; с overrides → '{override_captures}\\n\\nif . \\'{snapshot_path}\\' >/dev/null 2>&1; then :; fi\\n\\n{override_exports}\\n\\nexec \\'{original_shell}\\' -c \\'{original_script}\\'{trailing_args}'. Returned argv: [shell_path, '-c', rewritten_script]",
+        "numbers": null,
+        "formula": "rewritten_script = <captures optional> + 'if . SNAP >/dev/null 2>&1; then :; fi' + <restores optional> + 'exec SHELL -c SCRIPT TRAILING'",
+        "gwt": {
+          "given": "command=['/bin/zsh','-lc','echo hi'], snapshot.path=/tmp/snap, нет overrides",
+          "when": "maybe_wrap_shell_lc_with_snapshot",
+          "then": "argv = [session_shell.path, '-c', \"if . '/tmp/snap' >/dev/null 2>&1; then :; fi\\n\\nexec '/bin/zsh' -c 'echo hi'\"]"
+        }
+      }
+    },
+    {
+      "id": "SRC-0018/rule/shell-variable-name-validation",
+      "src": "SRC-0018",
+      "composition": "rule",
+      "terms": {
+        "condition": "is_valid_shell_variable_name: первый символ должен быть '_' или ASCII letter (is_ascii_alphabetic); остальные символы должны быть '_' или ASCII alphanumeric. Имя из нуля символов → false. Невалидные ключи env игнорируются в build_override_exports",
+        "numbers": null,
+        "formula": null,
+        "gwt": {
+          "given": "key='1INVALID'",
+          "when": "is_valid_shell_variable_name('1INVALID')",
+          "then": "false — первый символ digit, не '_' и не letter"
+        }
+      }
+    },
+    {
+      "id": "SRC-0018/rule/shell-single-quote-escape",
+      "src": "SRC-0018",
+      "composition": "rule",
+      "terms": {
+        "condition": "shell_single_quote(input) заменяет каждый ' на '\"'\"' (4 символа: closing quote, opened double quote, single quote as literal, closing double quote, reopening single quote) — безопасное экранирование внутри '...'",
+        "numbers": null,
+        "formula": "output = input.replace('\\'', '\\'\\\"\\'\\\"\\'')",
+        "gwt": {
+          "given": "input = \"it's fine\"",
+          "when": "shell_single_quote",
+          "then": "output = \"it'\\\"'\\\"'s fine\""
+        }
+      }
+    },
+    {
+      "id": "SRC-0018/rule/override-exports-capture-restore",
+      "src": "SRC-0018",
+      "composition": "rule",
+      "terms": {
+        "condition": "build_override_exports сортирует валидные ключи unstable, формирует для каждого идентификатора idx-based capture '__CODEX_SNAPSHOT_OVERRIDE_SET_{idx}=${key+x}' + '__CODEX_SNAPSHOT_OVERRIDE_{idx}=${key-}' до снапшота; после снапшота restore 'if [ -n \"$__CODEX_SNAPSHOT_OVERRIDE_SET_{idx}\" ]; then export {key}=\"$__CODEX_SNAPSHOT_OVERRIDE_{idx}\"; else unset {key}; fi'. Если нет валидных ключей → пустые строки captures и restores",
+        "numbers": null,
+        "formula": "captures_i = __CODEX_SNAPSHOT_OVERRIDE_SET_i + __CODEX_SNAPSHOT_OVERRIDE_i; restores_i = conditional export/unset",
+        "gwt": {
+          "given": "override_env = {'FOO': 'bar'}",
+          "when": "build_override_exports",
+          "then": "captures='__CODEX_SNAPSHOT_OVERRIDE_SET_0=\"${FOO+x}\"\\n__CODEX_SNAPSHOT_OVERRIDE_0=\"${FOO-}\"'; restores='if [ -n \"${__CODEX_SNAPSHOT_OVERRIDE_SET_0}\" ]; then export FOO=\"${__CODEX_SNAPSHOT_OVERRIDE_0}\"; else unset FOO; fi'"
+        }
+      }
+    },
+    {
+      "id": "SRC-0018/rule/thread-id-env-injection",
+      "src": "SRC-0018",
+      "composition": "rule",
+      "terms": {
+        "condition": "maybe_wrap_shell_lc_with_snapshot: если env содержит ключ CODEX_THREAD_ID_ENV_VAR ('CODEX_THREAD_ID') → добавить его в override_env (из exec_env, не из explicit_env_overrides) — сохраняется runtime-only переменная через snapshot",
+        "numbers": null,
+        "formula": null,
+        "gwt": {
+          "given": "env={'CODEX_THREAD_ID': 'thr_123'}, explicit_env_overrides={}",
+          "when": "maybe_wrap_shell_lc_with_snapshot",
+          "then": "override_env={'CODEX_THREAD_ID': 'thr_123'} — добавлено в capture/restore блоки"
+        }
+      }
+    },
+    {
+      "id": "SRC-0018/rule/shell-network-approval-mode",
+      "src": "SRC-0018",
+      "composition": "rule",
+      "terms": {
+        "condition": "ShellRuntime.network_approval_spec: если req.network is None → None; иначе NetworkApprovalSpec{network=req.network.clone(), mode=NetworkApprovalMode::Immediate}. UnifiedExecRuntime использует тот же паттерн но mode=NetworkApprovalMode::Deferred",
+        "numbers": null,
+        "formula": null,
+        "gwt": {
+          "given": "ShellRequest{network=Some(NetworkProxy)} vs UnifiedExecRequest{network=Some(NetworkProxy)}",
+          "when": "network_approval_spec",
+          "then": "Shell → mode=Immediate; UnifiedExec → mode=Deferred"
+        }
+      }
+    },
+    {
+      "id": "SRC-0018/rule/shell-sandbox-preference",
+      "src": "SRC-0018",
+      "composition": "rule",
+      "terms": {
+        "condition": "ShellRuntime, UnifiedExecRuntime и ApplyPatchRuntime имеют единый sandbox preset: sandbox_preference() = SandboxablePreference::Auto, escalate_on_failure() = true",
+        "numbers": null,
+        "formula": null,
+        "gwt": {
+          "given": "ShellRuntime | UnifiedExecRuntime | ApplyPatchRuntime",
+          "when": "Sandboxable trait методы",
+          "then": "sandbox_preference=Auto, escalate_on_failure=true"
+        }
+      }
+    },
+    {
+      "id": "SRC-0018/rule/zsh-fork-gate-conditions",
+      "src": "SRC-0018",
+      "composition": "rule",
+      "terms": {
+        "condition": "try_run_zsh_fork запускается только если все условия: (1) session.services.shell_zsh_path.as_ref() is Some; (2) session.features().enabled(Feature::ShellZshFork) == true; (3) session.user_shell().shell_type == ShellType::Zsh; (4) main_execve_wrapper_exe настроен. При нарушении любого → tracing::warn + Ok(None) (fallback на обычный shell flow, кроме (4) который Err)",
+        "numbers": null,
+        "formula": null,
+        "gwt": {
+          "given": "ShellRequest с backend=ShellCommandZshFork, но session.user_shell().shell_type=Bash",
+          "when": "try_run_zsh_fork",
+          "then": "warn 'ZshFork backend specified, but user shell is not Zsh.' + Ok(None)"
+        }
+      }
+    },
+    {
+      "id": "SRC-0018/rule/zsh-fork-execve-wrapper-required",
+      "src": "SRC-0018",
+      "composition": "rule",
+      "terms": {
+        "condition": "try_run_zsh_fork: если session.services.main_execve_wrapper_exe is None → ToolError::Rejected('zsh fork feature enabled, but execve wrapper is not configured') (не fallback, а жёсткая ошибка — конфигурация противоречива)",
+        "numbers": null,
+        "formula": null,
+        "gwt": {
+          "given": "shell_zsh_path=Some, Feature enabled, shell=Zsh, main_execve_wrapper_exe=None",
+          "when": "try_run_zsh_fork",
+          "then": "Err(ToolError::Rejected('zsh fork feature enabled, but execve wrapper is not configured'))"
+        }
+      }
+    },
+    {
+      "id": "SRC-0018/rule/extract-shell-script-triple",
+      "src": "SRC-0018",
+      "composition": "rule",
+      "terms": {
+        "condition": "extract_shell_script ищет первую тройку в argv через command.windows(3): [program, flag, script] где flag == '-c' → ParsedShellCommand{program, script, login=false}; flag == '-lc' → login=true; при отсутствии такой тройки → ToolError::Rejected('unexpected shell command format for zsh-fork execution')",
+        "numbers": [
+          {"value": 3, "kind": "window_size"}
+        ],
+        "formula": "ParsedShellCommand = first_window3(argv) where window[1] in {'-c', '-lc'}; login = (window[1] == '-lc')",
+        "gwt": {
+          "given": "command=['wrapper','FOO=bar','/bin/zsh','-lc','echo hi']",
+          "when": "extract_shell_script",
+          "then": "Ok(ParsedShellCommand{program='/bin/zsh', script='echo hi', login=true}) — найдена тройка внутри wrapper-а"
+        }
+      }
+    },
+    {
+      "id": "SRC-0018/rule/zsh-fork-effective-timeout",
+      "src": "SRC-0018",
+      "composition": "rule",
+      "terms": {
+        "condition": "try_run_zsh_fork: effective_timeout = Duration::from_millis(req.timeout_ms.unwrap_or(crate::exec::DEFAULT_EXEC_COMMAND_TIMEOUT_MS)); создаётся Stopwatch(effective_timeout) с cancellation_token",
+        "numbers": null,
+        "formula": "effective_timeout_ms = req.timeout_ms.unwrap_or(DEFAULT_EXEC_COMMAND_TIMEOUT_MS)",
+        "gwt": {
+          "given": "req.timeout_ms = None",
+          "when": "try_run_zsh_fork",
+          "then": "effective_timeout = DEFAULT_EXEC_COMMAND_TIMEOUT_MS (constant из crate::exec)"
+        }
+      }
+    },
+    {
+      "id": "SRC-0018/rule/approval-sandbox-permissions-normalization",
+      "src": "SRC-0018",
+      "composition": "rule",
+      "terms": {
+        "condition": "approval_sandbox_permissions: если additional_permissions_preapproved=true И sandbox_permissions=WithAdditionalPermissions → понизить до UseDefault (approval-уровень); иначе вернуть sandbox_permissions as-is",
+        "numbers": null,
+        "formula": null,
+        "gwt": {
+          "given": "sandbox_permissions=WithAdditionalPermissions, additional_permissions_preapproved=true",
+          "when": "approval_sandbox_permissions",
+          "then": "SandboxPermissions::UseDefault — escalated апрув не требуется (уже получен выше)"
+        }
+      }
+    },
+    {
+      "id": "SRC-0018/rule/shell-request-escalation-execution",
+      "src": "SRC-0018",
+      "composition": "rule",
+      "terms": {
+        "condition": "CoreShellActionProvider.shell_request_escalation_execution: UseDefault → EscalationExecution::TurnDefault; RequireEscalated → Unsandboxed; WithAdditionalPermissions с additional_permissions=Some → Permissions::Permissions(full) с sandbox/fs/network policies; WithAdditionalPermissions без additional_permissions → TurnDefault (fallback)",
+        "numbers": null,
+        "formula": null,
+        "gwt": {
+          "given": "sandbox_permissions=RequireEscalated",
+          "when": "shell_request_escalation_execution",
+          "then": "EscalationExecution::Unsandboxed"
+        }
+      }
+    },
+    {
+      "id": "SRC-0018/rule/execve-prompt-rejection-by-policy",
+      "src": "SRC-0018",
+      "composition": "rule",
+      "terms": {
+        "condition": "execve_prompt_is_rejected_by_policy: (AskForApproval::Never, _) → Some(PROMPT_CONFLICT_REASON='approval required by policy, but AskForApproval is set to Never'); (Granular(g), PrefixRule) если !g.allows_rules_approval() → Some(REJECT_RULES_APPROVAL_REASON='approval required by policy rule, but AskForApproval::Granular.rules is false'); (Granular(g), UnmatchedCommandFallback) если !g.allows_sandbox_approval() → Some(REJECT_SANDBOX_APPROVAL_REASON='approval required by policy, but AskForApproval::Granular.sandbox_approval is false'); иначе None",
+        "numbers": null,
+        "formula": null,
+        "gwt": {
+          "given": "approval_policy=Granular{allows_rules_approval=false}, decision_source=PrefixRule",
+          "when": "execve_prompt_is_rejected_by_policy",
+          "then": "Some(REJECT_RULES_APPROVAL_REASON) — prompt отклоняется → EscalationDecision::deny('Execution forbidden by policy')"
+        }
+      }
+    },
+    {
+      "id": "SRC-0018/rule/decision-driven-by-policy",
+      "src": "SRC-0018",
+      "composition": "rule",
+      "terms": {
+        "condition": "CoreShellActionProvider.decision_driven_by_policy: true, если в matched_rules есть хотя бы один rule, который НЕ RuleMatch::HeuristicsRuleMatch И rule.decision() == evaluation.decision. Это различает policy-driven (PrefixRule) от fallback-driven (UnmatchedCommandFallback) источники решения",
+        "numbers": null,
+        "formula": null,
+        "gwt": {
+          "given": "matched_rules = [HeuristicsRuleMatch(Prompt), ExactRule(Allow)], evaluation.decision=Allow",
+          "when": "decision_driven_by_policy",
+          "then": "true — ExactRule non-heuristics matches Allow; decision_source = PrefixRule"
+        }
+      }
+    },
+    {
+      "id": "SRC-0018/rule/needs-escalation-computation",
+      "src": "SRC-0018",
+      "composition": "rule",
+      "terms": {
+        "condition": "CoreShellActionProvider.determine_action: needs_escalation = sandbox_permissions.requires_escalated_permissions() OR decision_driven_by_policy. Если decision_source=PrefixRule → escalation_execution = Unsandboxed (policy требует exact escalation); если UnmatchedCommandFallback → escalation_execution = shell_request_escalation_execution(...)",
+        "numbers": null,
+        "formula": "needs_escalation = sandbox_permissions.requires_escalated_permissions() || decision_driven_by_policy",
+        "gwt": {
+          "given": "sandbox_permissions=UseDefault (requires_escalated=false), decision_driven_by_policy=true, decision_source=PrefixRule",
+          "when": "determine_action",
+          "then": "needs_escalation=true, escalation_execution=Unsandboxed"
+        }
+      }
+    },
+    {
+      "id": "SRC-0018/rule/enable-shell-wrapper-parsing-disabled",
+      "src": "SRC-0018",
+      "composition": "rule",
+      "terms": {
+        "condition": "ENABLE_INTERCEPTED_EXEC_POLICY_SHELL_WRAPPER_PARSING = false (const). Следствие: в evaluate_intercepted_exec_policy используется только одна candidate command = join_program_and_argv(program, argv), used_complex_parsing=false. Парсинг shell-wrapper скриптов через parse_shell_lc_plain_commands / parse_shell_lc_single_command_prefix отключён по умолчанию — path-sensitive rules полагаются на authoritative execve interception",
+        "numbers": null,
+        "formula": null,
+        "gwt": {
+          "given": "ENABLE_INTERCEPTED_EXEC_POLICY_SHELL_WRAPPER_PARSING=false, program='/bin/zsh', argv=['-lc','rm -rf /tmp']",
+          "when": "evaluate_intercepted_exec_policy",
+          "then": "commands=['/bin/zsh','-lc','rm -rf /tmp'] (единая команда), used_complex_parsing=false"
+        }
+      }
+    },
+    {
+      "id": "SRC-0018/rule/review-decision-mapping",
+      "src": "SRC-0018",
+      "composition": "rule",
+      "terms": {
+        "condition": "CoreShellActionProvider.process_decision для Decision::Prompt маппит ReviewDecision так: Approved|ApprovedForSession|ApprovedExecpolicyAmendment → escalate если needs_escalation иначе run(); NetworkPolicyAmendment::Allow → то же что Approved; NetworkPolicyAmendment::Deny → deny('User denied execution'); Denied(guardian_id=Some) → deny(guardian_rejection_message); Denied(guardian_id=None) → deny('User denied execution'); TimedOut → deny(guardian_timeout_message()); Abort → deny('User cancelled execution')",
+        "numbers": null,
+        "formula": null,
+        "gwt": {
+          "given": "ReviewDecision::TimedOut",
+          "when": "process_decision(Prompt, ...)",
+          "then": "EscalationDecision::deny(Some(guardian_timeout_message())) — пользователь не ответил вовремя"
+        }
+      }
+    },
+    {
+      "id": "SRC-0018/rule/core-shell-command-executor-env-overlay",
+      "src": "SRC-0018",
+      "composition": "rule",
+      "terms": {
+        "condition": "CoreShellCommandExecutor.run(env_overlay): ТОЛЬКО ключи ['CODEX_ESCALATE_SOCKET', 'EXEC_WRAPPER'] мержатся из env_overlay в self.env.clone(); остальные переменные EscalationSession.env() игнорируются для исходного выполнения (остаются только в escalation-адаптере)",
+        "numbers": null,
+        "formula": null,
+        "gwt": {
+          "given": "env_overlay={'CODEX_ESCALATE_SOCKET':'5', 'EXEC_WRAPPER':'/path/wrapper', 'OTHER':'x'}, self.env={'PATH':'/usr/bin'}",
+          "when": "run",
+          "then": "exec_env={'PATH':'/usr/bin','CODEX_ESCALATE_SOCKET':'5','EXEC_WRAPPER':'/path/wrapper'}; 'OTHER' не скопирован"
+        }
+      }
+    },
+    {
+      "id": "SRC-0018/rule/prepare-escalated-exec-argv-nonempty",
+      "src": "SRC-0018",
+      "composition": "rule",
+      "terms": {
+        "condition": "CoreShellCommandExecutor.prepare_escalated_exec: если argv.first() is None → anyhow!('intercepted exec request must contain argv[0]'). prepare_sandboxed_exec: если command.split_first() fails → anyhow!('prepared command must not be empty')",
+        "numbers": null,
+        "formula": null,
+        "gwt": {
+          "given": "argv = []",
+          "when": "prepare_escalated_exec(program, argv, workdir, env, execution)",
+          "then": "Err(anyhow!('intercepted exec request must contain argv[0]'))"
+        }
+      }
+    },
+    {
+      "id": "SRC-0018/rule/prepared-exec-arg0-unsandboxed",
+      "src": "SRC-0018",
+      "composition": "rule",
+      "terms": {
+        "condition": "В ветке EscalationExecution::Unsandboxed: PreparedExec{command=join_program_and_argv(program, argv), cwd=workdir.to_path_buf(), env, arg0=Some(first_arg)} — arg0 явно задаётся как argv[0] оригинала (не program path)",
+        "numbers": null,
+        "formula": null,
+        "gwt": {
+          "given": "program='/usr/bin/ls', argv=['ls','-la','/'], execution=Unsandboxed",
+          "when": "prepare_escalated_exec",
+          "then": "PreparedExec{command=['/usr/bin/ls','-la','/'], arg0=Some('ls'), env, cwd=workdir}"
+        }
+      }
+    },
+    {
+      "id": "SRC-0018/rule/join-program-and-argv-drops-argv0",
+      "src": "SRC-0018",
+      "composition": "rule",
+      "terms": {
+        "condition": "join_program_and_argv заменяет argv[0] на program.to_string_lossy(): итог = [program_string, argv[1], argv[2], ...] — оригинальный argv[0] отбрасывается, чтобы не дублировать имя программы как user-аргумент",
+        "numbers": null,
+        "formula": "output = once(program.to_string_lossy()) ++ argv.iter().skip(1).cloned()",
+        "gwt": {
+          "given": "program='/usr/bin/ls', argv=['ls','-la','/tmp']",
+          "when": "join_program_and_argv",
+          "then": "['/usr/bin/ls', '-la', '/tmp'] — argv[0]='ls' отброшен"
+        }
+      }
+    },
+    {
+      "id": "SRC-0018/rule/map-exec-result-timeout-vs-denied",
+      "src": "SRC-0018",
+      "composition": "rule",
+      "terms": {
+        "condition": "map_exec_result: если result.timed_out → ToolError::Codex(CodexErr::Sandbox(SandboxErr::Timeout{output})); иначе если is_likely_sandbox_denied(sandbox, output) → SandboxErr::Denied{output, network_policy_decision=None}; иначе Ok(output). Приоритет: timeout > denied > success",
+        "numbers": null,
+        "formula": null,
+        "gwt": {
+          "given": "ExecResult{timed_out=true, exit_code=-1, ...}",
+          "when": "map_exec_result(sandbox, result)",
+          "then": "Err(ToolError::Codex(Sandbox(Timeout{output})))"
+        }
+      }
+    },
+    {
+      "id": "SRC-0018/rule/unified-exec-remote-skip-wrap",
+      "src": "SRC-0018",
+      "composition": "rule",
+      "terms": {
+        "condition": "UnifiedExecRuntime.run: если turn.environment.is_remote() == true → пропустить maybe_wrap_shell_lc_with_snapshot и взять base_command.to_vec() как есть. Также unified_exec zsh-fork НЕ поддерживается когда environment remote: ToolError::Rejected('unified_exec zsh-fork is not supported when exec_server_url is configured')",
+        "numbers": null,
+        "formula": null,
+        "gwt": {
+          "given": "turn.environment.is_remote()=true, shell_mode=ZshFork",
+          "when": "UnifiedExecRuntime.run внутри prepared branch",
+          "then": "ToolError::Rejected('unified_exec zsh-fork is not supported when exec_server_url is configured')"
+        }
+      }
+    },
+    {
+      "id": "SRC-0018/rule/unified-exec-environment-required",
+      "src": "SRC-0018",
+      "composition": "rule",
+      "terms": {
+        "condition": "UnifiedExecRuntime.run: если turn.environment is None (при попытке вызвать manager.open_session_with_exec_env) → ToolError::Rejected('exec_command is unavailable in this session'). Проверка применяется и в zsh-fork branch, и в fallback (direct execution)",
+        "numbers": null,
+        "formula": null,
+        "gwt": {
+          "given": "turn.environment=None",
+          "when": "UnifiedExecRuntime.run достиг open_session_with_exec_env",
+          "then": "Err(ToolError::Rejected('exec_command is unavailable in this session'))"
+        }
+      }
+    },
+    {
+      "id": "SRC-0018/rule/unified-exec-sandbox-denied-mapping",
+      "src": "SRC-0018",
+      "composition": "rule",
+      "terms": {
+        "condition": "UnifiedExecRuntime.run: manager.open_session_with_exec_env ошибки маппятся: UnifiedExecError::SandboxDenied{output} → ToolError::Codex(CodexErr::Sandbox(SandboxErr::Denied{output, network_policy_decision=None})); остальные ошибки → ToolError::Rejected(err.to_string())",
+        "numbers": null,
+        "formula": null,
+        "gwt": {
+          "given": "manager.open_session_with_exec_env -> UnifiedExecError::SandboxDenied{output}",
+          "when": "UnifiedExecRuntime.run маппинг ошибки",
+          "then": "Err(ToolError::Codex(Sandbox(Denied{output, network_policy_decision=None})))"
+        }
+      }
+    },
+    {
+      "id": "SRC-0018/rule/code-mode-payload-contract-execute",
+      "src": "SRC-0018",
+      "composition": "rule",
+      "terms": {
+        "condition": "CodeModeExecuteHandler.handle принимает только: tool_name.namespace is None И tool_name.name.as_str() == PUBLIC_TOOL_NAME И payload=ToolPayload::Custom{input}. Любое другое сочетание → FunctionCallError::RespondToModel('{PUBLIC_TOOL_NAME} expects raw JavaScript source text')",
+        "numbers": null,
+        "formula": null,
+        "gwt": {
+          "given": "tool_name.namespace=Some('ns'), name='code_mode', payload=Custom{...}",
+          "when": "handle",
+          "then": "Err 'code_mode expects raw JavaScript source text' — namespace должен быть None"
+        }
+      }
+    },
+    {
+      "id": "SRC-0018/rule/code-mode-payload-contract-wait",
+      "src": "SRC-0018",
+      "composition": "rule",
+      "terms": {
+        "condition": "CodeModeWaitHandler.handle принимает только: tool_name.namespace is None И tool_name.name.as_str() == WAIT_TOOL_NAME И payload=ToolPayload::Function{arguments}. Любое другое → FunctionCallError::RespondToModel('{WAIT_TOOL_NAME} expects JSON arguments')",
+        "numbers": null,
+        "formula": null,
+        "gwt": {
+          "given": "tool_name='wait', namespace=None, payload=Custom{...}",
+          "when": "handle",
+          "then": "Err 'wait expects JSON arguments' — payload должен быть Function{arguments}"
+        }
+      }
+    },
+    {
+      "id": "SRC-0018/rule/exec-wait-args-defaults",
+      "src": "SRC-0018",
+      "composition": "rule",
+      "terms": {
+        "condition": "ExecWaitArgs serde-дефолты: yield_time_ms default = default_wait_yield_time_ms() → DEFAULT_WAIT_YIELD_TIME_MS (from codex_code_mode); max_tokens default = None; terminate default = false",
+        "numbers": null,
+        "formula": null,
+        "gwt": {
+          "given": "arguments='{\"cell_id\":\"c1\"}'",
+          "when": "parse_arguments::<ExecWaitArgs>",
+          "then": "ExecWaitArgs{cell_id:'c1', yield_time_ms=DEFAULT_WAIT_YIELD_TIME_MS, max_tokens=None, terminate=false}"
+        }
+      }
+    },
+    {
+      "id": "SRC-0018/rule/code-mode-wall-time-rounding",
+      "src": "SRC-0018",
+      "composition": "rule",
+      "terms": {
+        "condition": "prepend_script_status: wall_time_seconds = ((wall_time.as_secs_f32()) * 10.0).round() / 10.0 — округление до 0.1 секунды; header = '{status}\\nWall time {wall_time_seconds:.1} seconds\\nOutput:\\n' вставляется как items[0] InputText",
+        "numbers": [
+          {"value": 10.0, "kind": "rounding_multiplier_for_tenths"}
+        ],
+        "formula": "wall_time_seconds = round(wall_time_secs_f32 * 10.0) / 10.0",
+        "gwt": {
+          "given": "wall_time=1.256s",
+          "when": "prepend_script_status",
+          "then": "header = '{status}\\nWall time 1.3 seconds\\nOutput:\\n' (округление 1.256 → 1.3)"
+        }
+      }
+    },
+    {
+      "id": "SRC-0018/rule/code-mode-script-status-strings",
+      "src": "SRC-0018",
+      "composition": "rule",
+      "terms": {
+        "condition": "format_script_status: RuntimeResponse::Yielded{cell_id} → 'Script running with cell ID {cell_id}'; Terminated → 'Script terminated'; Result{error_text=None} → 'Script completed'; Result{error_text=Some} → 'Script failed'",
+        "numbers": null,
+        "formula": null,
+        "gwt": {
+          "given": "RuntimeResponse::Result{error_text=Some('x')}",
+          "when": "format_script_status",
+          "then": "'Script failed'"
+        }
+      }
+    },
+    {
+      "id": "SRC-0018/rule/code-mode-truncation-branch",
+      "src": "SRC-0018",
+      "composition": "rule",
+      "terms": {
+        "condition": "truncate_code_mode_result выбирает ветку: policy=TruncationPolicy::Tokens(resolve_max_tokens(max_output_tokens)); если все items = InputText → formatted_truncate_text_content_items_with_policy; иначе (смесь text+image) → truncate_function_output_items_with_policy",
+        "numbers": null,
+        "formula": null,
+        "gwt": {
+          "given": "items=[InputText,InputImage]",
+          "when": "truncate_code_mode_result",
+          "then": "truncate_function_output_items_with_policy выбрана (не all-text)"
+        }
+      }
+    },
+    {
+      "id": "SRC-0018/rule/code-mode-result-replace-stored-values",
+      "src": "SRC-0018",
+      "composition": "rule",
+      "terms": {
+        "condition": "handle_runtime_response для RuntimeResponse::Result: ВСЕГДА вызывает session.services.code_mode_service.replace_stored_values(stored_values) ДО добавления error text и усечения — обновляет сохранённые значения code_mode, даже если error_text Some",
+        "numbers": null,
+        "formula": null,
+        "gwt": {
+          "given": "RuntimeResponse::Result{stored_values={'x':1}, error_text=Some('boom')}",
+          "when": "handle_runtime_response",
+          "then": "replace_stored_values({'x':1}) вызван, затем 'Script error:\\nboom' добавлен, success=false"
+        }
+      }
+    },
+    {
+      "id": "SRC-0018/rule/code-mode-service-turn-worker-gated",
+      "src": "SRC-0018",
+      "composition": "rule",
+      "terms": {
+        "condition": "CodeModeService.start_turn_worker: если turn.features.enabled(Feature::CodeMode) == false → return None. Только при включенной фиче создаются ExecContext, ToolCallRuntime, CoreTurnHost и запускается inner.start_turn_worker",
+        "numbers": null,
+        "formula": null,
+        "gwt": {
+          "given": "turn.features.enabled(Feature::CodeMode) = false",
+          "when": "start_turn_worker",
+          "then": "None — worker не создаётся, code_mode не активен в турне"
+        }
+      }
+    },
+    {
+      "id": "SRC-0018/rule/code-mode-notify-empty-text-noop",
+      "src": "SRC-0018",
+      "composition": "rule",
+      "terms": {
+        "condition": "CoreTurnHost.notify: если text.trim().is_empty() → return Ok(()) без inject_response_items. Только непустой текст (после trim) инжектится как CustomToolCallOutput",
+        "numbers": null,
+        "formula": null,
+        "gwt": {
+          "given": "text='   \\t\\n'",
+          "when": "CoreTurnHost.notify",
+          "then": "Ok(()) — ничего не инжектится (text пустой после trim)"
+        }
+      }
+    },
+    {
+      "id": "SRC-0018/rule/code-mode-notify-injected-format",
+      "src": "SRC-0018",
+      "composition": "rule",
+      "terms": {
+        "condition": "CoreTurnHost.notify формирует ResponseInputItem::CustomToolCallOutput{call_id, name=Some(PUBLIC_TOOL_NAME), output=FunctionCallOutputPayload::from_text(text)} — name всегда = PUBLIC_TOOL_NAME независимо от оригинального tool_name",
+        "numbers": null,
+        "formula": null,
+        "gwt": {
+          "given": "call_id='abc', cell_id='c1', text='hello'",
+          "when": "CoreTurnHost.notify",
+          "then": "inject_response_items([CustomToolCallOutput{call_id='abc', name=Some('code_mode'=PUBLIC_TOOL_NAME), output=text}])"
+        }
+      }
+    },
+    {
+      "id": "SRC-0018/rule/code-mode-self-invoke-forbidden",
+      "src": "SRC-0018",
+      "composition": "rule",
+      "terms": {
+        "condition": "call_nested_tool: если tool_name.namespace is None И tool_name.name == PUBLIC_TOOL_NAME → FunctionCallError::RespondToModel('{PUBLIC_TOOL_NAME} cannot invoke itself'). Это защита от рекурсивного self-invoke code_mode внутри code_mode",
+        "numbers": null,
+        "formula": null,
+        "gwt": {
+          "given": "tool_name={namespace:None, name:'code_mode'=PUBLIC_TOOL_NAME}",
+          "when": "call_nested_tool",
+          "then": "Err 'code_mode cannot invoke itself'"
+        }
+      }
+    },
+    {
+      "id": "SRC-0018/rule/nested-tool-payload-selection",
+      "src": "SRC-0018",
+      "composition": "rule",
+      "terms": {
+        "condition": "build_nested_tool_payload: если spec = Some(Freeform(_)) → CodeModeToolKind::Freeform → build_freeform_tool_payload (input=String → Custom{input}; иначе 'expects a string input'); иначе (Some(non-Freeform) или None→err) → Function → build_function_tool_payload (None→'{}', Object→serde_json::to_string, иначе 'expects a JSON object for arguments'); spec=None → 'tool `{tool_name}` is not enabled in {PUBLIC_TOOL_NAME}'",
+        "numbers": null,
+        "formula": null,
+        "gwt": {
+          "given": "spec=Some(Freeform), input=Some(JsonValue::String('text'))",
+          "when": "build_nested_tool_payload",
+          "then": "Ok(ToolPayload::Custom{input='text'})"
+        }
+      }
+    },
+    {
+      "id": "SRC-0018/rule/nested-call-id-format",
+      "src": "SRC-0018",
+      "composition": "rule",
+      "terms": {
+        "condition": "call_nested_tool: call_id формируется как '{PUBLIC_TOOL_NAME}-{uuid::Uuid::new_v4()}' — префикс PUBLIC_TOOL_NAME + '-' + UUID v4 идентифицирует вложенный tool-вызов происходящий из code_mode runtime",
+        "numbers": null,
+        "formula": "call_id = PUBLIC_TOOL_NAME + '-' + uuid_v4()",
+        "gwt": {
+          "given": "PUBLIC_TOOL_NAME='code_mode', uuid='550e8400-e29b-41d4-a716-446655440000'",
+          "when": "call_nested_tool",
+          "then": "call_id='code_mode-550e8400-e29b-41d4-a716-446655440000'"
+        }
+      }
+    },
+    {
+      "id": "SRC-0018/rule/nested-tool-source-codemode",
+      "src": "SRC-0018",
+      "composition": "rule",
+      "terms": {
+        "condition": "call_nested_tool вызывает tool_runtime.handle_tool_call_with_source(call, ToolCallSource::CodeMode, cancellation_token) — все вложенные вызовы из code_mode помечены source=CodeMode (в отличие от JS_REPL где source=JsRepl)",
+        "numbers": null,
+        "formula": null,
+        "gwt": null
+      }
+    },
+    {
+      "id": "SRC-0018/rule/serialize-function-tool-arguments",
+      "src": "SRC-0018",
+      "composition": "rule",
+      "terms": {
+        "condition": "serialize_function_tool_arguments: None → Ok('{}'); Some(JsonValue::Object(map)) → serde_json::to_string (Err → 'failed to serialize tool `X` arguments'); Some(non-Object) → Err 'tool `X` expects a JSON object for arguments'",
+        "numbers": null,
+        "formula": null,
+        "gwt": {
+          "given": "input = Some(JsonValue::Array(...))",
+          "when": "serialize_function_tool_arguments('foo', input)",
+          "then": "Err('tool `foo` expects a JSON object for arguments')"
+        }
+      }
+    },
+    {
+      "id": "SRC-0018/rule/image-detail-mapping",
+      "src": "SRC-0018",
+      "composition": "rule",
+      "terms": {
+        "condition": "IntoProtocol<ImageDetail> для CodeModeImageDetail — прямой 1:1 маппинг: Auto→Auto, Low→Low, High→High, Original→Original. Каждое значение code_mode-варианта имеет эквивалент в codex_protocol",
+        "numbers": null,
+        "formula": null,
+        "gwt": {
+          "given": "CodeModeImageDetail::Original",
+          "when": "IntoProtocol::into_protocol",
+          "then": "ImageDetail::Original"
+        }
+      }
+    },
+    {
+      "id": "SRC-0018/rule/js-repl-default-timeout",
+      "src": "SRC-0018",
+      "composition": "rule",
+      "terms": {
+        "condition": "JsReplManager.execute: timeout для tokio::time::timeout = Duration::from_millis(args.timeout_ms.unwrap_or(30_000)). По умолчанию 30 секунд ожидания ответа kernel. При timeout → reset_kernel + 'js_repl execution timed out; kernel reset, rerun your request'",
+        "numbers": [
+          {"value": 30000, "kind": "default_timeout_ms"}
+        ],
+        "formula": "timeout_ms = args.timeout_ms.unwrap_or(30_000)",
+        "gwt": {
+          "given": "args.timeout_ms = None, kernel не отвечает",
+          "when": "execute ждёт 30 секунд",
+          "then": "reset_kernel + Err 'js_repl execution timed out; kernel reset, rerun your request'"
+        }
+      }
+    },
+    {
+      "id": "SRC-0018/rule/js-repl-exec-lock-single",
+      "src": "SRC-0018",
+      "composition": "rule",
+      "terms": {
+        "condition": "JsReplManager.exec_lock = Semaphore(1) — только один execute активен одновременно. Также reset() и interrupt_turn_exec() требуют acquire_owned. При Err (closed semaphore) → 'js_repl execution unavailable'",
+        "numbers": [
+          {"value": 1, "kind": "semaphore_permits"}
+        ],
+        "formula": null,
+        "gwt": {
+          "given": "Semaphore(1), один execute в процессе",
+          "when": "второй execute пытается acquire",
+          "then": "второй ждёт, пока первый не завершит (strict serialization)"
+        }
+      }
+    },
+    {
+      "id": "SRC-0018/rule/js-repl-stderr-tail-limits",
+      "src": "SRC-0018",
+      "composition": "rule",
+      "terms": {
+        "condition": "push_stderr_tail_line трейты: max_line_bytes = min(JS_REPL_STDERR_TAIL_LINE_MAX_BYTES=512, JS_REPL_STDERR_TAIL_MAX_BYTES=4096); пока lines.len() >= 20 OR stderr_tail_bytes_with_candidate > 4096 → pop_front. Итог: ≤20 строк, каждая ≤512 байт (UTF-8 safe), суммарно ≤4096 байт",
+        "numbers": [
+          {"value": 20, "kind": "line_limit", "const": "JS_REPL_STDERR_TAIL_LINE_LIMIT"},
+          {"value": 512, "kind": "line_max_bytes", "const": "JS_REPL_STDERR_TAIL_LINE_MAX_BYTES"},
+          {"value": 4096, "kind": "total_max_bytes", "const": "JS_REPL_STDERR_TAIL_MAX_BYTES"}
+        ],
+        "formula": "max_line_bytes = min(512, 4096) = 512; pop while lines >= 20 OR total + candidate > 4096",
+        "gwt": {
+          "given": "lines содержит 20 строк (600 байт суммарно), новая candidate 'err' (3 байт)",
+          "when": "push_stderr_tail_line",
+          "then": "pop_front → 19 строк + 'err' push_back = 20 строк"
+        }
+      }
+    },
+    {
+      "id": "SRC-0018/rule/js-repl-exec-id-log-truncation",
+      "src": "SRC-0018",
+      "composition": "rule",
+      "terms": {
+        "condition": "truncate_id_list: если ids.len() <= JS_REPL_EXEC_ID_LOG_LIMIT (8) → return clone; иначе return ids[..8] + ['...+{N-8}']. Используется в warn-логах при неожиданном завершении kernel для ограничения размера лога",
+        "numbers": [
+          {"value": 8, "kind": "exec_id_log_limit", "const": "JS_REPL_EXEC_ID_LOG_LIMIT"}
+        ],
+        "formula": null,
+        "gwt": {
+          "given": "ids = ['a','b','c','d','e','f','g','h','i','j'] (10 штук)",
+          "when": "truncate_id_list",
+          "then": "['a','b','c','d','e','f','g','h','...+2']"
+        }
+      }
+    },
+    {
+      "id": "SRC-0018/rule/js-repl-model-diag-limits",
+      "src": "SRC-0018",
+      "composition": "rule",
+      "terms": {
+        "condition": "format_model_kernel_failure_details обрезает stream_error через truncate_utf8_prefix_by_bytes(JS_REPL_MODEL_DIAG_ERROR_MAX_BYTES=256); stderr_tail через truncate_utf8_prefix_by_bytes(JS_REPL_MODEL_DIAG_STDERR_MAX_BYTES=1024); при Err serde_json::to_string → fallback '{\"reason\":\"serialization_error\",\"error\":\"{err}\"}' — финальный payload формат: 'js_repl diagnostics: {encoded}'",
+        "numbers": [
+          {"value": 256, "kind": "model_diag_error_max_bytes", "const": "JS_REPL_MODEL_DIAG_ERROR_MAX_BYTES"},
+          {"value": 1024, "kind": "model_diag_stderr_max_bytes", "const": "JS_REPL_MODEL_DIAG_STDERR_MAX_BYTES"}
+        ],
+        "formula": null,
+        "gwt": {
+          "given": "reason='write_failed', stream_error=string 300 bytes, snapshot.stderr_tail=2000 bytes",
+          "when": "format_model_kernel_failure_details",
+          "then": "stream_error обрезано до 256 byte boundary, stderr_tail до 1024 byte boundary, формат 'js_repl diagnostics: {json}'"
+        }
+      }
+    },
+    {
+      "id": "SRC-0018/rule/js-repl-write-error-diagnostic-gate",
+      "src": "SRC-0018",
+      "composition": "rule",
+      "terms": {
+        "condition": "should_include_model_diagnostics_for_write_error: true, если is_kernel_status_exited(snapshot.status)=true (starts_with 'exited(') ИЛИ err_message.to_ascii_lowercase().contains('broken pipe'). Только тогда write-ошибка сопровождается kernel_debug_snapshot в сообщении модели — иначе просто err_message",
+        "numbers": null,
+        "formula": null,
+        "gwt": {
+          "given": "err_message='failed to write to kernel: broken pipe', snapshot.status='running'",
+          "when": "should_include_model_diagnostics_for_write_error",
+          "then": "true (содержит 'broken pipe') → выдать with_model_kernel_failure_message"
+        }
+      }
+    },
+    {
+      "id": "SRC-0018/rule/js-repl-top-level-exec-state-transitions",
+      "src": "SRC-0018",
+      "composition": "rule",
+      "terms": {
+        "condition": "register_top_level_exec: если FreshKernel{turn_id==new_turn_id} → FreshKernel{turn_id, exec_id=Some}; иначе (Idle|ReusedKernelPending|Submitted|FreshKernel{diff_turn_id}) → ReusedKernelPending{turn_id, exec_id}. mark_top_level_exec_submitted: FreshKernel{exec_id=Some(active)} или ReusedKernelPending{active} с active_exec_id==exec_id → Submitted; иначе no-op. clear_if_matches(exec_id): если registered_exec_id==exec_id → Idle",
+        "numbers": null,
+        "formula": null,
+        "gwt": {
+          "given": "state=FreshKernel{turn_id='t1', exec_id=None}, register_top_level_exec('e1','t1')",
+          "when": "register_top_level_exec",
+          "then": "state = FreshKernel{turn_id='t1', exec_id=Some('e1')} (переход без смены варианта — тот же kernel)"
+        }
+      }
+    },
+    {
+      "id": "SRC-0018/rule/js-repl-interrupt-reset-condition",
+      "src": "SRC-0018",
+      "composition": "rule",
+      "terms": {
+        "condition": "TopLevelExecState.should_reset_for_interrupt(turn_id): Idle → false; FreshKernel{active_turn_id} → active_turn_id==turn_id; Submitted{active_turn_id} → active_turn_id==turn_id; ReusedKernelPending → false (всегда). То есть reset делается ТОЛЬКО если exec относится к тому же турну И это FreshKernel или Submitted; ReusedKernelPending НЕ считается принадлежащим текущему турну",
+        "numbers": null,
+        "formula": null,
+        "gwt": {
+          "given": "state=ReusedKernelPending{turn_id='t1', exec_id='e1'}, interrupt turn_id='t1'",
+          "when": "should_reset_for_interrupt('t1')",
+          "then": "false — не сбрасываем даже при совпадении turn_id (kernel переиспользован)"
+        }
+      }
+    },
+    {
+      "id": "SRC-0018/rule/js-repl-image-url-scheme-validation",
+      "src": "SRC-0018",
+      "composition": "rule",
+      "terms": {
+        "condition": "validate_emitted_image_url: если image_url.get(..5).is_some_and(scheme.eq_ignore_ascii_case('data:')) → Ok(()); иначе Err 'codex.emitImage only accepts data URLs'. Только data: URL (любой регистр) допускаются как emitted image",
+        "numbers": [
+          {"value": 5, "kind": "scheme_prefix_len"}
+        ],
+        "formula": null,
+        "gwt": {
+          "given": "image_url='https://example.com/img.png'",
+          "when": "validate_emitted_image_url",
+          "then": "Err('codex.emitImage only accepts data URLs')"
+        }
+      }
+    },
+    {
+      "id": "SRC-0018/rule/js-repl-internal-tool-names",
+      "src": "SRC-0018",
+      "composition": "rule",
+      "terms": {
+        "condition": "is_js_repl_internal_tool(name): true если name in ['js_repl', 'js_repl_reset']. Используется в run_tool_request для запрета self-invoke: 'js_repl cannot invoke itself'",
+        "numbers": null,
+        "formula": null,
+        "gwt": {
+          "given": "name='js_repl_reset'",
+          "when": "is_js_repl_internal_tool",
+          "then": "true → nested-call отклонён как self-invoke"
+        }
+      }
+    },
+    {
+      "id": "SRC-0018/rule/js-repl-parallel-mcp-empty",
+      "src": "SRC-0018",
+      "composition": "rule",
+      "terms": {
+        "condition": "В run_tool_request ToolRouter::from_config получает parallel_mcp_server_names = HashSet::new() — пустой. JS REPL диспатчит nested-вызовы напрямую, без parallel scheduling lock от ToolCallRuntime (комментарий в коде: 'JS REPL dispatches nested tool calls directly, not through `ToolCallRuntime`'s parallel scheduling lock')",
+        "numbers": null,
+        "formula": null,
+        "gwt": null
+      }
+    },
+    {
+      "id": "SRC-0018/rule/js-repl-split-exec-result-content",
+      "src": "SRC-0018",
+      "composition": "rule",
+      "terms": {
+        "condition": "split_exec_result_content_items: если content_items[0] = InputText → первый элемент remove (получить text), остаток = content_items; если [0] = InputImage или None → (String::new(), content_items). Инвариант: первый элемент всегда либо text-output, либо первый content item (если output пустой)",
+        "numbers": null,
+        "formula": null,
+        "gwt": {
+          "given": "content_items=[InputImage(url)]",
+          "when": "split_exec_result_content_items",
+          "then": "('', [InputImage(url)]) — output пустой, картинка остаётся"
+        }
+      }
+    },
+    {
+      "id": "SRC-0018/rule/js-repl-build-exec-result-prepends-output",
+      "src": "SRC-0018",
+      "composition": "rule",
+      "terms": {
+        "condition": "build_exec_result_content_items: prepend InputText{text=output} первым элементом, за ним collected content_items (emitted images через record_exec_content_item). Симметрия со split_exec_result_content_items — что прикрепляем на write, то разделяем на read",
+        "numbers": null,
+        "formula": "result = [InputText{text=output}] ++ content_items",
+        "gwt": {
+          "given": "output='console.log done', content_items=[InputImage(data_url)]",
+          "when": "build_exec_result_content_items",
+          "then": "[InputText{text='console.log done'}, InputImage(data_url)]"
+        }
+      }
+    },
+    {
+      "id": "SRC-0018/rule/js-repl-kill-wait-timeout",
+      "src": "SRC-0018",
+      "composition": "rule",
+      "terms": {
+        "condition": "kill_kernel_child: tokio::time::timeout(Duration::from_secs(2), guard.wait()) — 2 секунды на wait после start_kill. Err(wait err) → warn 'failed while waiting for js_repl kernel exit'; Ok(Err) → аналогично; timeout → warn 'timed out waiting for js_repl kernel to exit after kill'",
+        "numbers": [
+          {"value": 2, "kind": "kill_wait_seconds"}
+        ],
+        "formula": null,
+        "gwt": {
+          "given": "kernel процесс не реагирует на SIGKILL 3 секунды",
+          "when": "kill_kernel_child после start_kill",
+          "then": "warn 'timed out waiting for js_repl kernel to exit after kill' (прошло 2 секунды)"
+        }
+      }
+    },
+    {
+      "id": "SRC-0018/rule/js-repl-tool-response-text-preview-limit",
+      "src": "SRC-0018",
+      "composition": "rule",
+      "terms": {
+        "condition": "summarize_*_payload обрезает payload_text_preview через truncate_text(text, TruncationPolicy::Bytes(JS_REPL_TOOL_RESPONSE_TEXT_PREVIEW_MAX_BYTES=512)); payload_text_length = text.len() (не обрезанный); payload_text_preview формируется только если text не пустой",
+        "numbers": [
+          {"value": 512, "kind": "tool_response_text_preview_max_bytes", "const": "JS_REPL_TOOL_RESPONSE_TEXT_PREVIEW_MAX_BYTES"}
+        ],
+        "formula": null,
+        "gwt": {
+          "given": "text=1000 bytes",
+          "when": "summarize_text_payload",
+          "then": "payload_text_length=1000, payload_text_preview=truncated to 512 bytes"
+        }
+      }
+    },
+    {
+      "id": "SRC-0018/rule/js-repl-node-version-comparison",
+      "src": "SRC-0018",
+      "composition": "rule",
+      "terms": {
+        "condition": "ensure_node_version: если found < required → Err 'Node runtime too old for js_repl (resolved {node_path}): found v{found}, requires >= v{required}. Install/update Node or set js_repl_node_path to a newer runtime.'. Сравнение по лексикографическому порядку major.minor.patch (derive(Ord))",
+        "numbers": null,
+        "formula": "compare: (major, minor, patch) lexicographic order",
+        "gwt": {
+          "given": "required=NodeVersion{major=22, minor=0, patch=0}, found=NodeVersion{major=18, minor=17, patch=0}",
+          "when": "ensure_node_version",
+          "then": "Err('Node runtime too old ... found v18.17.0, requires >= v22.0.0. ...')"
+        }
+      }
+    },
+    {
+      "id": "SRC-0018/rule/js-repl-node-version-parse",
+      "src": "SRC-0018",
+      "composition": "rule",
+      "terms": {
+        "condition": "NodeVersion::parse: trim → trim_start_matches('v') → split_on ['.', '-', '+'] → три обязательные части (major, minor, patch) каждая parsed as u64. Пропуск любой части → 'missing major/minor/patch version'; parse error → 'invalid {part} version: {err}'",
+        "numbers": null,
+        "formula": null,
+        "gwt": {
+          "given": "input='v18.17.0-lts'",
+          "when": "NodeVersion::parse",
+          "then": "Ok(NodeVersion{major=18, minor=17, patch=0}) — '-lts' отделяется при split, остаётся '0'"
+        }
+      }
+    },
+    {
+      "id": "SRC-0018/rule/js-repl-node-resolution-priority",
+      "src": "SRC-0018",
+      "composition": "rule",
+      "terms": {
+        "condition": "resolve_node приоритет: (1) env CODEX_JS_REPL_NODE_PATH если path exists; (2) config_path (переданный в JsReplHandle::with_node_path) если exists; (3) which::which('node'). При отсутствии всех — None → 'Node runtime not found; install Node or set CODEX_JS_REPL_NODE_PATH'",
+        "numbers": null,
+        "formula": null,
+        "gwt": {
+          "given": "CODEX_JS_REPL_NODE_PATH=/nonexistent, config_path=/usr/local/bin/node (exists), PATH contains node",
+          "when": "resolve_node",
+          "then": "(1) env path не exists → пропуск; (2) config_path exists → вернуть /usr/local/bin/node"
+        }
+      }
+    },
+    {
+      "id": "SRC-0018/rule/js-repl-kernel-env-vars",
+      "src": "SRC-0018",
+      "composition": "rule",
+      "terms": {
+        "condition": "start_kernel формирует env: create_env(shell_environment_policy, thread_id) + extend(dependency_env) + CODEX_JS_TMP_DIR=tmp_dir.path(); CODEX_JS_REPL_NODE_MODULE_DIRS = std::env::join_paths(node_module_dirs) если node_module_dirs не пустой И ключ не установлен ранее. При join_paths Err → 'failed to join js_repl_node_module_dirs: {err}'",
+        "numbers": null,
+        "formula": null,
+        "gwt": {
+          "given": "node_module_dirs=['/p1','/p2'], env не содержит CODEX_JS_REPL_NODE_MODULE_DIRS",
+          "when": "start_kernel",
+          "then": "env['CODEX_JS_REPL_NODE_MODULE_DIRS']='/p1:/p2' (unix) или '/p1;/p2' (windows)"
+        }
+      }
+    },
+    {
+      "id": "SRC-0018/rule/js-repl-kernel-node-args",
+      "src": "SRC-0018",
+      "composition": "rule",
+      "terms": {
+        "condition": "start_kernel формирует SandboxCommand с args = ['--experimental-vm-modules', kernel_path]. Node запускается с включённым experimental-vm-modules (для vm.Module API используемого в kernel.js)",
+        "numbers": null,
+        "formula": null,
+        "gwt": {
+          "given": "node_path=/usr/bin/node, kernel_path=/tmp/xxxxx/js_repl_kernel.js",
+          "when": "start_kernel",
+          "then": "cmd = node --experimental-vm-modules /tmp/xxxxx/js_repl_kernel.js"
+        }
+      }
+    },
+    {
+      "id": "SRC-0018/rule/js-repl-write-message-format",
+      "src": "SRC-0018",
+      "composition": "rule",
+      "terms": {
+        "condition": "write_message(stdin, msg): serde_json::to_string(msg) → write_all(encoded.as_bytes()) → write_all(b'\\n'). Каждое сообщение = одна JSON-строка + '\\n' (newline-delimited JSON). При Err serde_json → 'failed to serialize kernel message: {err}'; при write_all Err → 'failed to write to kernel: {err}' или 'failed to flush kernel message: {err}'",
+        "numbers": null,
+        "formula": "line = serde_json::to_string(msg) + '\\n'",
+        "gwt": {
+          "given": "msg=HostToKernel::Exec{id='e1', code='1+1', timeout_ms=None}",
+          "when": "write_message",
+          "then": "stdin получает '{\"type\":\"exec\",\"id\":\"e1\",\"code\":\"1+1\",\"timeout_ms\":null}\\n'"
+        }
+      }
+    },
+    {
+      "id": "SRC-0018/rule/js-repl-kernel-status-string",
+      "src": "SRC-0018",
+      "composition": "rule",
+      "terms": {
+        "condition": "kernel_debug_snapshot формирует status: try_wait() → Ok(Some(status)) → format_exit_status(status) обёрнутый в 'exited({})'; Ok(None) → 'running'; Err → 'unknown ({err})'. format_exit_status: code()=Some(c) → 'code={c}'; unix signal()=Some(s) → 'signal={s}'; иначе 'unknown'",
+        "numbers": null,
+        "formula": null,
+        "gwt": {
+          "given": "child exited with SIGKILL (unix, signal=9)",
+          "when": "kernel_debug_snapshot",
+          "then": "status='exited(signal=9)'"
+        }
+      }
+    },
+    {
+      "id": "SRC-0018/rule/js-repl-truncate-utf8-prefix",
+      "src": "SRC-0018",
+      "composition": "rule",
+      "terms": {
+        "condition": "truncate_utf8_prefix_by_bytes(input, max_bytes): если input.len() <= max_bytes → clone; если max_bytes == 0 → ''; иначе end = max_bytes; пока end > 0 И !input.is_char_boundary(end) → end -= 1; вернуть input[..end]. Гарантирует что усечение происходит на границе UTF-8 char",
+        "numbers": null,
+        "formula": null,
+        "gwt": {
+          "given": "input='café' (5 bytes: 'c','a','f',0xC3,0xA9), max_bytes=4",
+          "when": "truncate_utf8_prefix_by_bytes",
+          "then": "'caf' (3 bytes) — end=4 не boundary, уменьшается до 3"
+        }
+      }
+    },
+    {
+      "id": "SRC-0018/rule/js-repl-pragma-prefix",
+      "src": "SRC-0018",
+      "composition": "rule",
+      "terms": {
+        "condition": "JS_REPL_PRAGMA_PREFIX = '// codex-js-repl:' — префикс prama-строк в JS-коде, распознаваемых kernel. Используется kernel.js для специальных директив",
+        "numbers": null,
+        "formula": null,
+        "gwt": null
+      }
+    },
+    {
+      "id": "SRC-0018/rule/js-repl-emit-image-normalization",
+      "src": "SRC-0018",
+      "composition": "rule",
+      "terms": {
+        "condition": "emitted_image_content_item: FunctionCallOutputContentItem::InputImage{image_url, detail=normalize_output_image_detail(turn.model_info, detail)}. normalize_output_image_detail заменяет Original на что-то меньшее если модель не поддерживает",
+        "numbers": null,
+        "formula": null,
+        "gwt": null
+      }
+    },
+    {
+      "id": "SRC-0018/rule/js-repl-stderr-tail-separator",
+      "src": "SRC-0018",
+      "composition": "rule",
+      "terms": {
+        "condition": "format_stderr_tail: если empty → '<empty>'; иначе lines.iter().cloned().collect().join(' | ') — строки объединяются через ' | ' (JS_REPL_STDERR_TAIL_SEPARATOR, 3 байта включая пробелы)",
+        "numbers": [
+          {"value": 3, "kind": "separator_bytes", "note": "длина ' | '"}
+        ],
+        "formula": "formatted = lines.join(' | ')",
+        "gwt": {
+          "given": "lines=['err1','err2','err3']",
+          "when": "format_stderr_tail",
+          "then": "'err1 | err2 | err3'"
+        }
+      }
+    },
+    {
+      "id": "SRC-0018/rule/exec-result-content-ok-err-branch",
+      "src": "SRC-0018",
+      "composition": "rule",
+      "terms": {
+        "condition": "read_stdout обработка KernelToHost::ExecResult: если ok=true → ExecResultMessage::Ok{content_items=build_exec_result_content_items(output, collected_content_items)}; если ok=false → ExecResultMessage::Err{message=error.unwrap_or_else(|| 'js_repl execution failed')}",
+        "numbers": null,
+        "formula": null,
+        "gwt": {
+          "given": "KernelToHost::ExecResult{id='e1', ok=false, output='', error=None}",
+          "when": "read_stdout",
+          "then": "oneshot send ExecResultMessage::Err{message='js_repl execution failed'}"
+        }
+      }
+    },
+    {
+      "id": "SRC-0018/rule/is-kernel-status-exited",
+      "src": "SRC-0018",
+      "composition": "rule",
+      "terms": {
+        "condition": "is_kernel_status_exited(status): status.starts_with('exited('). Используется как critertion для решения включать ли diagnostic в сообщение модели при write errors или response_channel_closed",
+        "numbers": null,
+        "formula": null,
+        "gwt": {
+          "given": "status='exited(code=137)'",
+          "when": "is_kernel_status_exited",
+          "then": "true"
+        }
+      }
+    }
+  ]
+}

@@ -1,0 +1,337 @@
+{
+  "src": "SRC-0015",
+  "schema_version": "2.0",
+  "lens": "use_case",
+  "compositions": [
+    {
+      "id": "SRC-0015/uc.sub/handle-inline-network-policy-request",
+      "src": "SRC-0015",
+      "composition": "use_case",
+      "level": "sub",
+      "strategic_domain": null,
+      "terms": {
+        "actor": "Сервис approval сетевых вызовов (NetworkApprovalService)",
+        "goal": "Решить, разрешить ли исходящий сетевой запрос (inline network policy request) — вернуть NetworkDecision (Allow / Deny)",
+        "steps": [
+          "1. Сервис нормализует запрос: маппит NetworkProtocol → NetworkApprovalProtocol (Http, Https, Socks5Tcp, Socks5Udp) и строит HostApprovalKey{host в lowercase, protocol label, port}",
+          "2. Сервис проверяет session_denied_hosts — если ключ присутствует, возвращает NetworkDecision::deny(\"not_allowed\") без опроса пользователя",
+          "3. Сервис проверяет session_approved_hosts — если ключ присутствует, возвращает NetworkDecision::Allow без опроса пользователя",
+          "4. Сервис регистрирует pending-ожидание для ключа (get_or_create_pending_approval): если это первый запрос к хосту → owner, иначе — ждёт чужое решение и возвращает его NetworkDecision",
+          "5. Owner-запрос формирует target (protocol://host:port) и prompt_reason ({host} is not in the allowed_domains)",
+          "6. Owner проверяет политики доступа: турновый контекст существует, sandbox_policy разрешает approval-поток (ReadOnly | WorkspaceWrite), approval_policy != Never",
+          "7. Owner строит NetworkApprovalContext{host, protocol} и guardian_approval_id (network#{protocol}#{host}#{port})",
+          "8. Owner маршрутизирует approval: если routes_approval_to_guardian(turn_context)=true — review_approval_request(GuardianApprovalRequest::NetworkAccess{...}); иначе session.request_command_approval([network-access, target], ..., NetworkApprovalContext)",
+          "9. Owner ожидает ReviewDecision пользователя/guardian и маппит его в PendingApprovalDecision: Approved|ApprovedExecpolicyAmendment → AllowOnce; ApprovedForSession → AllowForSession; NetworkPolicyAmendment{Allow} → AllowForSession; NetworkPolicyAmendment{Deny} → Deny; Denied|Abort → Deny; TimedOut → Deny",
+          "10. Owner при NetworkPolicyAmendment персистит amendment (session.persist_network_policy_amendment) и записывает amendment message (session.record_network_policy_amendment_message)",
+          "11. Owner обновляет кэши сессии: AllowForSession → session_denied_hosts.remove(key) + session_approved_hosts.insert(key); Deny через amendment → session_approved_hosts.remove + session_denied_hosts.insert",
+          "12. Owner через pending.set_decision будит waiters, удаляет pending-запись из pending_host_approvals и возвращает NetworkDecision"
+        ],
+        "extensions (Cockburn)": [
+          {"step": 4, "condition": "ключ уже есть в pending_host_approvals (не owner)", "action": "ждать decision через Notify; при пробуждении вернуть to_network_decision существующего решения"},
+          {"step": 6, "condition": "active_turn_context = None (нет активного turn)", "action": "pending.set_decision(Deny); удалить pending; record_outcome_for_single_active_call(DeniedByPolicy(\"Network access to {target} was blocked by policy.\")); вернуть NetworkDecision::deny(\"not_allowed\")"},
+          {"step": 6, "condition": "sandbox_policy не ReadOnly и не WorkspaceWrite (sandbox_policy_allows_network_approval_flow=false)", "action": "pending.set_decision(Deny); удалить pending; record_outcome_for_single_active_call(DeniedByPolicy(policy_denial_message)); вернуть deny(\"not_allowed\")"},
+          {"step": 6, "condition": "approval_policy = Never (allows_network_approval_flow=false)", "action": "pending.set_decision(Deny); удалить pending; record_outcome_for_single_active_call(DeniedByPolicy(policy_denial_message)); вернуть deny(\"not_allowed\")"},
+          {"step": 9, "condition": "ReviewDecision=NetworkPolicyAmendment{Deny} и есть owner_call", "action": "record_call_outcome(owner_call.registration_id, DeniedByUser); cache_session_deny=true → на шаге 11 переместить ключ из approved в denied"},
+          {"step": 9, "condition": "ReviewDecision=Denied|Abort через guardian (guardian_review_id=Some)", "action": "record_call_outcome(owner_call.registration_id, DeniedByPolicy(guardian_rejection_message(review_id)))"},
+          {"step": 9, "condition": "ReviewDecision=Denied|Abort без guardian", "action": "record_call_outcome(owner_call.registration_id, DeniedByUser)"},
+          {"step": 9, "condition": "ReviewDecision=TimedOut", "action": "record_call_outcome(owner_call.registration_id, DeniedByPolicy(guardian_timeout_message()))"},
+          {"step": 10, "condition": "persist_network_policy_amendment вернул Err(err)", "action": "warn!; session.send_event_raw(Event{id: sub_id, msg: EventMsg::Warning(WarningEvent{message: \"Failed to apply network policy amendment: {err}\"})})"}
+        ],
+        "edge_cases": [
+          {"condition": "ранее существующий DeniedByUser в call_outcomes", "action": "record_call_outcome не перезаписывает DeniedByUser более поздним outcome (приоритет отказа пользователя)"},
+          {"condition": "network-policy-decider поднят, но сессия уже dropped (Weak<Session>.upgrade()=None)", "action": "build_network_policy_decider возвращает NetworkDecision::ask(\"not_allowed\") без запроса approval"},
+          {"condition": "пользовательский ранее Deny для хоста (session_denied_hosts)", "action": "отказ без prompt — не спрашиваем повторно до явного Allow"},
+          {"condition": "совпадение case host", "action": "нормализация host.to_ascii_lowercase() перед сравнением (NodeJS может прийти с разным регистром)"}
+        ],
+        "lifecycle": {
+          "entity": "SRC-0015/entity/host-approval-key",
+          "states": ["unknown", "pending_decision", "session_approved", "session_denied"],
+          "transition": [
+            {"from": "unknown", "to": "pending_decision", "guard": "первый запрос к ключу — is_owner=true", "side_effect": "создание PendingHostApproval, регистрация в pending_host_approvals"},
+            {"from": "pending_decision", "to": "session_approved", "guard": "ReviewDecision ApprovedForSession или NetworkPolicyAmendment{Allow}", "side_effect": "session_approved_hosts.insert(key); session_denied_hosts.remove(key); notify waiters"},
+            {"from": "pending_decision", "to": "unknown", "guard": "ReviewDecision Approved (AllowOnce)", "side_effect": "pending удалён, кэши не затронуты — следующий запрос заново спросит"},
+            {"from": "pending_decision", "to": "session_denied", "guard": "ReviewDecision NetworkPolicyAmendment{Deny}", "side_effect": "session_approved_hosts.remove(key); session_denied_hosts.insert(key); record DeniedByUser; persist amendment"},
+            {"from": "pending_decision", "to": "unknown", "guard": "ReviewDecision Denied|Abort|TimedOut (без amendment)", "side_effect": "record DeniedByUser или DeniedByPolicy(message); pending удалён; кэши сессии не изменяются (следующий запрос опять спросит)"}
+          ]
+        },
+        "ux": [
+          "Пользователю/guardian показывается prompt_reason: «{host} is not in the allowed_domains»",
+          "Prompt command: [network-access, target] где target = protocol://host:port",
+          "При ошибке persist amendment — отправляется Event Warning: «Failed to apply network policy amendment: {err}»",
+          "Денайл через политику сопровождается сообщением: «Network access to \"{target}\" was blocked by policy.»"
+        ],
+        "result": "Возвращена NetworkDecision — Allow (proxy пропускает запрос) или Deny(\"not_allowed\") (proxy блокирует). Side effects: кэши сессии обновлены, call_outcomes записан для активного tool call, guardian/session events отправлены"
+      }
+    },
+    {
+      "id": "SRC-0015/uc.sub/begin-network-approval",
+      "src": "SRC-0015",
+      "composition": "use_case",
+      "level": "sub",
+      "strategic_domain": null,
+      "terms": {
+        "actor": "Запускатель tool runtime (вызывает begin_network_approval перед run)",
+        "goal": "Зарегистрировать активный network-approval call для turn и получить ActiveNetworkApproval-тикет",
+        "steps": [
+          "1. Вызывающий передаёт session, turn_id, managed_network_active, Option<NetworkApprovalSpec>",
+          "2. Сервис проверяет наличие spec (spec?) — ранний выход None, если spec=None",
+          "3. Сервис проверяет условия активации: managed_network_active=true и spec.network.is_some() — иначе возвращает None (approval не нужен)",
+          "4. Сервис генерирует registration_id = Uuid::new_v4().to_string()",
+          "5. Сервис регистрирует call: network_approval.register_call(registration_id, turn_id) → active_calls[registration_id] = Arc<ActiveNetworkApprovalCall{registration_id, turn_id}>",
+          "6. Сервис возвращает Some(ActiveNetworkApproval{registration_id=Some, mode=spec.mode})"
+        ],
+        "extensions (Cockburn)": [
+          {"step": 2, "condition": "spec=None (ToolRuntime не требует network approval)", "action": "вернуть None — approval цикл пропущен"},
+          {"step": 3, "condition": "managed_network_active=false ИЛИ spec.network=None", "action": "вернуть None — network approval не активируется"}
+        ],
+        "edge_cases": [
+          {"condition": "многократная регистрация — разные tool calls в одном turn", "action": "active_calls хранит IndexMap по registration_id, каждый call уникален"},
+          {"condition": "IndexMap сохраняет порядок вставки", "action": "для resolve_single_active_call важен: если len==1 — возвращает единственный call"}
+        ],
+        "lifecycle": {
+          "entity": "SRC-0015/entity/active-network-approval",
+          "states": ["not_started", "registered"],
+          "transition": [
+            {"from": "not_started", "to": "registered", "guard": "spec=Some && managed_network_active && spec.network=Some", "side_effect": "Uuid сгенерирован; active_calls.insert"}
+          ]
+        },
+        "ux": null,
+        "result": "Option<ActiveNetworkApproval> — тикет зарегистрированного approval, который вызывающий удерживает до finish_immediate_network_approval или into_deferred + finish_deferred_network_approval"
+      }
+    },
+    {
+      "id": "SRC-0015/uc.sub/finish-immediate-network-approval",
+      "src": "SRC-0015",
+      "composition": "use_case",
+      "level": "sub",
+      "strategic_domain": null,
+      "terms": {
+        "actor": "Запускатель tool runtime (после завершения run для tools с NetworkApprovalMode=Immediate)",
+        "goal": "Завершить immediate network approval и транслировать итог approval в Result<(), ToolError> для tool run",
+        "steps": [
+          "1. Вызывающий передаёт ActiveNetworkApproval",
+          "2. Сервис извлекает registration_id.as_deref() — если None → возвращает Ok(()) (approval не был зарегистрирован)",
+          "3. Сервис забирает outcome: network_approval.take_call_outcome(registration_id) → Option<NetworkApprovalOutcome>",
+          "4. Сервис снимает регистрацию: network_approval.unregister_call(registration_id) — удаляет запись из active_calls и call_outcomes",
+          "5. Сервис маппит outcome в Result: None → Ok(()); Some(DeniedByUser) → Err(ToolError::Rejected(\"rejected by user\")); Some(DeniedByPolicy(message)) → Err(ToolError::Rejected(message))"
+        ],
+        "extensions (Cockburn)": [
+          {"step": 2, "condition": "registration_id=None (ActiveNetworkApproval без регистрации)", "action": "вернуть Ok(()) без дальнейших действий"},
+          {"step": 3, "condition": "outcome=None (approval не записан за время run)", "action": "вернуть Ok(()) — запрос не был заблокирован"}
+        ],
+        "edge_cases": [
+          {"condition": "DeniedByUser", "action": "ToolError::Rejected с жёстким сообщением «rejected by user»"},
+          {"condition": "DeniedByPolicy(message)", "action": "ToolError::Rejected(message) — передаётся конкретный policy-текст (в т.ч. guardian_rejection_message, guardian_timeout_message, denied_network_policy_message или «Network access to {target} was blocked by policy.»)"}
+        ],
+        "lifecycle": {
+          "entity": "SRC-0015/entity/active-network-approval-call",
+          "states": ["registered", "unregistered"],
+          "transition": [
+            {"from": "registered", "to": "unregistered", "guard": "finish_immediate_network_approval вызвана", "side_effect": "active_calls.shift_remove(registration_id); call_outcomes.remove(registration_id)"}
+          ]
+        },
+        "ux": null,
+        "result": "Ok(()) если network запросы не были заблокированы; Err(ToolError::Rejected(reason)) если были зафиксированы DeniedByUser/DeniedByPolicy за время tool run"
+      }
+    },
+    {
+      "id": "SRC-0015/uc.sub/finish-deferred-network-approval",
+      "src": "SRC-0015",
+      "composition": "use_case",
+      "level": "sub",
+      "strategic_domain": null,
+      "terms": {
+        "actor": "Запускатель tool runtime (поздняя очистка для tools с NetworkApprovalMode=Deferred после фонового завершения)",
+        "goal": "Снять регистрацию отложенного network approval по завершению фоновой активности",
+        "steps": [
+          "1. Вызывающий передаёт Option<DeferredNetworkApproval>",
+          "2. Сервис извлекает deferred (ранний выход если None)",
+          "3. Сервис снимает регистрацию: network_approval.unregister_call(deferred.registration_id())"
+        ],
+        "extensions (Cockburn)": [
+          {"step": 2, "condition": "deferred=None (tool не стал deferred — например, mode был Immediate, или into_deferred вернул None)", "action": "ничего не делать, ранний return"}
+        ],
+        "edge_cases": [
+          {"condition": "into_deferred возвращает Some только при mode=Deferred И registration_id=Some", "action": "иначе ActiveNetworkApproval просто drop-ается, deferred=None"}
+        ],
+        "lifecycle": {
+          "entity": "SRC-0015/entity/deferred-network-approval",
+          "states": ["pending_deferred", "cleared"],
+          "transition": [
+            {"from": "pending_deferred", "to": "cleared", "guard": "finish_deferred_network_approval вызвана с Some(deferred)", "side_effect": "active_calls.shift_remove(registration_id); call_outcomes.remove"}
+          ]
+        },
+        "ux": null,
+        "result": "Регистрация отложенного approval удалена из active_calls; результат callу не возвращается (UC не меняет Result tool run)"
+      }
+    },
+    {
+      "id": "SRC-0015/uc.sub/determine-exec-approval-requirement",
+      "src": "SRC-0015",
+      "composition": "use_case",
+      "level": "sub",
+      "strategic_domain": null,
+      "terms": {
+        "actor": "Модуль sandboxing (default_exec_approval_requirement)",
+        "goal": "По политике approval и sandbox-настройкам файловой системы определить, требуется ли approval для tool execution",
+        "steps": [
+          "1. Модуль получает AskForApproval policy и &FileSystemSandboxPolicy",
+          "2. Модуль вычисляет needs_approval по policy: Never|OnFailure → false; OnRequest|Granular → true только если file_system_sandbox_policy.kind=Restricted; UnlessTrusted → true",
+          "3. Модуль проверяет Granular override: если needs_approval=true и policy=Granular(cfg) и !cfg.allows_sandbox_approval() → возвращает Forbidden{reason: \"approval policy disallowed sandbox approval prompt\"}",
+          "4. Модуль иначе при needs_approval=true → возвращает NeedsApproval{reason: None, proposed_execpolicy_amendment: None}",
+          "5. Модуль иначе (needs_approval=false) → возвращает Skip{bypass_sandbox: false, proposed_execpolicy_amendment: None}"
+        ],
+        "extensions (Cockburn)": [
+          {"step": 3, "condition": "Granular конфиг не допускает sandbox approval prompt", "action": "вернуть Forbidden с reason — tool call запрещён заранее"},
+          {"step": 2, "condition": "OnRequest|Granular при FileSystemSandboxKind != Restricted", "action": "needs_approval=false — approval не требуется, когда FS не ограничена"}
+        ],
+        "edge_cases": [
+          {"condition": "default не задаёт bypass_sandbox и proposed_execpolicy_amendment", "action": "оба поля None — конкретные amendments задаются в Approvable::exec_approval_requirement override"}
+        ],
+        "lifecycle": null,
+        "ux": null,
+        "result": "ExecApprovalRequirement: Skip (без bypass, без amendment) | NeedsApproval (без reason/amendment) | Forbidden (с reason) — руководство для tool orchestrator"
+      }
+    },
+    {
+      "id": "SRC-0015/uc.sub/resolve-sandbox-override-first-attempt",
+      "src": "SRC-0015",
+      "composition": "use_case",
+      "level": "sub",
+      "strategic_domain": null,
+      "terms": {
+        "actor": "Модуль sandboxing (sandbox_override_for_first_attempt)",
+        "goal": "Решить, нужно ли обойти sandbox на первой попытке исполнения tool call",
+        "steps": [
+          "1. Модуль получает SandboxPermissions и &ExecApprovalRequirement",
+          "2. Модуль проверяет sandbox_permissions.requires_escalated_permissions() — если true → возвращает BypassSandboxFirstAttempt",
+          "3. Модуль проверяет exec_approval_requirement — если ExecApprovalRequirement::Skip{bypass_sandbox=true, ..} → возвращает BypassSandboxFirstAttempt",
+          "4. Модуль иначе возвращает NoOverride"
+        ],
+        "extensions (Cockburn)": [
+          {"step": 3, "condition": "ExecPolicy Allow установил Skip{bypass_sandbox=true} (полный trust) — это превалирует над with_additional_permissions sandboxed-hints", "action": "принудительный BypassSandboxFirstAttempt даже если permissions не escalated"}
+        ],
+        "edge_cases": [
+          {"condition": "Skip{bypass_sandbox=false}", "action": "NoOverride — первый attempt с sandbox"},
+          {"condition": "NeedsApproval / Forbidden", "action": "bypass не активируется через этот путь"}
+        ],
+        "lifecycle": null,
+        "ux": null,
+        "result": "SandboxOverride: BypassSandboxFirstAttempt (первая попытка без sandbox) | NoOverride (все попытки под sandbox)"
+      }
+    },
+    {
+      "id": "SRC-0015/uc.sub/cache-tool-approval-per-session",
+      "src": "SRC-0015",
+      "composition": "use_case",
+      "level": "sub",
+      "strategic_domain": null,
+      "terms": {
+        "actor": "Модуль sandboxing (with_cached_approval)",
+        "goal": "Выполнить запрос approval для tool call с учётом session-level кэша: если все ключи уже ApprovedForSession — пропустить fetch; иначе запросить и при ApprovedForSession — закэшировать на сессию",
+        "steps": [
+          "1. Модуль получает services (SessionServices), tool_name, keys: Vec<K>, fetch: async FnOnce",
+          "2. Модуль проверяет keys.is_empty() — если пусто → возвращает fetch().await без кэша",
+          "3. Модуль открывает services.tool_approvals (ApprovalStore) и проверяет, что для ВСЕХ keys store.get(key) = Some(ApprovedForSession)",
+          "4. Если все approved_for_session → возвращает ReviewDecision::ApprovedForSession без fetch",
+          "5. Иначе модуль выполняет fetch().await → decision",
+          "6. Модуль инкрементирует telemetry counter: codex.approval.requested с тэгами tool=tool_name, approved=decision.to_opaque_string()",
+          "7. Если decision=ApprovedForSession → модуль кладёт каждый key в store с ApprovedForSession",
+          "8. Модуль возвращает decision"
+        ],
+        "extensions (Cockburn)": [
+          {"step": 2, "condition": "keys пустой — защитное поведение", "action": "не обращаться к кэшу, выполнить fetch напрямую и вернуть"},
+          {"step": 3, "condition": "хотя бы один ключ не ApprovedForSession", "action": "перейти к fetch (шаг 5)"},
+          {"step": 7, "condition": "decision != ApprovedForSession", "action": "кэш не обновляется — приглашаем пользователя при каждом запросе"}
+        ],
+        "edge_cases": [
+          {"condition": "apply_patch возвращает ≥2 keys (per-file)", "action": "approved_for_session требует ВСЕ ключи; cache put — на каждый ключ отдельно, чтобы subset future request был auto-approved"},
+          {"condition": "key не сериализуется в JSON", "action": "ApprovalStore.get возвращает None (не зацикливаться), ApprovalStore.put тихо пропускает (if let Ok(s) = ... )"}
+        ],
+        "lifecycle": null,
+        "ux": null,
+        "result": "ReviewDecision — либо закэшированный ApprovedForSession без опроса, либо результат fetch (с возможной записью в кэш при ApprovedForSession). Telemetry counter codex.approval.requested инкрементирован при каждом реальном fetch"
+      }
+    },
+    {
+      "id": "SRC-0015/uc.sub/record-blocked-network-request",
+      "src": "SRC-0015",
+      "composition": "use_case",
+      "level": "sub",
+      "strategic_domain": null,
+      "terms": {
+        "actor": "NetworkProxy (через BlockedRequestObserver)",
+        "goal": "Записать блокировку сетевого запроса политикой в outcome единственного активного approval call для диагностики на finish",
+        "steps": [
+          "1. NetworkProxy вызывает observer с BlockedRequest",
+          "2. Сервис строит message = denied_network_policy_message(&blocked) — ранний выход если None",
+          "3. Сервис ищет единственный активный call: resolve_single_active_call — требуется active_calls.len()==1",
+          "4. Сервис записывает outcome: record_call_outcome(owner_call.registration_id, DeniedByPolicy(message))"
+        ],
+        "extensions (Cockburn)": [
+          {"step": 2, "condition": "denied_network_policy_message вернул None (blocked request не интерпретируется как policy denial)", "action": "ничего не делать, ранний return"},
+          {"step": 3, "condition": "active_calls.len() != 1 (ноль или >1)", "action": "outcome не записывается (attribution невозможна — нельзя однозначно приписать конкретному tool call)"}
+        ],
+        "edge_cases": [
+          {"condition": "существует DeniedByUser в call_outcomes", "action": "record_call_outcome не перезаписывает DeniedByUser (приоритет явного отказа пользователя)"}
+        ],
+        "lifecycle": null,
+        "ux": null,
+        "result": "call_outcomes[registration_id]=DeniedByPolicy(message) — будет транслирован в ToolError::Rejected(message) на finish_immediate_network_approval"
+      }
+    },
+    {
+      "id": "SRC-0015/uc.sub/sync-approved-hosts-between-sessions",
+      "src": "SRC-0015",
+      "composition": "use_case",
+      "level": "sub",
+      "strategic_domain": null,
+      "terms": {
+        "actor": "NetworkApprovalService исходной сессии",
+        "goal": "Перенести список одобренных на сессию хостов из текущего сервиса в другой сервис (используется при смене/переносе контекста сессии)",
+        "steps": [
+          "1. Сервис клонирует собственный session_approved_hosts",
+          "2. Сервис захватывает другую сессию (&self для self → other: &Self)",
+          "3. Сервис очищает other.session_approved_hosts.clear()",
+          "4. Сервис расширяет other.session_approved_hosts.extend(approved_hosts.iter().cloned())"
+        ],
+        "extensions (Cockburn)": [],
+        "edge_cases": [
+          {"condition": "session_denied_hosts НЕ переносится — только approved", "action": "denied-кэш целевой сессии не меняется; при совпадении ключа с approved — в handle_inline_policy_request денайл имеет приоритет (проверяется первым)"}
+        ],
+        "lifecycle": null,
+        "ux": null,
+        "result": "Целевой сервис имеет те же session_approved_hosts, что и исходный; другие кэши (denied, pending, outcomes, active_calls) не затронуты"
+      }
+    },
+    {
+      "id": "SRC-0015/uc.sub/build-sandbox-exec-request",
+      "src": "SRC-0015",
+      "composition": "use_case",
+      "level": "sub",
+      "strategic_domain": null,
+      "terms": {
+        "actor": "SandboxAttempt (env_for)",
+        "goal": "Построить ExecRequest для запуска tool-команды под sandbox с применением всех политик, cwd, network proxy и платформенных настроек",
+        "steps": [
+          "1. Vызывающий передаёт SandboxCommand command, ExecOptions options, Option<&NetworkProxy> network",
+          "2. SandboxAttempt собирает SandboxTransformRequest: command, policy, file_system_policy, network_policy, sandbox (тип), enforce_managed_network, network, sandbox_policy_cwd, codex_linux_sandbox_exe (Option<&PathBuf>), use_legacy_landlock, windows_sandbox_level, windows_sandbox_private_desktop",
+          "3. SandboxAttempt передаёт запрос в SandboxManager.transform",
+          "4. При успехе transform → ExecRequest::from_sandbox_exec_request(request, options)",
+          "5. При ошибке transform → проброс SandboxTransformError"
+        ],
+        "extensions (Cockburn)": [
+          {"step": 5, "condition": "SandboxManager.transform вернул Err(SandboxTransformError)", "action": "проброс ошибки вызывающему (Result<ExecRequest, SandboxTransformError>)"}
+        ],
+        "edge_cases": [
+          {"condition": "network=None", "action": "команда запускается без прокси — применяется только network_policy sandbox"},
+          {"condition": "codex_linux_sandbox_exe=None", "action": "Linux sandbox не инжектируется; manager использует доступный механизм"},
+          {"condition": "enforce_managed_network=true без network=Some", "action": "manager решает на своей стороне (SandboxManager.transform семантика вне этого SRC)"}
+        ],
+        "lifecycle": null,
+        "ux": null,
+        "result": "ExecRequest готов к запуску дочерним процессом (tool runtime вызывает run с attempt, затем исполняет полученный ExecRequest)"
+      }
+    }
+  ]
+}

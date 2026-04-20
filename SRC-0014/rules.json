@@ -1,0 +1,778 @@
+{
+  "src": "SRC-0014",
+  "schema_version": "2.0",
+  "lens": "rule",
+  "compositions": [
+    {
+      "id": "SRC-0014/rule/telemetry-preview-size-limit",
+      "src": "SRC-0014",
+      "composition": "rule",
+      "terms": {
+        "condition": "Log preview для tool-результата ограничен 2 KiB по байтам И 64 строками; при превышении любого лимита добавляется маркер '[... telemetry preview truncated ...]'",
+        "numbers": [
+          {"value": 2048, "kind": "bytes_limit", "label": "TELEMETRY_PREVIEW_MAX_BYTES (2 * 1024)"},
+          {"value": 64, "kind": "lines_limit", "label": "TELEMETRY_PREVIEW_MAX_LINES"}
+        ],
+        "formula": "truncated = take_bytes_at_char_boundary(content, 2048); preview = первые 64 строк из truncated; если len(truncated) < len(content) ИЛИ есть 65-я строка → preview + TRUNCATION_NOTICE",
+        "gwt": {
+          "given": "content размером 3000 байт с 100 строками, TELEMETRY_PREVIEW_MAX_BYTES=2048, TELEMETRY_PREVIEW_MAX_LINES=64",
+          "when": "telemetry_preview(content)",
+          "then": "preview урезан до 2048 байт (truncated_by_bytes=true) и/или до 64 строк (truncated_by_lines=true) + '[... telemetry preview truncated ...]' в конце"
+        }
+      }
+    },
+    {
+      "id": "SRC-0014/rule/exec-duration-rounded-to-tenth",
+      "src": "SRC-0014",
+      "composition": "rule",
+      "terms": {
+        "condition": "Wall time в форматированном выводе команды округляется до 0.1 секунды (одного десятичного знака)",
+        "numbers": [
+          {"value": 10.0, "kind": "rounding_multiplier"},
+          {"value": 0.1, "kind": "rounding_precision"}
+        ],
+        "formula": "duration_seconds = round(duration.as_secs_f32() * 10.0) / 10.0",
+        "gwt": {
+          "given": "exec_output.duration = 1.2345 секунды",
+          "when": "format_exec_output_for_model_structured или format_exec_output_for_model_freeform",
+          "then": "duration_seconds = round(12.345) / 10.0 = 12.0 / 10.0 = 1.2 секунды"
+        }
+      }
+    },
+    {
+      "id": "SRC-0014/rule/abort-minimum-wall-time",
+      "src": "SRC-0014",
+      "composition": "rule",
+      "terms": {
+        "condition": "При прерывании tool call по cancellation wall time в сообщении не меньше 0.1 секунды (чтобы UX не показывал 0.0)",
+        "numbers": [
+          {"value": 0.1, "kind": "min_seconds"}
+        ],
+        "formula": "secs = max(started.elapsed().as_secs_f32(), 0.1)",
+        "gwt": {
+          "given": "started зафиксирован 0.05 секунды назад, cancellation_token срабатывает",
+          "when": "ToolCallRuntime.handle_tool_call_with_source формирует aborted_response",
+          "then": "secs = 0.05.max(0.1) = 0.1 → сообщение 'Wall time: 0.1 seconds\\naborted by user' (для shell-подобных) или 'aborted by user after 0.1s'"
+        }
+      }
+    },
+    {
+      "id": "SRC-0014/rule/shell-like-abort-message-format",
+      "src": "SRC-0014",
+      "composition": "rule",
+      "terms": {
+        "condition": "Формат сообщения об отмене зависит от имени инструмента: для shell-подобных инструментов — формат с 'Wall time: {secs:.1} seconds\\naborted by user'; для остальных — 'aborted by user after {secs:.1}s'",
+        "numbers": null,
+        "formula": "shell_like = namespace=None AND name ∈ {'shell', 'container.exec', 'local_shell', 'shell_command', 'unified_exec'}; message = if shell_like then 'Wall time: {secs:.1} seconds\\naborted by user' else 'aborted by user after {secs:.1}s'",
+        "gwt": {
+          "given": "tool_name={namespace:None, name:'local_shell'}, secs=1.2",
+          "when": "ToolCallRuntime.abort_message(call, secs)",
+          "then": "'Wall time: 1.2 seconds\\naborted by user' (shell-подобный) — для name='plan' результат был бы 'aborted by user after 1.2s'"
+        }
+      }
+    },
+    {
+      "id": "SRC-0014/rule/exec-non-zero-exit-to-respond-to-model",
+      "src": "SRC-0014",
+      "composition": "rule",
+      "terms": {
+        "condition": "Успешное завершение exec-инструмента с exit_code != 0 преобразуется в Err(FunctionCallError::RespondToModel(content)); exit_code == 0 → Ok(content)",
+        "numbers": [
+          {"value": 0, "kind": "success_exit_code"}
+        ],
+        "formula": "result = if output.exit_code == 0 { Ok(content) } else { Err(FunctionCallError::RespondToModel(content)) }",
+        "gwt": {
+          "given": "tool.run вернул Ok(ExecToolCallOutput{exit_code: 1, ...})",
+          "when": "ToolEmitter.finish(ctx, out)",
+          "then": "content форматируется для модели, event = ToolEventStage::Success, но result = Err(RespondToModel(content)) — модель видит ошибку, но получает полный вывод"
+        }
+      }
+    },
+    {
+      "id": "SRC-0014/rule/patch-status-by-exit-code",
+      "src": "SRC-0014",
+      "composition": "rule",
+      "terms": {
+        "condition": "PatchApplyStatus определяется exit_code: 0 → Completed, иначе → Failed; для Rejected-сообщений всегда Declined",
+        "numbers": [
+          {"value": 0, "kind": "success_exit_code"}
+        ],
+        "formula": "status = if output.exit_code == 0 { PatchApplyStatus::Completed } else { PatchApplyStatus::Failed }; для Failure::Rejected → PatchApplyStatus::Declined",
+        "gwt": {
+          "given": "ApplyPatch завершился с ExecToolCallOutput{exit_code:0, stdout, stderr}",
+          "when": "ToolEmitter::ApplyPatch finish → emit_patch_end",
+          "then": "PatchApplyEndEvent.status = PatchApplyStatus::Completed; success=true; если exit_code=2 → Failed; если ToolError::Rejected → Declined"
+        }
+      }
+    },
+    {
+      "id": "SRC-0014/rule/exec-failure-exit-code-minus-one",
+      "src": "SRC-0014",
+      "composition": "rule",
+      "terms": {
+        "condition": "При Failure::Message или Failure::Rejected для exec-стадии exit_code в ExecCommandEndEvent равен -1 и duration равна ZERO",
+        "numbers": [
+          {"value": -1, "kind": "failure_exit_code"},
+          {"value": 0, "kind": "duration_zero_ns"}
+        ],
+        "formula": "ExecCommandResult{exit_code=-1, duration=Duration::ZERO, status=Failed(Message)|Declined(Rejected)}",
+        "gwt": {
+          "given": "ToolError::Codex(прочая ошибка) при выполнении shell",
+          "when": "emit_exec_stage с ToolEventStage::Failure(Message('execution error: ...'))",
+          "then": "ExecCommandEndEvent: exit_code=-1, duration=Duration::ZERO, status=ExecCommandStatus::Failed, stdout='', stderr=text сообщения"
+        }
+      }
+    },
+    {
+      "id": "SRC-0014/rule/rejected-message-normalization",
+      "src": "SRC-0014",
+      "composition": "rule",
+      "terms": {
+        "condition": "ToolError::Rejected с сообщением 'rejected by user' нормализуется по типу инструмента: Shell/UnifiedExec → 'exec command rejected by user'; ApplyPatch → 'patch rejected by user'; иные сообщения проходят без изменений",
+        "numbers": null,
+        "formula": "normalized = if msg == 'rejected by user' then { match emitter { Shell|UnifiedExec => 'exec command rejected by user', ApplyPatch => 'patch rejected by user' } } else msg",
+        "gwt": {
+          "given": "ToolEmitter::Shell, Err(ToolError::Rejected('rejected by user'))",
+          "when": "ToolEmitter.finish",
+          "then": "event=Failure(Rejected('exec command rejected by user')), result=Err(RespondToModel('exec command rejected by user'))"
+        }
+      }
+    },
+    {
+      "id": "SRC-0014/rule/tool-call-counter-saturating-increment",
+      "src": "SRC-0014",
+      "composition": "rule",
+      "terms": {
+        "condition": "Каждый диспатч инструмента увеличивает turn_state.tool_calls ровно на 1 через saturating_add — счётчик не переполняется и не уменьшается",
+        "numbers": [
+          {"value": 1, "kind": "increment_delta"}
+        ],
+        "formula": "turn_state.tool_calls = turn_state.tool_calls.saturating_add(1)",
+        "gwt": {
+          "given": "turn_state.tool_calls = u32::MAX (или текущий максимум)",
+          "when": "ToolRegistry.dispatch_any invocation",
+          "then": "tool_calls остаётся на максимуме (saturating) — не переполняется в 0"
+        }
+      }
+    },
+    {
+      "id": "SRC-0014/rule/pre-tool-use-hook-blocks-command",
+      "src": "SRC-0014",
+      "composition": "rule",
+      "terms": {
+        "condition": "Если PreToolUse hook возвращает reason — выполнение инструмента блокируется с сообщением 'Command blocked by PreToolUse hook: {reason}. Command: {command}'",
+        "numbers": null,
+        "formula": "if Some(reason) = run_pre_tool_use_hooks(session, turn, call_id, command).await then return Err(FunctionCallError::RespondToModel(format!('Command blocked by PreToolUse hook: {reason}. Command: {command}')))",
+        "gwt": {
+          "given": "handler.pre_tool_use_payload вернул PreToolUsePayload{command: 'rm -rf /'}, hook вернул Some('destructive path')",
+          "when": "ToolRegistry.dispatch_any",
+          "then": "handler.handle не вызывается; возвращается FunctionCallError::RespondToModel('Command blocked by PreToolUse hook: destructive path. Command: rm -rf /')"
+        }
+      }
+    },
+    {
+      "id": "SRC-0014/rule/post-tool-use-hook-only-on-success",
+      "src": "SRC-0014",
+      "composition": "rule",
+      "terms": {
+        "condition": "PostToolUse hook запускается только при success=true; при неудаче handler.post_tool_use_payload не вызывается",
+        "numbers": null,
+        "formula": "post_tool_use_payload = if success { handler.post_tool_use_payload(call_id, payload, result) } else { None }",
+        "gwt": {
+          "given": "handler.handle вернул Err(FunctionCallError::RespondToModel(...))",
+          "when": "ToolRegistry.dispatch_any продолжает после otel.log_tool_result",
+          "then": "post_tool_use_payload = None, run_post_tool_use_hooks не вызывается"
+        }
+      }
+    },
+    {
+      "id": "SRC-0014/rule/post-tool-use-stop-replaces-response",
+      "src": "SRC-0014",
+      "composition": "rule",
+      "terms": {
+        "condition": "Если PostToolUse outcome.should_stop=true — ответ инструмента заменяется на outcome.feedback_message либо outcome.stop_reason либо 'PostToolUse hook stopped execution'; если outcome.feedback_message присутствует без should_stop — всё равно заменяет ответ",
+        "numbers": null,
+        "formula": "replacement_text = if should_stop { feedback_message.or(stop_reason).unwrap_or('PostToolUse hook stopped execution') } else { feedback_message }; if Some(text) = replacement_text then result = FunctionToolOutput::from_text(text, None)",
+        "gwt": {
+          "given": "PostToolUse outcome = {should_stop: true, feedback_message: None, stop_reason: Some('budget exceeded')}",
+          "when": "ToolRegistry обрабатывает outcome",
+          "then": "replacement_text = Some('budget exceeded'); result.result = Box::new(FunctionToolOutput::from_text('budget exceeded', None))"
+        }
+      }
+    },
+    {
+      "id": "SRC-0014/rule/after-tool-use-hook-failed-abort-fatal",
+      "src": "SRC-0014",
+      "composition": "rule",
+      "terms": {
+        "condition": "AfterToolUse hook HookResult::FailedAbort преобразуется в FunctionCallError::Fatal 'after_tool_use hook {hook_name} failed and aborted operation: {error}', прерывая всю операцию; FailedContinue только логируется (warn)",
+        "numbers": null,
+        "formula": "match hook_outcome.result { Success => {}, FailedContinue(e) => warn!(...), FailedAbort(e) => return Some(FunctionCallError::Fatal(format!('after_tool_use hook '{hook_name}' failed and aborted operation: {e}'))) }",
+        "gwt": {
+          "given": "AfterToolUse hook 'rate_limiter' вернул FailedAbort('quota exceeded')",
+          "when": "dispatch_after_tool_use_hook",
+          "then": "warn лог + return Some(FunctionCallError::Fatal(\"after_tool_use hook 'rate_limiter' failed and aborted operation: quota exceeded\")) — вся операция прерывается"
+        }
+      }
+    },
+    {
+      "id": "SRC-0014/rule/hook-duration-ms-saturating-cast",
+      "src": "SRC-0014",
+      "composition": "rule",
+      "terms": {
+        "condition": "При отправке AfterToolUse hook duration_ms приводится к u64 с saturation до u64::MAX, избегая переполнения",
+        "numbers": [
+          {"value": "u64::MAX", "kind": "cast_saturation_upper_bound"}
+        ],
+        "formula": "duration_ms = u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)",
+        "gwt": {
+          "given": "dispatch.duration = Duration::from_millis(u128::MAX) (крайний случай)",
+          "when": "dispatch_after_tool_use_hook формирует HookEventAfterToolUse",
+          "then": "try_from возвращает Err → unwrap_or(u64::MAX) → duration_ms = u64::MAX"
+        }
+      }
+    },
+    {
+      "id": "SRC-0014/rule/js-repl-tools-only-guard",
+      "src": "SRC-0014",
+      "composition": "rule",
+      "terms": {
+        "condition": "При turn.tools_config.js_repl_tools_only=true прямые tool calls (ToolCallSource::Direct) запрещены кроме js_repl и js_repl_reset (с namespace=None)",
+        "numbers": null,
+        "formula": "direct_js_repl_call = tool_name.namespace.is_none() AND tool_name.name ∈ {'js_repl', 'js_repl_reset'}; if source==Direct AND tools_config.js_repl_tools_only AND NOT direct_js_repl_call → Err(RespondToModel('direct tool calls are disabled; use js_repl and codex.tool(...) instead'))",
+        "gwt": {
+          "given": "source=Direct, tools_config.js_repl_tools_only=true, tool_name={namespace:None, name:'shell'}",
+          "when": "ToolRouter.dispatch_tool_call_with_code_mode_result",
+          "then": "FunctionCallError::RespondToModel('direct tool calls are disabled; use js_repl and codex.tool(...) instead')"
+        }
+      }
+    },
+    {
+      "id": "SRC-0014/rule/mcp-parallel-by-server-name",
+      "src": "SRC-0014",
+      "composition": "rule",
+      "terms": {
+        "condition": "Для MCP-вызовов поддержка параллелизма определяется по имени сервера (parallel_mcp_server_names.contains(server)); namespaced tool_name всегда возвращает false для configured_tool_supports_parallel",
+        "numbers": null,
+        "formula": "tool_supports_parallel = match payload { Mcp{server,..} => parallel_mcp_server_names.contains(server), _ => configured_tool_supports_parallel(tool_name) }; configured_tool_supports_parallel возвращает false если tool_name.namespace.is_some()",
+        "gwt": {
+          "given": "call.payload = Mcp{server: 'github', ...}, parallel_mcp_server_names = {'github', 'filesystem'}",
+          "when": "ToolRouter.tool_supports_parallel(call)",
+          "then": "true (server 'github' в множестве); для payload=Function и tool_name.namespace=Some('ns') → false"
+        }
+      }
+    },
+    {
+      "id": "SRC-0014/rule/parallel-execution-rw-lock",
+      "src": "SRC-0014",
+      "composition": "rule",
+      "terms": {
+        "condition": "Tool calls с supports_parallel=true берут read-lock parallel_execution (разрешают конкурентное исполнение); без supports_parallel — write-lock (эксклюзивное исполнение), ожидает завершения всех read-locks",
+        "numbers": null,
+        "formula": "guard = if supports_parallel { Either::Left(lock.read().await) } else { Either::Right(lock.write().await) }",
+        "gwt": {
+          "given": "tool A supports_parallel=true (read-lock активен), приходит tool B supports_parallel=false",
+          "when": "ToolCallRuntime.handle_tool_call_with_source для B",
+          "then": "B вызывает lock.write().await — ждёт пока все read-locks (включая A) не освободятся, затем эксклюзивно исполняется"
+        }
+      }
+    },
+    {
+      "id": "SRC-0014/rule/mutating-tool-waits-for-gate",
+      "src": "SRC-0014",
+      "composition": "rule",
+      "terms": {
+        "condition": "Перед вызовом is_mutating handler реестр ждёт turn.tool_call_gate.wait_ready — мутирующие инструменты не выполняются пока gate не готов",
+        "numbers": null,
+        "formula": "if is_mutating { invocation.turn.tool_call_gate.wait_ready().await }",
+        "gwt": {
+          "given": "handler.is_mutating(invocation)=true, tool_call_gate ещё не ready",
+          "when": "ToolRegistry.dispatch_any",
+          "then": "wait_ready().await блокирует исполнение handler.handle_any пока gate не откроется; не-мутирующие инструменты не ждут gate"
+        }
+      }
+    },
+    {
+      "id": "SRC-0014/rule/is-mutating-defensive-default",
+      "src": "SRC-0014",
+      "composition": "rule",
+      "terms": {
+        "condition": "is_mutating должен оставаться оборонительным: при сомнении возвращать true; default реализации в trait ToolHandler возвращает false, но конкретные handlers обязаны переопределить если есть сомнения",
+        "numbers": null,
+        "formula": "fn is_mutating(&self, _invocation) -> impl Future<Output=bool> + Send { async { false } } — default; doc: 'This function must remains defensive and return true if a doubt exist on the exact effect of a ToolInvocation.'",
+        "gwt": {
+          "given": "новый handler для инструмента с неясным side effect",
+          "when": "implementation не переопределяет is_mutating",
+          "then": "используется default=false (не ждёт gate, не блокирует); автор обязан оценить риски и переопределить на true при сомнении"
+        }
+      }
+    },
+    {
+      "id": "SRC-0014/rule/matches-kind-compatibility",
+      "src": "SRC-0014",
+      "composition": "rule",
+      "terms": {
+        "condition": "Handler kind и ToolPayload совместимы только по паре: Function kind ↔ Function|ToolSearch payload; Mcp kind ↔ Mcp payload; другие комбинации отвергаются с 'tool {name} invoked with incompatible payload' (FunctionCallError::Fatal)",
+        "numbers": null,
+        "formula": "matches_kind = matches!((self.kind(), payload), (Function, Function{..})|(Function, ToolSearch{..})|(Mcp, Mcp{..}))",
+        "gwt": {
+          "given": "handler.kind()=Function, payload=Mcp{server,tool,raw_arguments}",
+          "when": "ToolRegistry.dispatch_any проверяет matches_kind",
+          "then": "false → FunctionCallError::Fatal('tool {display_name} invoked with incompatible payload')"
+        }
+      }
+    },
+    {
+      "id": "SRC-0014/rule/tool-spec-parallel-scope",
+      "src": "SRC-0014",
+      "composition": "rule",
+      "terms": {
+        "condition": "configured_tool_supports_parallel работает ТОЛЬКО для spec'ов типа ToolSpec::Function или ToolSpec::Freeform; Namespace/ToolSearch/LocalShell/ImageGeneration/WebSearch всегда возвращают false",
+        "numbers": null,
+        "formula": "match &config.spec { ToolSpec::Function(tool) => tool.name == tool_name.name.as_str(), ToolSpec::Freeform(tool) => tool.name == tool_name.name.as_str(), ToolSpec::Namespace(_) | ToolSearch{..} | LocalShell{} | ImageGeneration{..} | WebSearch{..} => false }",
+        "gwt": {
+          "given": "ConfiguredToolSpec с ToolSpec::LocalShell{} и supports_parallel_tool_calls=true",
+          "when": "tool_supports_parallel для подобного spec",
+          "then": "false — LocalShell ветка возвращает false независимо от флага spec"
+        }
+      }
+    },
+    {
+      "id": "SRC-0014/rule/escalate-sandbox-on-denial",
+      "src": "SRC-0014",
+      "composition": "rule",
+      "terms": {
+        "condition": "При SandboxErr::Denied оркестратор пытается retry с SandboxType::None ТОЛЬКО если tool.escalate_on_failure=true; при tool.wants_no_sandbox_approval(approval_policy)=false и отсутствии allow_on_request_network_prompt — возвращает исходную ошибку без retry",
+        "numbers": null,
+        "formula": "if !tool.escalate_on_failure() { return Err(Denied) }; if !tool.wants_no_sandbox_approval(approval_policy) && !(approval_policy==OnRequest && network_approval_context.is_some() && default_exec_approval_requirement==NeedsApproval) { return Err(Denied) }; else retry с SandboxType::None",
+        "gwt": {
+          "given": "tool.escalate_on_failure=true, approval_policy=Never, tool.wants_no_sandbox_approval(Never)=false, no network context",
+          "when": "ToolOrchestrator.run получил Denied",
+          "then": "allow_on_request_network_prompt=false (policy=Never, не OnRequest) → возврат исходной Sandbox(Denied) без retry"
+        }
+      }
+    },
+    {
+      "id": "SRC-0014/rule/escalated-sandbox-is-none",
+      "src": "SRC-0014",
+      "composition": "rule",
+      "terms": {
+        "condition": "Escalated sandbox attempt всегда использует SandboxType::None и codex_linux_sandbox_exe=None — полное отключение песочницы, попытка не может быть дальше эскалирована",
+        "numbers": null,
+        "formula": "escalated_attempt = SandboxAttempt { sandbox: SandboxType::None, codex_linux_sandbox_exe: None, ... (прочие policy/cwd/windows как в initial) }",
+        "gwt": {
+          "given": "initial attempt denied, escalate_on_failure=true, approval granted",
+          "when": "ToolOrchestrator.run формирует escalated_attempt",
+          "then": "SandboxAttempt.sandbox = SandboxType::None, codex_linux_sandbox_exe = None; вторая попытка без sandbox"
+        }
+      }
+    },
+    {
+      "id": "SRC-0014/rule/bypass-first-attempt-sandbox-none",
+      "src": "SRC-0014",
+      "composition": "rule",
+      "terms": {
+        "condition": "При SandboxOverride::BypassSandboxFirstAttempt начальная попытка сразу использует SandboxType::None без обращения к sandbox.select_initial",
+        "numbers": null,
+        "formula": "initial_sandbox = match tool.sandbox_mode_for_first_attempt(req) { BypassSandboxFirstAttempt => SandboxType::None, NoOverride => sandbox.select_initial(policies, preference, windows_level, managed_network_active) }",
+        "gwt": {
+          "given": "tool.sandbox_mode_for_first_attempt(req) = SandboxOverride::BypassSandboxFirstAttempt",
+          "when": "ToolOrchestrator.run выбирает initial_sandbox",
+          "then": "initial_sandbox = SandboxType::None; select_initial не вызывается"
+        }
+      }
+    },
+    {
+      "id": "SRC-0014/rule/review-decision-mapping",
+      "src": "SRC-0014",
+      "composition": "rule",
+      "terms": {
+        "condition": "ReviewDecision маппится в действия оркестратора: Denied/Abort → Rejected(reason); TimedOut → Rejected(guardian_timeout_message); Approved/ApprovedExecpolicyAmendment/ApprovedForSession → продолжить; NetworkPolicyAmendment{action=Allow} → продолжить; NetworkPolicyAmendment{action=Deny} → Rejected('rejected by user')",
+        "numbers": null,
+        "formula": "match decision { Denied|Abort => return Err(Rejected(guardian_rejection_message(session, review_id) if use_guardian else 'rejected by user')), TimedOut => return Err(Rejected(guardian_timeout_message())), Approved|ApprovedExecpolicyAmendment|ApprovedForSession => continue, NetworkPolicyAmendment{Allow} => continue, NetworkPolicyAmendment{Deny} => return Err(Rejected('rejected by user')) }",
+        "gwt": {
+          "given": "decision = ReviewDecision::NetworkPolicyAmendment{action: NetworkPolicyRuleAction::Deny}, use_guardian=true",
+          "when": "ToolOrchestrator обрабатывает approval",
+          "then": "Err(ToolError::Rejected('rejected by user')) — для Deny сообщение фиксированное, guardian message не используется"
+        }
+      }
+    },
+    {
+      "id": "SRC-0014/rule/guardian-vs-user-otel-source",
+      "src": "SRC-0014",
+      "composition": "rule",
+      "terms": {
+        "condition": "Источник решения approval в otel определяется routes_approval_to_guardian: если true → AutomatedReviewer; иначе → User; при Skip-requirement источник = Config",
+        "numbers": null,
+        "formula": "use_guardian = routes_approval_to_guardian(turn_ctx); otel_source = if use_guardian { AutomatedReviewer } else { User }; для Skip — otel.tool_decision(Approved, Config)",
+        "gwt": {
+          "given": "routes_approval_to_guardian(turn_ctx)=true, decision=Approved",
+          "when": "ToolOrchestrator логирует tool_decision",
+          "then": "otel.tool_decision(tool_name, call_id, &Approved, ToolDecisionSource::AutomatedReviewer)"
+        }
+      }
+    },
+    {
+      "id": "SRC-0014/rule/denial-reason-network-vs-generic",
+      "src": "SRC-0014",
+      "composition": "rule",
+      "terms": {
+        "condition": "Retry reason при Denied зависит от контекста: network denial → 'Network access to \"{host}\" is blocked by policy.'; без network context → 'command failed; retry without sandbox?' (константа)",
+        "numbers": null,
+        "formula": "retry_reason = if Some(nac) = network_approval_context { format!('Network access to \"{}\" is blocked by policy.', nac.host) } else { build_denial_reason_from_output(output) = 'command failed; retry without sandbox?' }",
+        "gwt": {
+          "given": "network_approval_context = Some(NetworkApprovalContext{host: 'api.external.com'})",
+          "when": "ToolOrchestrator формирует retry approval",
+          "then": "retry_reason = 'Network access to \"api.external.com\" is blocked by policy.'"
+        }
+      }
+    },
+    {
+      "id": "SRC-0014/rule/bypass-retry-approval-on-already-approved",
+      "src": "SRC-0014",
+      "composition": "rule",
+      "terms": {
+        "condition": "Повторный approval пропускается если tool.should_bypass_approval(approval_policy, already_approved)=true И network_approval_context отсутствует",
+        "numbers": null,
+        "formula": "bypass_retry_approval = tool.should_bypass_approval(approval_policy, already_approved) AND network_approval_context.is_none()",
+        "gwt": {
+          "given": "already_approved=true (первый approval был Approved), tool.should_bypass_approval=true, network_approval_context=None",
+          "when": "оркестратор готовит escalated retry",
+          "then": "bypass_retry_approval=true → retry approval пропускается, сразу запускается escalated attempt"
+        }
+      }
+    },
+    {
+      "id": "SRC-0014/rule/deferred-network-approval-on-error",
+      "src": "SRC-0014",
+      "composition": "rule",
+      "terms": {
+        "condition": "При deferred network approval и ошибке tool.run — deferred approval немедленно finalize'ится через finish_deferred_network_approval; при успехе — передаётся в OrchestratorRunResult",
+        "numbers": null,
+        "formula": "match network_approval.mode() { Immediate => finish_immediate (Err? return) else (run_result, None), Deferred => if run_result.is_err { finish_deferred_network_approval(session, deferred); return (run_result, None) } else { (run_result, deferred) } }",
+        "gwt": {
+          "given": "network_approval.mode()=Deferred, tool.run вернул Err",
+          "when": "run_attempt финализирует",
+          "then": "finish_deferred_network_approval(session, deferred) await; return (Err, None) — deferred approval не оставлено висячим"
+        }
+      }
+    },
+    {
+      "id": "SRC-0014/rule/default-supports-parallel-false",
+      "src": "SRC-0014",
+      "composition": "rule",
+      "terms": {
+        "condition": "push_spec по умолчанию устанавливает supports_parallel_tool_calls=false; для поддержки параллелизма используется push_spec_with_parallel_support(spec, true)",
+        "numbers": null,
+        "formula": "push_spec(spec) -> push_spec_with_parallel_support(spec, /*supports_parallel_tool_calls*/ false)",
+        "gwt": {
+          "given": "builder.push_spec(ToolSpec::Function(...))",
+          "when": "ToolRegistryBuilder сохраняет spec",
+          "then": "ConfiguredToolSpec{spec, supports_parallel_tool_calls: false} добавлен в specs Vec"
+        }
+      }
+    },
+    {
+      "id": "SRC-0014/rule/unique-handler-registration",
+      "src": "SRC-0014",
+      "composition": "rule",
+      "terms": {
+        "condition": "Регистрация handler по уже существующему имени сохраняет новый handler (overwrite), но выводит warning 'overwriting handler for tool {display_name}'",
+        "numbers": null,
+        "formula": "if self.handlers.insert(name, handler).is_some() { warn!('overwriting handler for tool {display_name}') }",
+        "gwt": {
+          "given": "в handlers уже есть entry для ToolName{name:'shell'}, register_handler('shell', new_handler)",
+          "when": "ToolRegistryBuilder.register_handler",
+          "then": "новый handler сохраняется (HashMap.insert возвращает Some(old)); warn лог: 'overwriting handler for tool shell'"
+        }
+      }
+    },
+    {
+      "id": "SRC-0014/rule/unavailable-tool-placeholder-spec",
+      "src": "SRC-0014",
+      "composition": "rule",
+      "terms": {
+        "condition": "Для каждого unavailable_called_tool с именем ещё не занятым в specs — добавляется placeholder ToolSpec::Function с пустыми параметрами и описанием-заглушкой; всегда регистрируется UnavailableToolHandler; при code_mode_enabled spec обогащается augment_tool_spec_for_code_mode",
+        "numbers": null,
+        "formula": "if existing_spec_names.insert(tool_name.clone()) { spec = Function(ResponsesApiTool{name, description: unavailable_tool_message(name, 'Calling this placeholder returns an error...'), strict: false, parameters: JsonSchema::object(Default, None, Some(AdditionalProperties::Boolean(false))), output_schema: None, defer_loading: None}); if code_mode_enabled { spec = augment_tool_spec_for_code_mode(spec) }; builder.push_spec(spec) }; builder.register_handler(tool, unavailable_handler)",
+        "gwt": {
+          "given": "unavailable_called_tools = [ToolName('deprecated_tool')], code_mode_enabled=true, имя отсутствует в existing_spec_names",
+          "when": "build_specs_with_discoverable_tools обрабатывает unavailable",
+          "then": "добавлен placeholder Function-spec с AdditionalProperties::Boolean(false), augmented для code_mode, handler=UnavailableToolHandler"
+        }
+      }
+    },
+    {
+      "id": "SRC-0014/rule/code-mode-only-filters-nested-tools",
+      "src": "SRC-0014",
+      "composition": "rule",
+      "terms": {
+        "condition": "При config.code_mode_only_enabled=true модели видны только tools, для которых is_code_mode_nested_tool(name)=false; при false — все specs видны модели",
+        "numbers": null,
+        "formula": "model_visible_specs = if config.code_mode_only_enabled { specs.iter().filter_map(|ct| if !is_code_mode_nested_tool(ct.name()) { Some(ct.spec.clone()) } else { None }).collect() } else { specs.iter().map(|ct| ct.spec.clone()).collect() }",
+        "gwt": {
+          "given": "code_mode_only_enabled=true, specs = [js_repl, nested_shell (nested), plan]",
+          "when": "ToolRouter.from_config",
+          "then": "model_visible_specs = [js_repl, plan] — nested_shell отфильтрован через is_code_mode_nested_tool"
+        }
+      }
+    },
+    {
+      "id": "SRC-0014/rule/local-shell-uses-default-sandbox-permissions",
+      "src": "SRC-0014",
+      "composition": "rule",
+      "terms": {
+        "condition": "При построении ToolCall из LocalShellCall(Exec) sandbox_permissions всегда устанавливаются в Some(SandboxPermissions::UseDefault); additional_permissions=None, prefix_rule=None, justification=None",
+        "numbers": null,
+        "formula": "ShellToolCallParams{ command: exec.command, workdir: exec.working_directory, timeout_ms: exec.timeout_ms, sandbox_permissions: Some(SandboxPermissions::UseDefault), additional_permissions: None, prefix_rule: None, justification: None }",
+        "gwt": {
+          "given": "ResponseItem::LocalShellCall с action=LocalShellAction::Exec(exec)",
+          "when": "ToolRouter.build_tool_call",
+          "then": "ToolCall.tool_name='local_shell', payload=LocalShell{params} где params.sandbox_permissions=Some(UseDefault), additional_permissions=None"
+        }
+      }
+    },
+    {
+      "id": "SRC-0014/rule/local-shell-call-id-fallback-to-id",
+      "src": "SRC-0014",
+      "composition": "rule",
+      "terms": {
+        "condition": "LocalShellCall без call_id использует id как call_id (fallback); при отсутствии обоих — FunctionCallError::MissingLocalShellCallId",
+        "numbers": null,
+        "formula": "call_id = call_id.or(id).ok_or(FunctionCallError::MissingLocalShellCallId)?",
+        "gwt": {
+          "given": "ResponseItem::LocalShellCall{id: Some('call_42'), call_id: None, action, ...}",
+          "when": "ToolRouter.build_tool_call",
+          "then": "call_id = 'call_42'; если оба None → Err(FunctionCallError::MissingLocalShellCallId)"
+        }
+      }
+    },
+    {
+      "id": "SRC-0014/rule/tool-search-client-execution-required",
+      "src": "SRC-0014",
+      "composition": "rule",
+      "terms": {
+        "condition": "ToolSearchCall обрабатывается только при execution='client' и наличии call_id; другие execution-значения → None (не tool call)",
+        "numbers": null,
+        "formula": "if execution == 'client' AND call_id.is_some() { parse SearchToolCallParams → ToolCall } else { None }",
+        "gwt": {
+          "given": "ResponseItem::ToolSearchCall{call_id: Some('c1'), execution: 'server', arguments: {...}}",
+          "when": "ToolRouter.build_tool_call",
+          "then": "Ok(None) — server-side поиск игнорируется; для execution='client' создаётся ToolCall с payload=ToolSearch"
+        }
+      }
+    },
+    {
+      "id": "SRC-0014/rule/tool-search-output-status",
+      "src": "SRC-0014",
+      "composition": "rule",
+      "terms": {
+        "condition": "ToolSearchOutput всегда возвращает status='completed' и execution='client' независимо от результата (включая случай abort с пустым tools)",
+        "numbers": null,
+        "formula": "ResponseInputItem::ToolSearchOutput{ call_id, status: 'completed', execution: 'client', tools }",
+        "gwt": {
+          "given": "AbortedToolOutput для ToolSearch payload",
+          "when": "AbortedToolOutput.to_response_item",
+          "then": "ResponseInputItem::ToolSearchOutput{status:'completed', execution:'client', tools: Vec::new()} — даже при abort статус 'completed'"
+        }
+      }
+    },
+    {
+      "id": "SRC-0014/rule/sandbox-policy-tag-mapping",
+      "src": "SRC-0014",
+      "composition": "rule",
+      "terms": {
+        "condition": "sandbox_policy_tag возвращает один из четырёх фиксированных tag-ов по типу SandboxPolicy: ReadOnly→'read-only'; WorkspaceWrite→'workspace-write'; DangerFullAccess→'danger-full-access'; ExternalSandbox→'external-sandbox'",
+        "numbers": null,
+        "formula": "match policy { ReadOnly{..} => 'read-only', WorkspaceWrite{..} => 'workspace-write', DangerFullAccess => 'danger-full-access', ExternalSandbox{..} => 'external-sandbox' }",
+        "gwt": {
+          "given": "SandboxPolicy::WorkspaceWrite{...}",
+          "when": "sandbox_policy_tag(&policy)",
+          "then": "'workspace-write' (str)"
+        }
+      }
+    },
+    {
+      "id": "SRC-0014/rule/custom-tool-response-envelope",
+      "src": "SRC-0014",
+      "composition": "rule",
+      "terms": {
+        "condition": "Для ToolPayload::Custom ответ оборачивается в ResponseInputItem::CustomToolCallOutput с name=None; для других payload — в ResponseInputItem::FunctionCallOutput",
+        "numbers": null,
+        "formula": "if matches!(payload, ToolPayload::Custom { .. }) { ResponseInputItem::CustomToolCallOutput{ call_id, name: None, output: FunctionCallOutputPayload{ body, success } } } else { ResponseInputItem::FunctionCallOutput{ call_id, output } }",
+        "gwt": {
+          "given": "payload=ToolPayload::Custom{input: '...'}, body=одна InputText запись",
+          "when": "function_tool_response(call_id, payload, body, Some(true))",
+          "then": "body=Text(text), ResponseInputItem::CustomToolCallOutput{call_id, name:None, output:{body, success:Some(true)}}"
+        }
+      }
+    },
+    {
+      "id": "SRC-0014/rule/single-input-text-flattens-to-text-body",
+      "src": "SRC-0014",
+      "composition": "rule",
+      "terms": {
+        "condition": "Если body содержит ровно одну запись InputText — она сглаживается в FunctionCallOutputBody::Text(text); иначе сохраняется как ContentItems",
+        "numbers": null,
+        "formula": "body = match body.as_slice() { [InputText{text}] => FunctionCallOutputBody::Text(text.clone()), _ => FunctionCallOutputBody::ContentItems(body) }",
+        "gwt": {
+          "given": "body = [FunctionCallOutputContentItem::InputText{text: 'ok'}]",
+          "when": "function_tool_response",
+          "then": "FunctionCallOutputBody::Text('ok') — одна запись flattened; для 2+ записей или InputImage → ContentItems"
+        }
+      }
+    },
+    {
+      "id": "SRC-0014/rule/content-items-filter-empty",
+      "src": "SRC-0014",
+      "composition": "rule",
+      "terms": {
+        "condition": "content_items_to_code_mode_result пропускает элементы с trim пустым text или image_url; оставшиеся соединяются через '\\n'",
+        "numbers": null,
+        "formula": "items.iter().filter_map(|item| match item { InputText{text} if !text.trim().is_empty() => Some(text.clone()), InputImage{image_url,..} if !image_url.trim().is_empty() => Some(image_url.clone()), _ => None }).collect::<Vec<_>>().join('\\n')",
+        "gwt": {
+          "given": "items = [InputText{text:'hello'}, InputText{text:'   '}, InputImage{image_url:'https://...'}, InputText{text:''}]",
+          "when": "content_items_to_code_mode_result",
+          "then": "JsonValue::String('hello\\nhttps://...') — два пустых элемента отфильтрованы"
+        }
+      }
+    },
+    {
+      "id": "SRC-0014/rule/mcp-wall-time-header-format",
+      "src": "SRC-0014",
+      "composition": "rule",
+      "terms": {
+        "condition": "К MCP-результату всегда добавляется заголовок 'Wall time: {wall_time_seconds:.4} seconds\\nOutput:' с 4 знаками точности; для Text body — prepend + '\\n{text}' или замена если text пуст; для ContentItems — вставка InputText с header на позицию 0",
+        "numbers": [
+          {"value": 4, "kind": "decimal_precision"}
+        ],
+        "formula": "header = format!('Wall time: {wall_time_seconds:.4} seconds\\nOutput:'); match body { Text(text) => if text.empty { text=header } else { text=format!('{header}\\n{text}') }, ContentItems(items) => items.insert(0, InputText{text: header}) }",
+        "gwt": {
+          "given": "McpToolOutput.wall_time = Duration::from_millis(1234), body=Text('result data')",
+          "when": "McpToolOutput.response_payload",
+          "then": "text = 'Wall time: 1.2340 seconds\\nOutput:\\nresult data' (1.234 → 1.2340 с 4 знаками)"
+        }
+      }
+    },
+    {
+      "id": "SRC-0014/rule/apply-patch-code-mode-empty-object",
+      "src": "SRC-0014",
+      "composition": "rule",
+      "terms": {
+        "condition": "ApplyPatchToolOutput.code_mode_result всегда возвращает пустой JSON-объект независимо от содержимого patch — code_mode получает {}",
+        "numbers": null,
+        "formula": "code_mode_result(payload) = JsonValue::Object(serde_json::Map::new())",
+        "gwt": {
+          "given": "ApplyPatchToolOutput{text: 'applied 3 files'}",
+          "when": "code_mode_result",
+          "then": "JsonValue::Object({}) — текст patch не передаётся в code_mode"
+        }
+      }
+    },
+    {
+      "id": "SRC-0014/rule/exec-code-mode-skip-empty-optional-fields",
+      "src": "SRC-0014",
+      "composition": "rule",
+      "terms": {
+        "condition": "В UnifiedExecCodeModeResult chunk_id включается только если не пуст; exit_code/session_id/original_token_count включаются только при Some",
+        "numbers": null,
+        "formula": "chunk_id: (!self.chunk_id.is_empty()).then(|| self.chunk_id.clone()); exit_code/session_id/original_token_count/chunk_id имеют #[serde(skip_serializing_if = 'Option::is_none')]",
+        "gwt": {
+          "given": "ExecCommandToolOutput{chunk_id: '', wall_time: 1.5s, exit_code: None, process_id: Some(42), original_token_count: None}",
+          "when": "code_mode_result",
+          "then": "JSON включает только wall_time_seconds и session_id=42 и output; chunk_id/exit_code/original_token_count пропущены"
+        }
+      }
+    },
+    {
+      "id": "SRC-0014/rule/exec-post-tool-use-only-session-command-without-pid",
+      "src": "SRC-0014",
+      "composition": "rule",
+      "terms": {
+        "condition": "ExecCommandToolOutput.post_tool_use_response возвращает Some(truncated_output) ТОЛЬКО если process_id=None И session_command=Some; иначе None",
+        "numbers": null,
+        "formula": "if self.process_id.is_some() || self.session_command.is_none() { return None }; Some(JsonValue::String(self.truncated_output()))",
+        "gwt": {
+          "given": "ExecCommandToolOutput{process_id: None, session_command: Some(vec!['ls'])}",
+          "when": "post_tool_use_response",
+          "then": "Some(JsonValue::String(truncated_output)) — финальный ответ команды передаётся в hook"
+        }
+      }
+    },
+    {
+      "id": "SRC-0014/rule/exec-timeout-prepends-message",
+      "src": "SRC-0014",
+      "composition": "rule",
+      "terms": {
+        "condition": "При exec_output.timed_out=true content для модели получает префикс 'command timed out after {ms} milliseconds\\n{text}'; иначе — только aggregated_output.text",
+        "numbers": null,
+        "formula": "if exec_output.timed_out { format!('command timed out after {} milliseconds\\n{}', exec_output.duration.as_millis(), exec_output.aggregated_output.text) } else { exec_output.aggregated_output.text.clone() }",
+        "gwt": {
+          "given": "ExecToolCallOutput{timed_out: true, duration: Duration::from_millis(5000), aggregated_output.text: 'hello'}",
+          "when": "build_content_with_timeout",
+          "then": "'command timed out after 5000 milliseconds\\nhello'"
+        }
+      }
+    },
+    {
+      "id": "SRC-0014/rule/freeform-total-lines-only-when-truncated",
+      "src": "SRC-0014",
+      "composition": "rule",
+      "terms": {
+        "condition": "В freeform форматировании exec-вывода секция 'Total output lines: {n}' добавляется ТОЛЬКО если total_lines != formatted_output.lines().count() (то есть вывод был усечён по строкам)",
+        "numbers": null,
+        "formula": "if total_lines != formatted_output.lines().count() { sections.push(format!('Total output lines: {total_lines}')) }",
+        "gwt": {
+          "given": "content имеет 100 строк, truncate_text(policy) вернул 64 строки",
+          "when": "format_exec_output_for_model_freeform",
+          "then": "секция 'Total output lines: 100' добавлена (100 != 64); если бы truncate не сработал, секция была бы опущена"
+        }
+      }
+    },
+    {
+      "id": "SRC-0014/rule/hook-tool-kind-mapping",
+      "src": "SRC-0014",
+      "composition": "rule",
+      "terms": {
+        "condition": "HookToolKind определяется по варианту HookToolInput: Function→Function, Custom→Custom, LocalShell→LocalShell, Mcp→Mcp",
+        "numbers": null,
+        "formula": "match tool_input { Function{..} => Function, Custom{..} => Custom, LocalShell{..} => LocalShell, Mcp{..} => Mcp }",
+        "gwt": {
+          "given": "HookToolInput::LocalShell{params:...}",
+          "when": "hook_tool_kind(&tool_input)",
+          "then": "HookToolKind::LocalShell"
+        }
+      }
+    },
+    {
+      "id": "SRC-0014/rule/tool-search-to-hook-function-encoding",
+      "src": "SRC-0014",
+      "composition": "rule",
+      "terms": {
+        "condition": "ToolPayload::ToolSearch преобразуется в HookToolInput::Function с arguments = json({query, limit}).to_string() — т.е. hooks видят tool_search как Function",
+        "numbers": null,
+        "formula": "ToolSearch{arguments} -> HookToolInput::Function{ arguments: json!({'query': arguments.query, 'limit': arguments.limit}).to_string() }",
+        "gwt": {
+          "given": "ToolPayload::ToolSearch{arguments: SearchToolCallParams{query: 'deploy', limit: Some(10)}}",
+          "when": "HookToolInput::from(&payload)",
+          "then": "HookToolInput::Function{arguments: '{\"query\":\"deploy\",\"limit\":10}'}; hook_tool_kind = Function"
+        }
+      }
+    },
+    {
+      "id": "SRC-0014/rule/function-tool-output-log-success-default-true",
+      "src": "SRC-0014",
+      "composition": "rule",
+      "terms": {
+        "condition": "FunctionToolOutput.success_for_logging возвращает self.success.unwrap_or(true) — по умолчанию success=true; ApplyPatchToolOutput.success_for_logging всегда true; AbortedToolOutput.success_for_logging всегда false",
+        "numbers": null,
+        "formula": "FunctionToolOutput: self.success.unwrap_or(true); ApplyPatchToolOutput: true; AbortedToolOutput: false; ExecCommandToolOutput: true; ToolSearchOutput: true; McpToolOutput: self.result.success(); CallToolResult: self.success()",
+        "gwt": {
+          "given": "FunctionToolOutput{body, success: None, post_tool_use_response: None}",
+          "when": "success_for_logging",
+          "then": "true (unwrap_or(true)); если success=Some(false) → false"
+        }
+      }
+    }
+  ]
+}

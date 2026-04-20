@@ -1,0 +1,635 @@
+{
+  "src": "SRC-0007",
+  "schema_version": "2.0",
+  "lens": "use_case",
+  "compositions": [
+    {
+      "id": "SRC-0007/uc.sub/record-rollout-items",
+      "src": "SRC-0007",
+      "composition": "use_case",
+      "level": "sub",
+      "strategic_domain": null,
+      "terms": {
+        "actor": "RolloutRecorder (фоновая writer-task)",
+        "goal": "Персистировать items текущей thread-сессии в rollout-файл с учётом режима persistence",
+        "steps": [
+          "1. Caller вызывает record_items(items) — отфильтровать по is_persisted_response_item(item, event_persistence_mode)",
+          "2. RolloutRecorder санитизирует каждый отфильтрованный item через sanitize_rollout_item_for_persistence(item, mode) — в Extended режиме для ExecCommandEnd truncate aggregated_output до 10_000 байт (truncate_middle_chars) и очистить stdout/stderr/formatted_output",
+          "3. RolloutRecorder отправляет RolloutCmd::AddItems(filtered) в MPSC-канал (capacity 256)",
+          "4. Writer-task добавляет items в RolloutWriterState.pending_items",
+          "5. Writer-task вызывает flush_if_materialized — если writer уже открыт, пишет pending; если is_deferred — ждёт persist()/flush()/shutdown()",
+          "6. write_pending_once: ensure_writer_open (materialize deferred path) → write_session_meta_if_needed (первая строка) → write_pending_items_once → file.flush",
+          "7. Writer-task вызывает sync_thread_state_after_write →triggers SRC-0007/uc.sub/sync-thread-state"
+        ],
+        "extensions (Cockburn)": [
+          {"step": 1, "condition": "is_persisted_response_item → false для всех items (например все ResponseItem::Other или неперсистируемые EventMsg)", "action": "filtered.is_empty() → return Ok(()) без отправки команды"},
+          {"step": 3, "condition": "self.tx.send(AddItems) вернул ошибку (writer-task died)", "action": "использовать writer_task.terminal_failure() если есть, иначе вернуть IoError::other('failed to queue rollout items: {e}')"},
+          {"step": 6, "condition": "write_pending_once вернул Err (I/O или timestamp format)", "action": "write_pending_with_recovery: enter_recovery_mode (writer=None, last_logged_error dedup), warn('failed to {operation} rollout writer; reopening and retrying'); повторить write_pending_once один раз"},
+          {"step": 6, "condition": "Retry тоже вернул Err", "action": "enter_recovery_mode повторно, warn с first+final error, вернуть Err (pending_items сохранены для следующей попытки)"}
+        ],
+        "edge_cases": [
+          {"condition": "Writer частично написал items (written_count > 0, затем Err)", "action": "drain written items из pending_items (первые written_count); для них вызвать sync_thread_state_after_write; вернуть оригинальную ошибку — не-списанные items остаются в pending_items"},
+          {"condition": "Background writer-task паникует / падает фатально", "action": "RolloutWriterTask.mark_failed сохраняет Arc<IoError>; последующие API-вызовы возвращают его через terminal_failure()"},
+          {"condition": "ExecCommandEnd в Limited режиме", "action": "sanitize_rollout_item_for_persistence возвращает item без изменений (только Extended режим усекает output)"}
+        ],
+        "lifecycle": {
+          "entity": "SRC-0007/entity/rollout-writer-state",
+          "states": ["deferred (writer=None, deferred_log_file_info=Some)", "open (writer=Some)", "recovery (writer=None после ошибки, last_logged_error set)"],
+          "transition": {
+            "from": "deferred",
+            "to": "open",
+            "guard": "ensure_writer_open: open_log_file (create_dir_all parent + OpenOptions::append.create)",
+            "side_effect": "deferred_log_file_info = None; write_session_meta_if_needed, если meta is Some"
+          }
+        },
+        "ux": null,
+        "result": "Все pending_items либо записаны в rollout-файл + state_db синхронизирован, либо retained в pending_items для retry; ошибки записи логируются через warn с dedup по last_logged_error"
+      }
+    },
+    {
+      "id": "SRC-0007/uc.sub/persist-session-meta",
+      "src": "SRC-0007",
+      "composition": "use_case",
+      "level": "sub",
+      "strategic_domain": null,
+      "terms": {
+        "actor": "RolloutWriterState (write_session_meta)",
+        "goal": "Записать SessionMetaLine первой строкой rollout-файла при первой материализации writer и синхронизировать state db",
+        "steps": [
+          "1. write_session_meta_if_needed: проверить self.meta — если None, сразу Ok",
+          "2. write_session_meta: collect_git_info(cwd) → ProtocolGitInfo (commit_hash, branch, repository_url)",
+          "3. write_session_meta: собрать SessionMetaLine { meta: session_meta, git: git_info }",
+          "4. Если state_db_ctx.is_some() — state_builder = metadata::builder_from_session_meta(session_meta_line, rollout_path)",
+          "5. Обернуть в RolloutItem::SessionMeta и через JsonlWriter.write_rollout_item записать первую строку",
+          "6. sync_thread_state_after_write со state_builder и new_thread_memory_mode = (!generate_memories).then_some('disabled')",
+          "7. self.meta = None (marker — meta уже записана)"
+        ],
+        "extensions (Cockburn)": [
+          {"step": 2, "condition": "collect_git_info(cwd) возвращает None", "action": "SessionMetaLine.git = None"},
+          {"step": 5, "condition": "writer is None (deferred)", "action": "skip write_rollout_item, но всё равно sync_thread_state_after_write (SQLite-обновление без записи в файл)"}
+        ],
+        "edge_cases": [
+          {"condition": "write_rollout_item возвращает ошибку форматирования timestamp", "action": "IoError::other('failed to format timestamp: {e}') пробрасывается наверх в write_pending_with_recovery"}
+        ],
+        "lifecycle": null,
+        "ux": null,
+        "result": "SessionMetaLine — первая строка rollout-файла; state_builder инициализирован (если state_db доступен); thread metadata row создана в SQLite с memory_mode (опционально)"
+      }
+    },
+    {
+      "id": "SRC-0007/uc.sub/sync-thread-state",
+      "src": "SRC-0007",
+      "composition": "use_case",
+      "level": "sub",
+      "strategic_domain": null,
+      "terms": {
+        "actor": "RolloutRecorder (sync_thread_state_after_write)",
+        "goal": "Обновить SQLite metadata row после успешной записи items в rollout-файл",
+        "steps": [
+          "1. updated_at = Utc::now()",
+          "2. Проверить: есть new_thread_memory_mode ИЛИ items содержит элементы, affecting metadata (codex_state::rollout_item_affects_thread_metadata)",
+          "3. Если да — apply_rollout_items(state_db_ctx, rollout_path, default_provider, state_builder, items, 'rollout_writer', new_thread_memory_mode, Some(updated_at)) и вернуть",
+          "4. Иначе — получить thread_id из state_builder или из builder_from_items",
+          "5. touch_thread_updated_at(state_db_ctx, thread_id, updated_at, 'rollout_writer') — lightweight обновление",
+          "6. Если touch вернул true — вернуть",
+          "7. Fallback: apply_rollout_items как полная перезапись"
+        ],
+        "extensions (Cockburn)": [
+          {"step": 3, "condition": "apply_rollout_items возвращает Err из runtime", "action": "warn 'state db apply_rollout_items failed during {stage} for {path}: {err}' — не пробрасывается наверх (sync не блокирует rollout write)"},
+          {"step": 4, "condition": "state_builder is None и builder_from_items вернул None (нет SessionMeta и filename не парсится)", "action": "warn 'state db apply_rollout_items missing builder during {stage}: {path}' + warn 'state db discrepancy during apply_rollout_items: {stage}, missing_builder'; return"},
+          {"step": 5, "condition": "state_db_ctx is None", "action": "return без обновления (SQLite отключена)"}
+        ],
+        "edge_cases": [
+          {"condition": "thread_id is None (ни state_builder, ни items не дают id)", "action": "touch_thread_updated_at вернёт false; fallback в apply_rollout_items, который warn'нёт и вернёт"}
+        ],
+        "lifecycle": null,
+        "ux": null,
+        "result": "SQLite thread metadata row обновлена (либо полный upsert с apply_rollout_items, либо только updated_at через touch); ошибки логируются warn-ами, не блокируют запись"
+      }
+    },
+    {
+      "id": "SRC-0007/uc.sub/persist-rollout-recorder",
+      "src": "SRC-0007",
+      "composition": "use_case",
+      "level": "sub",
+      "strategic_domain": null,
+      "terms": {
+        "actor": "RolloutRecorder.persist / flush / shutdown",
+        "goal": "Материализовать rollout-файл (если отложен) и дождаться durability буферизованных items",
+        "steps": [
+          "1. Caller вызывает persist() / flush() / shutdown() — создать oneshot channel (tx, rx)",
+          "2. Отправить RolloutCmd::{Persist|Flush|Shutdown}{ ack: tx } в MPSC-канал",
+          "3. Дождаться rx.await — ответ от writer-task",
+          "4. Writer-task: для Persist — write_pending_with_recovery('persist'); для Flush — если is_deferred && pending_items пусто, Ok; иначе write_pending_with_recovery('flush'); для Shutdown — аналогично + после Ok выйти из цикла цикла processing",
+          "5. Вернуть результат caller'у"
+        ],
+        "extensions (Cockburn)": [
+          {"step": 2, "condition": "tx.send вернул SendError (channel closed = writer-task завершилась)", "action": "использовать writer_task.terminal_failure() если есть, иначе IoError::other('failed to queue rollout {operation}: {e}')"},
+          {"step": 3, "condition": "rx.await вернул RecvError (ack dropped)", "action": "аналогично — terminal_failure() или IoError::other('failed waiting for rollout {operation}: {e}')"},
+          {"step": 4, "condition": "Shutdown — ack.send вернул Err, но ok", "action": "оркестратор игнорирует — пишет Ok; для Shutdown выйти из цикла (break)"}
+        ],
+        "edge_cases": [
+          {"condition": "Persist вызван когда writer уже открыт (idempotent)", "action": "write_pending_with_recovery просто ничего не добавляет в файл если pending_items пусто и writer уже up"},
+          {"condition": "Flush вызван когда is_deferred && pending_items.is_empty()", "action": "return Ok без попытки материализации"},
+          {"condition": "Shutdown вызван когда is_deferred && pending_items.is_empty()", "action": "return Ok без материализации — пустая сессия НЕ создаёт rollout-файл"},
+          {"condition": "Shutdown-команда не может быть послана (tx.send Err)", "action": "warn + вернуть terminal_failure() или IoError('failed to send rollout shutdown command')"}
+        ],
+        "lifecycle": null,
+        "ux": null,
+        "result": "Все pending_items записаны на диск + flushed; для shutdown — writer-task останавливается; для persist — rollout-файл гарантированно материализован"
+      }
+    },
+    {
+      "id": "SRC-0007/uc.user/list-threads",
+      "src": "SRC-0007",
+      "composition": "use_case",
+      "level": "user",
+      "strategic_domain": "обзор истории сессий Codex",
+      "terms": {
+        "actor": "Пользователь (через ThreadStore.list_threads или RolloutRecorder::list_threads)",
+        "goal": "Получить страницу thread-summary (список рабочих thread) с фильтрацией по source/provider/search_term и cursor-пагинацией",
+        "steps": [
+          "1. Пользователь передаёт ListThreadsParams (page_size, cursor, sort_key, allowed_sources, model_providers, archived, search_term)",
+          "2. LocalThreadStore.list_threads парсит cursor (parse_cursor) и конвертирует ThreadSortKey",
+          "3. Делегирует RolloutRecorder::list_threads (или list_archived_threads если archived=true)",
+          "4. list_threads_with_db_fallback: получить state_db_ctx через get_state_db (SQLite если backfill complete)",
+          "5. Если search_term is Some и SQLite вернула страницу (с items или с cursor) — вернуть её →triggers SRC-0007/uc.sub/list-threads-db",
+          "6. Иначе filesystem-first: overfetch (page_size * 2) — get_threads для active или get_threads_in_root Flat для archived →triggers SRC-0007/uc.sub/scan-rollout-directory",
+          "7. Если SQLite недоступен — truncate_fs_page(fs_page, page_size, sort_key) и вернуть",
+          "8. Warm DB: для каждого item в fs_page.items — state_db::read_repair_rollout_path →triggers SRC-0007/uc.sub/repair-rollout-path",
+          "9. После warm — list_threads_db ещё раз; если Ok — вернуть db_page.into() (конвертация в ThreadsPage)",
+          "10. Fallback: если SQLite всё равно fail — truncate_fs_page вернуть; error+warn 'Falling back on rollout system / state db discrepancy ... falling_back'",
+          "11. LocalThreadStore маппит items через stored_thread_from_rollout_item → ThreadPage { items, next_cursor }"
+        ],
+        "extensions (Cockburn)": [
+          {"step": 2, "condition": "cursor невалидный (parse_cursor вернул None)", "action": "ThreadStoreError::InvalidRequest { message: 'invalid cursor: {cursor}' }"},
+          {"step": 4, "condition": "state_db backfill не завершён", "action": "get_state_db возвращает None; warn 'state db backfill not complete at {path} (status: {status})'; продолжить без SQLite"},
+          {"step": 5, "condition": "search_term Some но SQLite вернула пустой результат и cursor=None", "action": "продолжить в filesystem-first ветвь (НЕ принимать пустой результат как финальный)"},
+          {"step": 8, "condition": "list_threads_db возвращает stale rollout_path (try_exists=false)", "action": "warn 'state db list_threads returned stale rollout path for thread {id}: {path}' + warn 'state db discrepancy during list_threads_db: stale_db_path_dropped'; ctx.delete_thread(item.id); item исключается из результата"}
+        ],
+        "edge_cases": [
+          {"condition": "rootовая директория ~/.codex/sessions не существует", "action": "get_threads_in_root возвращает пустую ThreadsPage { items: [], next_cursor: None, num_scanned_files: 0, reached_scan_cap: false }"},
+          {"condition": "num_scanned_files достиг MAX_SCAN_FILES (10000)", "action": "reached_scan_cap=true; more_matches_available=true если items не пуст; next_cursor строится"},
+          {"condition": "ни session meta, ни user event в head файла", "action": "build_thread_item возвращает None — файл исключается из результата"},
+          {"condition": "allowed_sources не пуст и source файла не в списке", "action": "build_thread_item возвращает None"},
+          {"condition": "provider_matcher задан и session provider не в filters (None → сравнение с matches_default_provider)", "action": "build_thread_item возвращает None"}
+        ],
+        "lifecycle": null,
+        "ux": null,
+        "result": "ThreadPage { items: Vec<StoredThread>, next_cursor: Option<String> } — упорядочен newest-first по sort_key; позволяет client resume с next_cursor"
+      }
+    },
+    {
+      "id": "SRC-0007/uc.sub/scan-rollout-directory",
+      "src": "SRC-0007",
+      "composition": "use_case",
+      "level": "sub",
+      "strategic_domain": null,
+      "terms": {
+        "actor": "get_threads_in_root / walk_rollout_files",
+        "goal": "Пройти директорию rollouts в правильном порядке (по sort_key + layout) и собрать ThreadsPage с учётом anchor cursor и scan-cap",
+        "steps": [
+          "1. Определить layout (NestedByDate или Flat) и sort_key (CreatedAt или UpdatedAt)",
+          "2. NestedByDate + CreatedAt: traverse_directories_for_paths_created — walk_rollout_files (year→month→day dirs via collect_dirs_desc; day files via collect_rollout_day_files; порядок: Reverse(ts), Reverse(uuid))",
+          "3. NestedByDate + UpdatedAt: traverse_directories_for_paths_updated — collect_files_by_updated_at (FilesByUpdatedAtVisitor собирает кандидатов с mtime); sort by (Reverse(mtime), Reverse(uuid))",
+          "4. Flat + CreatedAt: traverse_flat_paths_created — collect_flat_rollout_files + sort; filename-based anchor",
+          "5. Flat + UpdatedAt: traverse_flat_paths_updated — collect_flat_files_by_updated_at + mtime sort",
+          "6. Per file: AnchorState.should_skip(ts, uuid) — пропустить до прохождения cursor (ts < self.ts или ts==self.ts && id < self.id → passed=true)",
+          "7. Если items.len() == page_size — more_matches_available=true, break",
+          "8. Для каждого прошедшего файла — build_thread_item(path, allowed_sources, provider_matcher, updated_at_fallback)",
+          "9. build_thread_item: read_head_summary (HEAD_RECORD_LIMIT=10 записей, + USER_EVENT_SCAN_LIMIT=200 если SessionMeta есть но UserMessage ещё не встречен); фильтр по allowed_sources и provider; saw_session_meta && saw_user_event → Some(ThreadItem)",
+          "10. build_next_cursor если more_matches_available — (last ts, id из filename или updated_at)"
+        ],
+        "extensions (Cockburn)": [
+          {"step": 2, "condition": "num_scanned_files >= MAX_SCAN_FILES (10000)", "action": "break 'outer из walk_rollout_files; reached_scan_cap=true; если items не пуст — more_matches_available=true"},
+          {"step": 6, "condition": "anchor.is_none()", "action": "AnchorState.new возвращает passed=true сразу — все файлы проходят"},
+          {"step": 9, "condition": "read_head_summary не нашёл ни SessionMeta, ни UserMessage в первых 10 записях + 200 доп. при ожидании", "action": "return None — файл не включается в результаты"},
+          {"step": 9, "condition": "serde_json::from_str RolloutLine вернул Err на строке", "action": "continue — строка пропускается (silent)"}
+        ],
+        "edge_cases": [
+          {"condition": "В файле несколько SessionMeta (fork случай)", "action": "использовать только первую (!summary.saw_session_meta guard); дальнейшие SessionMeta в head игнорируются"},
+          {"condition": "TurnContext/Compacted в head", "action": "не включается в head; skip"},
+          {"condition": "directory содержит не-rollout файлы (не match 'rollout-*.jsonl')", "action": "skip — parse_timestamp_uuid_from_filename возвращает None"},
+          {"condition": "UUID-часть в filename не парсится", "action": "skip файл (continue)"}
+        ],
+        "lifecycle": null,
+        "ux": null,
+        "result": "ThreadsPage { items, next_cursor, num_scanned_files, reached_scan_cap } в корректном порядке с проставленными created_at/updated_at"
+      }
+    },
+    {
+      "id": "SRC-0007/uc.sub/list-threads-db",
+      "src": "SRC-0007",
+      "composition": "use_case",
+      "level": "sub",
+      "strategic_domain": null,
+      "terms": {
+        "actor": "state_db::list_threads_db",
+        "goal": "Запросить thread metadata страницу из SQLite без обхода rollout-директорий",
+        "steps": [
+          "1. Проверить state_runtime context — None → return None",
+          "2. Warn если ctx.codex_home() != codex_home (mismatch)",
+          "3. cursor_to_anchor(cursor) — split '|' → (ts, uuid); ts парсится как '%Y-%m-%dT%H-%M-%S' или RFC3339",
+          "4. Сконвертировать allowed_sources в Vec<String> через serde_json::to_value",
+          "5. Сконвертировать sort_key: ThreadSortKey::CreatedAt→codex_state::SortKey::CreatedAt, UpdatedAt→UpdatedAt",
+          "6. ctx.list_threads(page_size, anchor, sort_key, allowed_sources, model_providers, archived, search_term) — await",
+          "7. Per page item: если tokio::fs::try_exists(rollout_path) == false — warn stale; ctx.delete_thread(item.id); исключить из valid_items",
+          "8. page.items = valid_items — вернуть Some(page)"
+        ],
+        "extensions (Cockburn)": [
+          {"step": 3, "condition": "cursor_to_anchor вернул None (невалидный cursor)", "action": "anchor = None — поиск с начала"},
+          {"step": 6, "condition": "ctx.list_threads вернул Err", "action": "warn 'state db list_threads failed: {err}'; return None (caller fallback на filesystem)"},
+          {"step": 7, "condition": "try_exists Err или вернул false", "action": "item считается stale, исключается; ctx.delete_thread вызывается, но результат ignored"}
+        ],
+        "edge_cases": [
+          {"condition": "state_db backfill не complete", "action": "require_backfill_complete возвращает None на ранней стадии — list_threads_db не вызывается"},
+          {"condition": "cursor содержит '|' более одного раза (id_str содержит '|')", "action": "cursor_to_anchor возвращает None"}
+        ],
+        "lifecycle": null,
+        "ux": null,
+        "result": "Option<codex_state::ThreadsPage> с отфильтрованными items (без stale paths); converts to ThreadsPage через From impl"
+      }
+    },
+    {
+      "id": "SRC-0007/uc.user/read-thread",
+      "src": "SRC-0007",
+      "composition": "use_case",
+      "level": "user",
+      "strategic_domain": "просмотр деталей сессии Codex",
+      "terms": {
+        "actor": "Пользователь (через ThreadStore.read_thread)",
+        "goal": "Получить summary конкретной thread по ID, опционально с историей replay",
+        "steps": [
+          "1. Пользователь передаёт ReadThreadParams { thread_id, include_archived, include_history }",
+          "2. Если include_archived=true — сначала find_thread_path_by_id_str (active), при None — find_archived_thread_path_by_id_str (archived) →triggers SRC-0007/uc.sub/locate-thread-path",
+          "3. Иначе только find_thread_path_by_id_str (active)",
+          "4. read_thread_item_from_rollout(path) — build_thread_item с пустыми allowed_sources и provider_matcher=None",
+          "5. archived = item.path.starts_with(codex_home/archived_sessions/)",
+          "6. stored_thread_from_rollout_item(item, archived, default_provider) — собрать StoredThread",
+          "7. Если include_history — RolloutRecorder::load_rollout_items(path) → StoredThreadHistory { thread_id, items }; thread.history = Some(...)"
+        ],
+        "extensions (Cockburn)": [
+          {"step": 2, "condition": "find_thread_path_by_id_str вернул Err (I/O)", "action": "ThreadStoreError::InvalidRequest { 'failed to locate thread id {thread_id}: {err}' }"},
+          {"step": 2, "condition": "find_thread_path_by_id_str вернул Ok(None) И find_archived_thread_path_by_id_str вернул Ok(None)", "action": "ThreadStoreError::InvalidRequest { 'no rollout found for thread id {thread_id}' }"},
+          {"step": 4, "condition": "read_thread_item_from_rollout вернул None (нет session meta или user message)", "action": "ThreadStoreError::Internal { 'failed to read thread {path}' }"},
+          {"step": 6, "condition": "stored_thread_from_rollout_item вернул None (thread_id невосстановим)", "action": "ThreadStoreError::Internal { 'failed to read thread id from {path}' }"},
+          {"step": 7, "condition": "load_rollout_items вернул Err", "action": "ThreadStoreError::Internal { 'failed to load thread history {path}: {err}' }"}
+        ],
+        "edge_cases": [
+          {"condition": "rollout-файл в archived но include_archived=false", "action": "find_thread_path_by_id_str (sessions) не найдёт; InvalidRequest 'no rollout found'"},
+          {"condition": "rollout содержит parse-errors (невалидные JSON строки)", "action": "load_rollout_items игнорирует строки с warn (parse_errors count возвращается, но не блокирует)"}
+        ],
+        "lifecycle": null,
+        "ux": null,
+        "result": "StoredThread с заполненными метаданными (+ опционально history: Vec<RolloutItem> в replay order)"
+      }
+    },
+    {
+      "id": "SRC-0007/uc.sub/locate-thread-path",
+      "src": "SRC-0007",
+      "composition": "use_case",
+      "level": "sub",
+      "strategic_domain": null,
+      "terms": {
+        "actor": "find_thread_path_by_id_str (codex_rollout::list)",
+        "goal": "Найти файл rollout по ID thread через SQLite-поиск с fallback на filesystem scan",
+        "steps": [
+          "1. Uuid::parse_str(id_str) — валидация UUID; Err → Ok(None)",
+          "2. Определить archived_only флаг: SESSIONS_SUBDIR → Some(false); ARCHIVED_SESSIONS_SUBDIR → Some(true); иначе None",
+          "3. thread_id = ThreadId::from_string(id_str).ok()",
+          "4. state_db_ctx = state_db::open_if_present(codex_home, '')",
+          "5. Если state_db_ctx и thread_id есть — state_db::find_rollout_path_by_id(ctx, thread_id, archived_only, 'find_path_query')",
+          "6. Если DB вернул path — tokio::fs::try_exists — true→return Some(db_path); false→error 'state db returned stale rollout path' + warn discrepancy stale_db_path",
+          "7. Fallback: root = codex_home.join(subdir); если !exists → Ok(None)",
+          "8. file_search::run(id_str, [root], { limit=1, compute_indices=false, respect_gitignore=false }, cancel_flag=None)",
+          "9. Если results.matches.next() — читать полный path; debug 'state db missing rollout path' + warn discrepancy falling_back",
+          "10. state_db::read_repair_rollout_path(ctx, thread_id, archived_only, found_path) — починить SQLite →triggers SRC-0007/uc.sub/repair-rollout-path",
+          "11. Return Ok(found)"
+        ],
+        "extensions (Cockburn)": [
+          {"step": 5, "condition": "find_rollout_path_by_id вернул Err", "action": "warn 'state db find_rollout_path_by_id failed during {stage}: {err}'; продолжить в filesystem fallback"},
+          {"step": 8, "condition": "file_search::run вернул Err", "action": "io::Error::other('file search failed: {e}') — пробрасывается caller"}
+        ],
+        "edge_cases": [
+          {"condition": "DB path указывает на файл, который физически удалён (stale)", "action": "tracing::error + tracing::warn discrepancy; продолжить в filesystem fallback (обновить DB через read_repair)"},
+          {"condition": "state_db не инициализирован (sqlite_home отсутствует)", "action": "open_if_present возвращает None; сразу filesystem fallback"}
+        ],
+        "lifecycle": null,
+        "ux": null,
+        "result": "Option<PathBuf> — путь к rollout-файлу или None; SQLite чинится автоматически при filesystem fallback"
+      }
+    },
+    {
+      "id": "SRC-0007/uc.sub/repair-rollout-path",
+      "src": "SRC-0007",
+      "composition": "use_case",
+      "level": "sub",
+      "strategic_domain": null,
+      "terms": {
+        "actor": "state_db::read_repair_rollout_path",
+        "goal": "Починить rollout_path в SQLite после filesystem fallback (fast path) или реконструировать row (slow path)",
+        "steps": [
+          "1. Если thread_id известен — ctx.get_thread(thread_id) (Ok(Some(metadata)) = saw_existing_metadata)",
+          "2. Fast path: repaired = metadata.clone; repaired.rollout_path = new_path; repaired.cwd = normalize_cwd_for_state_db",
+          "3. archived_only: Some(true) && archived_at.is_none() → archived_at = Some(updated_at); Some(false) → archived_at = None; Some(true)/None — no-op",
+          "4. Если repaired == metadata — return (no-op, avoid unnecessary write)",
+          "5. warn 'state db discrepancy ... upsert_needed (fast path)' + ctx.upsert_thread(repaired); Ok→return",
+          "6. Upsert Err — fallthrough в slow path",
+          "7. Slow path: если !saw_existing_metadata — warn 'state db discrepancy ... upsert_needed (slow path)'",
+          "8. default_provider = read_session_meta_line(rollout_path).ok().and_then(meta.model_provider).unwrap_or_default()",
+          "9. reconcile_rollout(ctx, rollout_path, default_provider, builder=None, items=[], archived_only, new_thread_memory_mode=None) →triggers SRC-0007/uc.sub/reconcile-rollout"
+        ],
+        "extensions (Cockburn)": [
+          {"step": 2, "condition": "ctx.get_thread вернул Err или Ok(None)", "action": "saw_existing_metadata остаётся false; пропуск fast path, переход в slow"},
+          {"step": 5, "condition": "upsert_thread Err", "action": "warn 'state db read-repair upsert failed for {path}: {err}'; продолжить в slow path"}
+        ],
+        "edge_cases": [
+          {"condition": "ctx is None", "action": "early return (SQLite отключена)"},
+          {"condition": "read_session_meta_line Err (файл пустой/повреждён)", "action": "default_provider = '' (empty); reconcile сам разберётся"}
+        ],
+        "lifecycle": null,
+        "ux": null,
+        "result": "SQLite row обновлён или пересоздан с актуальным rollout_path; никаких ошибок наверх не пробрасывается"
+      }
+    },
+    {
+      "id": "SRC-0007/uc.sub/reconcile-rollout",
+      "src": "SRC-0007",
+      "composition": "use_case",
+      "level": "sub",
+      "strategic_domain": null,
+      "terms": {
+        "actor": "state_db::reconcile_rollout",
+        "goal": "Синхронизировать rollout-файл в SQLite — полная реконструкция metadata row через extraction из файла",
+        "steps": [
+          "1. Если builder.is_some() ИЛИ !items.is_empty() — сразу apply_rollout_items и return (быстрый путь с готовыми данными)",
+          "2. Иначе metadata::extract_metadata_from_rollout(rollout_path, default_provider) — загрузить все items, применить apply_rollout_item для metadata",
+          "3. memory_mode = outcome.memory_mode.unwrap_or_else(|| 'enabled')",
+          "4. metadata.cwd = normalize_cwd_for_state_db(metadata.cwd)",
+          "5. Если ctx.get_thread(id) Ok(Some(existing)) — metadata.prefer_existing_git_info(&existing)",
+          "6. archived_only: Some(true) && archived_at.is_none() → archived_at = Some(updated_at); Some(false) → archived_at = None",
+          "7. ctx.upsert_thread(metadata)",
+          "8. ctx.set_thread_memory_mode(id, memory_mode)",
+          "9. read_session_meta_line(rollout_path) + persist_dynamic_tools(ctx, meta.id, meta.dynamic_tools, 'reconcile_rollout')"
+        ],
+        "extensions (Cockburn)": [
+          {"step": 2, "condition": "extract_metadata_from_rollout Err (пустой файл / нет SessionMeta / filename не парсится)", "action": "warn 'state db reconcile_rollout extraction failed {path}: {err}'; return"},
+          {"step": 7, "condition": "upsert_thread Err", "action": "warn 'state db reconcile_rollout upsert failed {path}: {err}'; return"},
+          {"step": 8, "condition": "set_thread_memory_mode Err", "action": "warn 'state db reconcile_rollout memory_mode update failed {path}: {err}'; return"},
+          {"step": 9, "condition": "read_session_meta_line Err", "action": "warn 'state db reconcile_rollout missing session meta {path}'"}
+        ],
+        "edge_cases": [
+          {"condition": "memory_mode = None в extraction outcome", "action": "fallback 'enabled' (hardcoded default в reconcile_rollout и backfill_sessions)"}
+        ],
+        "lifecycle": null,
+        "ux": null,
+        "result": "SQLite row создан/обновлён с актуальными metadata + memory_mode + dynamic_tools"
+      }
+    },
+    {
+      "id": "SRC-0007/uc.user/archive-thread",
+      "src": "SRC-0007",
+      "composition": "use_case",
+      "level": "user",
+      "strategic_domain": "управление жизненным циклом thread (архив)",
+      "terms": {
+        "actor": "Пользователь (через ThreadStore.archive_thread)",
+        "goal": "Архивировать thread — переместить rollout из active sessions в archived_sessions",
+        "steps": [
+          "1. Пользователь передаёт ArchiveThreadParams { thread_id }",
+          "2. find_thread_path_by_id_str(codex_home, thread_id) — найти active rollout",
+          "3. scoped_rollout_path(codex_home/sessions, rollout_path, 'sessions') — canonicalize; проверить что путь лежит внутри sessions/",
+          "4. matching_rollout_file_name(canonical_rollout_path, thread_id, rollout_path) — проверить, что filename заканчивается '<thread_id>.jsonl'",
+          "5. create_dir_all(codex_home/archived_sessions)",
+          "6. archived_path = archive_folder.join(file_name); std::fs::rename(canonical_rollout_path, archived_path)",
+          "7. Если get_state_db Some — ctx.mark_archived(thread_id, archived_path, Utc::now()) — SQLite обновление"
+        ],
+        "extensions (Cockburn)": [
+          {"step": 2, "condition": "find_thread_path_by_id_str вернул Err", "action": "ThreadStoreError::InvalidRequest { 'failed to locate thread id {thread_id}: {err}' }"},
+          {"step": 2, "condition": "find_thread_path_by_id_str вернул Ok(None)", "action": "ThreadStoreError::InvalidRequest { 'no rollout found for thread id {thread_id}' }"},
+          {"step": 3, "condition": "canonicalize sessions/ Err", "action": "ThreadStoreError::Internal { 'failed to resolve sessions directory `{path}`: {err}' }"},
+          {"step": 3, "condition": "canonicalize rollout_path Err или canonical_rollout_path не starts_with canonical_root", "action": "ThreadStoreError::InvalidRequest { 'rollout path `{path}` must be in sessions directory' }"},
+          {"step": 4, "condition": "filename не заканчивается '<thread_id>.jsonl'", "action": "ThreadStoreError::InvalidRequest { 'rollout path ... does not match thread id {thread_id}' }"},
+          {"step": 5, "condition": "create_dir_all Err", "action": "ThreadStoreError::Internal { 'failed to archive thread: {err}' }"},
+          {"step": 6, "condition": "rename Err (другая FS, permission)", "action": "ThreadStoreError::Internal { 'failed to archive thread: {err}' }"},
+          {"step": 7, "condition": "mark_archived Err", "action": "результат ignored (let _ = ...) — SQLite-обновление best effort"}
+        ],
+        "edge_cases": [
+          {"condition": "SQLite state_db отсутствует или backfill не complete", "action": "get_state_db возвращает None; шаг 7 skip — rename на FS выполнен, метадата не обновлена"}
+        ],
+        "lifecycle": {
+          "entity": "SRC-0007/entity/rollout-file",
+          "states": ["active (codex_home/sessions/YYYY/MM/DD/)", "archived (codex_home/archived_sessions/ flat)"],
+          "transition": {
+            "from": "active",
+            "to": "archived",
+            "guard": "rollout path внутри sessions/ + filename ends_with thread_id.jsonl",
+            "side_effect": "rename файла + SQLite mark_archived(thread_id, archived_path, now)"
+          }
+        },
+        "ux": null,
+        "result": "Rollout физически перемещён; thread попадает в list_threads(archived=true); active list больше не видит"
+      }
+    },
+    {
+      "id": "SRC-0007/uc.user/unarchive-thread",
+      "src": "SRC-0007",
+      "composition": "use_case",
+      "level": "user",
+      "strategic_domain": "управление жизненным циклом thread (восстановление)",
+      "terms": {
+        "actor": "Пользователь (через ThreadStore.unarchive_thread)",
+        "goal": "Восстановить архивированный thread — переместить rollout из archived_sessions обратно в active sessions/YYYY/MM/DD",
+        "steps": [
+          "1. Пользователь передаёт ArchiveThreadParams { thread_id }",
+          "2. find_archived_thread_path_by_id_str(codex_home, thread_id) — найти archived rollout",
+          "3. scoped_rollout_path(archived_sessions, archived_path, 'archived') — canonicalize и валидировать prefix",
+          "4. matching_rollout_file_name(canonical_archived_path, thread_id, archived_path)",
+          "5. rollout_date_parts(file_name) — извлечь (year, month, day) из 'rollout-YYYY-MM-DDT...' (indices 0..10 после 'rollout-': year=0..4, month=5..7, day=8..10)",
+          "6. dest_dir = codex_home/sessions/year/month/day; create_dir_all(dest_dir)",
+          "7. restored_path = dest_dir.join(file_name); std::fs::rename(canonical_archived_path, restored_path)",
+          "8. touch_modified_time(restored_path) — обновить mtime (set_times через OpenOptions::append.open)",
+          "9. Если get_state_db Some — ctx.mark_unarchived(thread_id, restored_path)",
+          "10. read_thread_item_from_rollout(restored_path) + stored_thread_from_rollout_item(item, archived=false, default_provider)"
+        ],
+        "extensions (Cockburn)": [
+          {"step": 2, "condition": "find_archived_thread_path_by_id_str вернул Err", "action": "ThreadStoreError::InvalidRequest { 'failed to locate archived thread id {thread_id}: {err}' }"},
+          {"step": 2, "condition": "find_archived_thread_path_by_id_str вернул Ok(None)", "action": "ThreadStoreError::InvalidRequest { 'no archived rollout found for thread id {thread_id}' }"},
+          {"step": 5, "condition": "rollout_date_parts вернул None (неправильный filename)", "action": "ThreadStoreError::InvalidRequest { 'rollout path `{path}` missing filename timestamp' }"},
+          {"step": 6, "condition": "create_dir_all Err", "action": "ThreadStoreError::Internal { 'failed to unarchive thread: {err}' }"},
+          {"step": 7, "condition": "rename Err", "action": "ThreadStoreError::Internal { 'failed to unarchive thread: {err}' }"},
+          {"step": 8, "condition": "touch_modified_time Err", "action": "ThreadStoreError::Internal { 'failed to update unarchived thread timestamp: {err}' }"},
+          {"step": 10, "condition": "read_thread_item_from_rollout вернул None", "action": "ThreadStoreError::Internal { 'failed to read unarchived thread {path}' }"},
+          {"step": 10, "condition": "stored_thread_from_rollout_item вернул None", "action": "ThreadStoreError::Internal { 'failed to read unarchived thread id from {path}' }"}
+        ],
+        "edge_cases": [
+          {"condition": "SQLite mark_unarchived Err", "action": "ignored (let _ = ...)"}
+        ],
+        "lifecycle": {
+          "entity": "SRC-0007/entity/rollout-file",
+          "states": ["archived", "active"],
+          "transition": {
+            "from": "archived",
+            "to": "active",
+            "guard": "filename парсится rollout_date_parts для сборки destination directory; filename ends_with thread_id.jsonl",
+            "side_effect": "create_dir_all sessions/YYYY/MM/DD + rename + touch mtime + SQLite mark_unarchived"
+          }
+        },
+        "ux": null,
+        "result": "StoredThread с archived_at=None, rollout_path указывает на active location"
+      }
+    },
+    {
+      "id": "SRC-0007/uc.user/resume-session",
+      "src": "SRC-0007",
+      "composition": "use_case",
+      "level": "user",
+      "strategic_domain": "возобновление работы Codex в том же контексте",
+      "terms": {
+        "actor": "Пользователь (через RolloutRecorder::get_rollout_history или find_latest_thread_path + resume)",
+        "goal": "Найти подходящий предыдущий thread (по cwd или последний вообще) и восстановить его историю для продолжения",
+        "steps": [
+          "1. find_latest_thread_path(config, page_size, cursor, sort_key, allowed_sources, model_providers, default_provider, filter_cwd)",
+          "2. Если state_db_ctx есть — получить страницы через list_threads_db в цикле; для каждой страницы select_resume_path_from_db_page",
+          "3. Если state_db нет или DB исчерпан — loop get_threads + select_resume_path",
+          "4. select_resume_path (filter_cwd=Some): для каждого item — resume_candidate_matches_cwd; первый совпавший — возврат path",
+          "5. select_resume_path (filter_cwd=None): page.items.first().path",
+          "6. resume_candidate_matches_cwd: cached_cwd.is_some_and(cwd_matches) → true return",
+          "7. Fallback: load_rollout_items; найти latest TurnContext.cwd (rev find); сравнить cwd_matches",
+          "8. Если нет TurnContext — extract_metadata_from_rollout.metadata.cwd; сравнить",
+          "9. После нахождения path — RolloutRecorder::get_rollout_history(path) → InitialHistory::Resumed { conversation_id, history, rollout_path }"
+        ],
+        "extensions (Cockburn)": [
+          {"step": 9, "condition": "items пустой после load", "action": "return InitialHistory::New"},
+          {"step": 9, "condition": "thread_id не найден ни в одной SessionMeta", "action": "IoError::other('failed to parse thread ID from rollout file')"},
+          {"step": 1, "condition": "Все cursor page_size-страницы исчерпаны без совпадения", "action": "Ok(None) — нет подходящей сессии"}
+        ],
+        "edge_cases": [
+          {"condition": "rollout содержит parse_errors (невалидные JSON строки)", "action": "load_rollout_items: warn 'failed to parse line as JSON' + parse_errors saturating_add 1; продолжить; возвращает (items, thread_id, parse_errors)"},
+          {"condition": "cwd сравнение: path_utils::paths_match_after_normalization", "action": "использовать canonicalize-подобную нормализацию для надёжного матчинга"}
+        ],
+        "lifecycle": null,
+        "ux": null,
+        "result": "InitialHistory::Resumed с corresponding thread_id + full items + rollout_path — сессия готова к продолжению"
+      }
+    },
+    {
+      "id": "SRC-0007/uc.sub/backfill-sessions",
+      "src": "SRC-0007",
+      "composition": "use_case",
+      "level": "sub",
+      "strategic_domain": null,
+      "terms": {
+        "actor": "metadata::backfill_sessions (background task после state_db::init)",
+        "goal": "Одноразово проиндексировать все rollout-файлы в SQLite state db при первом запуске после миграции",
+        "steps": [
+          "1. state_db::init: runtime.get_backfill_state; если status == Complete — return (fast path)",
+          "2. Спавн tokio::spawn(backfill_sessions(runtime, config))",
+          "3. backfill_sessions: start timer DB_METRIC_BACKFILL_DURATION_MS",
+          "4. runtime.get_backfill_state — если status==Complete return (двойная проверка)",
+          "5. runtime.try_claim_backfill(BACKFILL_LEASE_SECONDS=900) — атомарный claim; false → info 'backfill already running'; return",
+          "6. Если status != Running — runtime.mark_backfill_running",
+          "7. collect_rollout_paths для sessions_root и archived_root (рекурсивный stack-based обход)",
+          "8. Обогатить BackfillRolloutPath { watermark, path, archived }: watermark = path.strip_prefix(codex_home).to_string_lossy() + replace('\\\\','/')",
+          "9. Sort rollout_paths по watermark; retain entries > last_watermark если был прежний прогресс",
+          "10. Per batch (size 200): for each rollout — extract_metadata_from_rollout; если parse_errors > 0 — counter DB_ERROR_METRIC; metadata.cwd = normalize_cwd_for_state_db; memory_mode unwrap_or 'enabled'; get_thread + prefer_existing_git_info; archived && archived_at.is_none() → archived_at = file_modified_time_utc(path).or(updated_at)",
+          "11. runtime.upsert_thread; stats.upserted += 1; runtime.set_thread_memory_mode + persist_dynamic_tools",
+          "12. После каждого batch — runtime.checkpoint_backfill(last_entry.watermark); обновить last_watermark",
+          "13. После цикла — runtime.mark_backfill_complete(last_watermark)",
+          "14. info 'state db backfill scanned=X, upserted=Y, failed=Z'; counter DB_METRIC_BACKFILL с status=upserted/failed; timer record со status=success/failed/partial_failure"
+        ],
+        "extensions (Cockburn)": [
+          {"step": 5, "condition": "try_claim_backfill Err", "action": "warn 'failed to claim backfill worker at {path}: {err}'; return (работник не запущен)"},
+          {"step": 6, "condition": "mark_backfill_running Err", "action": "warn 'failed to mark backfill running at {path}: {err}'; продолжить со status=Running локально"},
+          {"step": 7, "condition": "collect_rollout_paths Err для root", "action": "warn 'failed to collect rollout paths under {root}: {err}'; продолжить с другим root"},
+          {"step": 10, "condition": "extract_metadata_from_rollout Err", "action": "stats.failed += 1; warn 'failed to extract rollout {path}: {err}'; continue"},
+          {"step": 11, "condition": "upsert_thread Err", "action": "stats.failed += 1; warn 'failed to upsert rollout {path}: {err}'; continue"},
+          {"step": 11, "condition": "set_thread_memory_mode Err", "action": "stats.failed += 1; warn 'failed to restore memory mode for {path}: {err}'; continue"},
+          {"step": 11, "condition": "persist_dynamic_tools Err", "action": "warn 'failed to backfill dynamic tools {path}: {err}' — не инкрементит failed (stats)"},
+          {"step": 11, "condition": "read_session_meta_line Err для dynamic tools", "action": "warn 'failed to read session meta for dynamic tools {path}'"},
+          {"step": 12, "condition": "checkpoint_backfill Err", "action": "warn 'failed to checkpoint backfill at {path}: {err}'; last_watermark не обновляется"},
+          {"step": 13, "condition": "mark_backfill_complete Err", "action": "warn 'failed to mark backfill complete at {path}: {err}'"}
+        ],
+        "edge_cases": [
+          {"condition": "sessions_root или archived_root не существуют", "action": "try_exists false → skip root, продолжить с другим"},
+          {"condition": "directory unreadable", "action": "warn 'failed to read directory {dir}: {err}'; continue"},
+          {"condition": "entry unreadable", "action": "warn 'failed to read directory entry under {dir}: {err}'; continue"},
+          {"condition": "file_type unreadable", "action": "warn 'failed to read file type for {path}: {err}'; continue"}
+        ],
+        "lifecycle": {
+          "entity": "SRC-0007/entity/backfill-state",
+          "states": ["initial (pre-migration)", "Running (lease held)", "Complete"],
+          "transition": {
+            "from": "initial",
+            "to": "Complete",
+            "guard": "successfully scanned все существующие rollout + upsert с учётом last_watermark",
+            "side_effect": "mark_backfill_complete(last_watermark); metric DB_METRIC_BACKFILL counters; timer record с outcome (success/failed/partial_failure)"
+          }
+        },
+        "ux": null,
+        "result": "Все исторические rollout-файлы (active + archived) проиндексированы в SQLite; backfill_state = Complete; последующие list/read операции могут использовать state_db"
+      }
+    },
+    {
+      "id": "SRC-0007/uc.sub/append-thread-name",
+      "src": "SRC-0007",
+      "composition": "use_case",
+      "level": "sub",
+      "strategic_domain": null,
+      "terms": {
+        "actor": "session_index::append_thread_name",
+        "goal": "Добавить запись в append-only session_index.jsonl для связки thread_id ↔ thread_name",
+        "steps": [
+          "1. updated_at = OffsetDateTime::now_utc().format(Rfc3339).unwrap_or_else(|_| 'unknown')",
+          "2. entry = SessionIndexEntry { id: thread_id, thread_name: name.to_string, updated_at }",
+          "3. append_session_index_entry: path = codex_home.join(SESSION_INDEX_FILE='session_index.jsonl')",
+          "4. tokio::fs::OpenOptions::new().create(true).append(true).open(path)",
+          "5. serde_json::to_string(entry) + '\\n' → write_all + flush"
+        ],
+        "extensions (Cockburn)": [
+          {"step": 1, "condition": "Rfc3339 format Err", "action": "updated_at = 'unknown' — запись всё равно создаётся"},
+          {"step": 5, "condition": "serde_json::to_string Err", "action": "std::io::Error::other(e) — ошибка пробрасывается"}
+        ],
+        "edge_cases": [
+          {"condition": "thread уже имеет предыдущий name", "action": "старая запись остаётся; новая запись append добавляется последней — при чтении от конца побеждает"},
+          {"condition": "thread_name обновляется на пустую строку", "action": "пустой name — запись всё равно append; find_thread_names_by_ids фильтрует по !name.is_empty()"}
+        ],
+        "lifecycle": null,
+        "ux": null,
+        "result": "Новая запись в session_index.jsonl; последующие find_thread_name_by_id / find_thread_meta_by_name_str находят её first при reverse-scan"
+      }
+    },
+    {
+      "id": "SRC-0007/uc.sub/find-thread-by-name",
+      "src": "SRC-0007",
+      "composition": "use_case",
+      "level": "sub",
+      "strategic_domain": null,
+      "terms": {
+        "actor": "session_index::find_thread_meta_by_name_str",
+        "goal": "По строке-имени найти актуальный (читаемый) rollout-файл и его session meta",
+        "steps": [
+          "1. Проверить name.trim().is_empty() → Ok(None)",
+          "2. session_index_path(codex_home); если !exists → Ok(None)",
+          "3. Создать mpsc::channel(1); spawn_blocking(stream_thread_ids_from_end_by_name(path, name, tx))",
+          "4. stream_thread_ids_from_end_by_name: seen=HashSet; scan_index_from_end_for_each — для каждой entry (от конца к началу): если seen.insert(entry.id) && entry.thread_name == name → blocking_send(entry.id)",
+          "5. Основной await-цикл: while rx.recv() — для каждого thread_id: find_thread_path_by_id_str → если path есть и read_session_meta_line Ok → drop(rx); await scan; return Some((path, session_meta))",
+          "6. Если rx исчерпан — scan.await + return Ok(None)"
+        ],
+        "extensions (Cockburn)": [
+          {"step": 4, "condition": "tx.blocking_send Err (receiver dropped)", "action": "вернуть Some(entry.clone) из predicate — scan завершается"},
+          {"step": 5, "condition": "find_thread_path_by_id_str Err", "action": "пробрасывается через ? — ошибка наверх"},
+          {"step": 5, "condition": "read_session_meta_line Err", "action": "продолжить цикл — следующий thread_id (не ловить)"}
+        ],
+        "edge_cases": [
+          {"condition": "Самая свежая запись для id указывает на thread, rollout которого удалён / повреждён", "action": "продолжать идти по reverse stream, пока не найдём id с загружаемым rollout — 'unsaved or partial rename не должен shadow-ить older persisted session with the same name' (цитата из кода)"},
+          {"condition": "id переименовывался несколько раз", "action": "HashSet seen гарантирует: только самая новая запись для id считается текущим name; если текущий name не тот что запрошен — id не отправляется"},
+          {"condition": "session_index.jsonl повреждён / содержит невалидный JSON", "action": "parse_line_from_rev возвращает Ok(None) для строк которые не парсятся как SessionIndexEntry — continue"}
+        ],
+        "lifecycle": null,
+        "ux": null,
+        "result": "Option<(PathBuf, SessionMetaLine)> — path и session meta самого нового матчинга name с валидным rollout"
+      }
+    }
+  ]
+}

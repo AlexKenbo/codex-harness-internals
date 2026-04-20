@@ -1,0 +1,500 @@
+{
+  "src": "SRC-0006",
+  "schema_version": "2.0",
+  "lens": "use_case",
+  "compositions": [
+    {
+      "id": "SRC-0006/uc.user/tail-codex-logs",
+      "src": "SRC-0006",
+      "composition": "use_case",
+      "level": "user",
+      "strategic_domain": "наблюдаемость и диагностика Codex",
+      "terms": {
+        "actor": "Оператор/разработчик Codex (пользователь CLI codex-state-logs)",
+        "goal": "Просматривать логи Codex в реальном времени с фильтрами по уровню, времени, модулю, файлу, thread и подстроке",
+        "steps": [
+          "1. Оператор запускает codex-state-logs с флагами --codex-home/--db, --level, --from, --to, --module, --file, --thread-id, --search, --threadless, --backfill, --poll-ms, --compact",
+          "2. CLI определяет путь к logs DB: явный --db, иначе CODEX_HOME (env var) или ~/.codex → logs_db_path",
+          "3. CLI инициализирует StateRuntime для logs-client",
+          "4. CLI собирает LogFilter из аргументов (level → uppercase; from/to → unix или RFC3339 → unix секунды; пустые module/file/thread_id отбрасываются)",
+          "5. CLI выполняет backfill: запрашивает последние N строк (descending=true, limit=backfill), переворачивает порядок, печатает →triggers SRC-0006/uc.sub/query-logs",
+          "6. CLI запоминает last_id (max id из backfill); если backfill вернул 0 строк — last_id = max_log_id (без backfill печати)",
+          "7. CLI входит в цикл tail: каждые poll_ms запрашивает строки с id > last_id (descending=false), печатает их, обновляет last_id = max(last_id, row.id) →triggers SRC-0006/uc.sub/query-logs",
+          "8. Оператор видит отформатированные строки лога: timestamp + level + [thread_id] + target + message (или compact: timestamp + level + message)"
+        ],
+        "extensions (Cockburn)": [
+          {"step": 4, "condition": "не удалось распарсить --from", "action": "вернуть ошибку 'failed to parse --from' через anyhow context"},
+          {"step": 4, "condition": "не удалось распарсить --to", "action": "вернуть ошибку 'failed to parse --to' через anyhow context"},
+          {"step": 4, "condition": "значение --from/--to не unix-секунды и не RFC3339", "action": "вернуть ошибку 'expected RFC3339 or unix seconds, got <value>'"},
+          {"step": 5, "condition": "запрос backfill упал", "action": "вернуть ошибку 'failed to fetch backfill logs'"},
+          {"step": 7, "condition": "запрос новых строк упал", "action": "вернуть ошибку 'failed to fetch new logs'"},
+          {"step": 6, "condition": "запрос max_log_id упал", "action": "вернуть ошибку 'failed to fetch max log id'"},
+          {"step": 5, "condition": "backfill = 0", "action": "пропустить печать backfill, перейти к шагу 6"},
+          {"step": 8, "condition": "сообщение содержит 'ToolCall: apply_patch'", "action": "применить heuristic apply_patch форматирование: '+' строки → зелёным, '-' строки → красным, остальные → bold"}
+        ],
+        "edge_cases": [
+          {"condition": "home_dir() недоступен", "action": "использовать относительный путь PathBuf::from('.codex')"},
+          {"condition": "db_path не имеет parent", "action": "использовать PathBuf::from('.') как codex_home для StateRuntime"},
+          {"condition": "ts_nanos > u32::MAX", "action": "использовать 0 в качестве наносекунд при форматировании (try_from с unwrap_or(0))"},
+          {"condition": "DateTime::from_timestamp вернул None", "action": "печать в виде '<ts>.<ts_nanos:09>Z' без валидации"},
+          {"condition": "thread_id отсутствует у строки", "action": "печатать '-' вместо thread_id"},
+          {"condition": "message отсутствует у строки", "action": "печатать пустую строку"}
+        ],
+        "lifecycle": null,
+        "ux": [
+          "форматированный вывод: timestamp dimmed; level окрашен (error=red, warn=yellow, info=green, debug=blue, trace=magenta, остальные=bold), padded до 5 символов; thread_id blue+dimmed; target dimmed; сообщение bold",
+          "compact-режим: только время в HH:MM:SS, level, message",
+          "обычный режим: RFC3339 миллисекунды, level, [thread_id], target, message",
+          "heuristic apply_patch: '+' зелёным, '-' красным, остальные строки bold (для diff-визуализации в логах)"
+        ],
+        "result": "Оператор видит непрерывный поток отфильтрованных логов Codex: backfill последних N строк, затем continuous tail с интервалом poll_ms, до прерывания процесса"
+      }
+    },
+    {
+      "id": "SRC-0006/uc.sub/query-logs",
+      "src": "SRC-0006",
+      "composition": "use_case",
+      "level": "sub",
+      "strategic_domain": null,
+      "terms": {
+        "actor": "Logs Query Adapter (to_log_query + StateRuntime.query_logs)",
+        "goal": "Сформировать LogQuery из LogFilter и режима выборки и запросить строки логов из SQLite logs DB",
+        "steps": [
+          "1. Logs Query Adapter принимает LogFilter, limit (Option<usize>), after_id (Option<i64>), descending (bool)",
+          "2. Logs Query Adapter копирует фильтры в LogQuery: level_upper, from_ts, to_ts, module_like, file_like, thread_ids, search, include_threadless",
+          "3. Logs Query Adapter выставляет after_id, limit, descending по режиму вызова (backfill: descending=true, limit=N; tail: after_id=last_id, descending=false; max_id: descending=false)",
+          "4. StateRuntime выполняет SQL-выборку логов с применением фильтров и возвращает Vec<LogRow>"
+        ],
+        "extensions (Cockburn)": null,
+        "edge_cases": [
+          {"condition": "limit=None", "action": "выборка без лимита (полный набор по фильтру)"},
+          {"condition": "after_id=None", "action": "выборка от начала (с учётом сортировки)"},
+          {"condition": "thread_ids пуст и include_threadless=false", "action": "выбираются только строки с любыми thread_id (поведение определяется реализацией query)"}
+        ],
+        "lifecycle": null,
+        "ux": null,
+        "result": "Возвращён Vec<LogRow> по применённым фильтрам и режиму выборки"
+      }
+    },
+    {
+      "id": "SRC-0006/uc.sub/extract-thread-metadata-from-rollout",
+      "src": "SRC-0006",
+      "composition": "use_case",
+      "level": "sub",
+      "strategic_domain": null,
+      "terms": {
+        "actor": "Rollout Extraction Module (apply_rollout_item)",
+        "goal": "Применить RolloutItem к ThreadMetadata, обновляя поля в зависимости от типа item, чтобы получить каноничную метаданные thread из rollout-файла",
+        "steps": [
+          "1. Rollout Extraction Module получает mutable ThreadMetadata, RolloutItem и default_provider",
+          "2. Rollout Extraction Module диспатчит по типу RolloutItem: SessionMeta → apply_session_meta_from_item; TurnContext → apply_turn_context; EventMsg → apply_event_msg; ResponseItem → apply_response_item (no-op); Compacted → no-op",
+          "3. Для SessionMeta: проверяет соответствие meta.id и metadata.id (если разные — игнорирует line); устанавливает source/agent_nickname/agent_role/agent_path; устанавливает model_provider если присутствует; устанавливает cli_version если непустой; устанавливает cwd если непустой; устанавливает git_sha/git_branch/git_origin_url из git-блока",
+          "4. Для TurnContext: устанавливает cwd только если текущий пуст; всегда устанавливает model, reasoning_effort, sandbox_policy, approval_mode",
+          "5. Для EventMsg::TokenCount: устанавливает tokens_used = max(0, info.total_token_usage.total_tokens) если info присутствует",
+          "6. Для EventMsg::UserMessage: если first_user_message пуст — устанавливает preview; если title пуст — устанавливает title как очищенное от USER_MESSAGE_BEGIN сообщение",
+          "7. Для EventMsg::ThreadNameUpdated: устанавливает title как trim(thread_name), если thread_name присутствует и непустой после trim",
+          "8. После всех операций: если model_provider пуст — заполняет его default_provider"
+        ],
+        "extensions (Cockburn)": [
+          {"step": 3, "condition": "meta.id ≠ metadata.id (forked rollout с embedded source session)", "action": "проигнорировать SessionMeta line, не обновлять метаданные"},
+          {"step": 4, "condition": "metadata.cwd уже непустой (пришёл из SessionMeta)", "action": "сохранить cwd из SessionMeta, не перезаписывать из TurnContext"},
+          {"step": 6, "condition": "user.message пустое и нет images/local_images", "action": "оставить first_user_message=None, title не менять"},
+          {"step": 6, "condition": "user.message пустое, но есть images или local_images", "action": "first_user_message = '[Image]' (IMAGE_ONLY_USER_MESSAGE_PLACEHOLDER), title не менять"},
+          {"step": 6, "condition": "user.message пустое после trim/strip префикса", "action": "title не устанавливать, оставить пустой"},
+          {"step": 7, "condition": "thread_name=None или пустой после trim", "action": "title не менять"}
+        ],
+        "edge_cases": [
+          {"condition": "ResponseItem с user-сообщением", "action": "first_user_message и title не устанавливаются (apply_response_item — no-op; см. тест response_item_user_messages_do_not_set_title_or_first_user_message)"},
+          {"condition": "RolloutItem::Compacted", "action": "no-op (не влияет на метаданные)"},
+          {"condition": "TokenCount без info", "action": "tokens_used не обновляется"},
+          {"condition": "total_tokens отрицательное", "action": "сохраняется max(0, total_tokens)"},
+          {"condition": "TurnContext с моделью при пришедшем ранее SessionMeta", "action": "model/reasoning_effort устанавливаются из TurnContext, не из SessionMeta (см. тест session_meta_does_not_set_model_or_reasoning_effort)"}
+        ],
+        "lifecycle": {
+          "entity": "SRC-0006/entity/thread-metadata",
+          "states": ["empty/initialized", "session-applied", "turn-context-applied", "event-applied"],
+          "transition": {
+            "from": "empty/initialized",
+            "to": "fully-populated",
+            "guard": "по мере чтения rollout строк применяются RolloutItem; first_user_message и title защищены от перезаписи (только если пустые)",
+            "side_effect": "model_provider заполняется default_provider если по итогу пуст"
+          }
+        },
+        "ux": null,
+        "result": "ThreadMetadata обновлена согласно RolloutItem: правильные поля заполнены, защищённые поля сохранены, model_provider гарантированно непустой"
+      }
+    },
+    {
+      "id": "SRC-0006/uc.sub/persist-tracing-event-to-logs-db",
+      "src": "SRC-0006",
+      "composition": "use_case",
+      "level": "sub",
+      "strategic_domain": null,
+      "terms": {
+        "actor": "Log DB Layer (LogDbLayer + run_inserter)",
+        "goal": "Захватить tracing-событие, обогатить контекстом span'ов и записать в SQLite logs DB пачками с периодическим flush",
+        "steps": [
+          "1. Log DB Layer инициализируется через start(state_db): создаёт mpsc-канал ёмкостью LOG_QUEUE_CAPACITY=512, запускает run_inserter в tokio task",
+          "2. Log DB Layer на on_new_span сохраняет SpanLogContext в extensions span'а (name, formatted_fields, thread_id из визитора)",
+          "3. Log DB Layer на on_record обновляет SpanLogContext: дополняет thread_id и formatted_fields",
+          "4. Log DB Layer на on_event строит LogEntry: извлекает message и thread_id через MessageVisitor; если thread_id отсутствует — пытается найти в span scope (event_thread_id обходит сверху вниз и берёт последний непустой); собирает feedback_log_body как 'span1{fields}:span2{fields}: <event-fields>'; берёт ts/ts_nanos из SystemTime::now; level/target/module_path/file/line из metadata; process_uuid из current_process_log_uuid",
+          "5. Log DB Layer пытается отправить LogEntry в mpsc-канал через try_send (без блокировки)",
+          "6. run_inserter получает LogDbCommand из канала: Entry → буферизует; если буфер достиг LOG_BATCH_SIZE=128 → flush; Flush(reply) → flush + ответ",
+          "7. run_inserter каждые LOG_FLUSH_INTERVAL=2s по тикеру выполняет flush",
+          "8. flush вызывает state_db.insert_logs(entries) и сбрасывает буфер"
+        ],
+        "extensions (Cockburn)": [
+          {"step": 5, "condition": "канал переполнен (try_send fail)", "action": "отбросить событие (let _ = try_send); потеря лога без блокировки горячего пути"},
+          {"step": 6, "condition": "канал закрыт (None из recv)", "action": "финальный flush буфера и выход из цикла"},
+          {"step": 8, "condition": "insert_logs вернул ошибку", "action": "ошибка проглатывается (let _ = insert_logs); буфер уже сброшен"},
+          {"step": 6, "condition": "получен Flush(reply) при пустом буфере", "action": "flush = no-op; reply.send(()) выполняется"}
+        ],
+        "edge_cases": [
+          {"condition": "SystemTime::now < UNIX_EPOCH (clock skew)", "action": "duration_since fail → используется Duration::from_secs(0)"},
+          {"condition": "thread_id присутствует в нескольких span'ах сверху вниз", "action": "берётся последний непустой (event_thread_id перезаписывает)"},
+          {"condition": "флаш через flush() явно", "action": "клиент создаёт oneshot, отправляет LogDbCommand::Flush; ждёт rx — гарантия что все буферы записаны"},
+          {"condition": "одновременно несколько процессов пишут в logs DB", "action": "process_uuid 'pid:<pid>:<uuid_v4>' уникален per-process — позволяет различать"}
+        ],
+        "lifecycle": {
+          "entity": "SRC-0006/entity/log-entry",
+          "states": ["created (от tracing event)", "queued (в mpsc буфере)", "buffered (в run_inserter)", "persisted (в SQLite)"],
+          "transition": {
+            "from": "queued",
+            "to": "persisted",
+            "guard": "буфер достиг LOG_BATCH_SIZE=128 ИЛИ прошло LOG_FLUSH_INTERVAL=2s ИЛИ получен явный Flush",
+            "side_effect": "state_db.insert_logs(batch); буфер очищен"
+          }
+        },
+        "ux": null,
+        "result": "Tracing-события Codex асинхронно записаны в SQLite logs DB пачками; горячий путь (on_event) не блокируется при заполненном канале (с возможной потерей событий)"
+      }
+    },
+    {
+      "id": "SRC-0006/uc.sub/build-thread-metadata",
+      "src": "SRC-0006",
+      "composition": "use_case",
+      "level": "sub",
+      "strategic_domain": null,
+      "terms": {
+        "actor": "Thread Metadata Builder (ThreadMetadataBuilder.build)",
+        "goal": "Собрать каноничную ThreadMetadata из ThreadMetadataBuilder, заполняя пропущенные значения значениями по умолчанию",
+        "steps": [
+          "1. Thread Metadata Builder получает default_provider: &str",
+          "2. Thread Metadata Builder сериализует source/sandbox_policy/approval_mode через enum_to_string",
+          "3. Thread Metadata Builder канонизирует created_at через canonicalize_datetime (округление через epoch_millis)",
+          "4. Thread Metadata Builder вычисляет updated_at: если задан — канонизирует, иначе = created_at",
+          "5. Thread Metadata Builder заполняет agent_path: если пуст в builder — берёт source.get_agent_path()",
+          "6. Thread Metadata Builder заполняет model_provider: если пуст — default_provider",
+          "7. Thread Metadata Builder заполняет cli_version: если None — пустая строка",
+          "8. Thread Metadata Builder инициализирует runtime-поля: model=None, reasoning_effort=None, title='', tokens_used=0, first_user_message=None",
+          "9. Thread Metadata Builder копирует git_sha/git_branch/git_origin_url, archived_at (canonicalize)",
+          "10. Thread Metadata Builder возвращает ThreadMetadata"
+        ],
+        "extensions (Cockburn)": [
+          {"step": 4, "condition": "updated_at = None", "action": "updated_at = created_at"},
+          {"step": 5, "condition": "agent_path = None и source.get_agent_path() возвращает Some", "action": "agent_path = source.get_agent_path()"},
+          {"step": 6, "condition": "model_provider = None в builder", "action": "model_provider = default_provider"},
+          {"step": 7, "condition": "cli_version = None в builder", "action": "cli_version = String::new()"}
+        ],
+        "edge_cases": [
+          {"condition": "ThreadMetadataBuilder::new(...)", "action": "создаёт builder с дефолтами: cwd=PathBuf::new(), sandbox_policy=read_only_policy, approval_mode=OnRequest, все опциональные поля = None"}
+        ],
+        "lifecycle": null,
+        "ux": null,
+        "result": "ThreadMetadata сконструирована с гарантированно непустым model_provider и канонизированными timestamps"
+      }
+    },
+    {
+      "id": "SRC-0006/uc.sub/reconcile-thread-metadata",
+      "src": "SRC-0006",
+      "composition": "use_case",
+      "level": "sub",
+      "strategic_domain": null,
+      "terms": {
+        "actor": "Thread Metadata Reconciler (ThreadMetadata.prefer_existing_git_info + diff_fields)",
+        "goal": "Согласовать ThreadMetadata извлечённую из rollout с существующей записью БД: сохранить уже известную git-информацию и определить какие поля изменились",
+        "steps": [
+          "1. Thread Metadata Reconciler получает self (новая метаданные из rollout) и existing (метаданные из БД)",
+          "2. Thread Metadata Reconciler вызывает prefer_existing_git_info(existing): если existing.git_sha=Some — копирует в self; то же для git_branch и git_origin_url",
+          "3. Thread Metadata Reconciler (опционально) вызывает diff_fields(other): сравнивает 22 поля по очереди (id, rollout_path, created_at, updated_at, source, agent_nickname, agent_role, agent_path, model_provider, model, reasoning_effort, cwd, cli_version, title, sandbox_policy, approval_mode, tokens_used, first_user_message, archived_at, git_sha, git_branch, git_origin_url) и возвращает Vec<&'static str> с именами изменённых полей"
+        ],
+        "extensions (Cockburn)": [
+          {"step": 2, "condition": "existing.git_sha = None", "action": "self.git_sha не перезаписывается"},
+          {"step": 2, "condition": "existing.git_branch = None", "action": "self.git_branch не перезаписывается"},
+          {"step": 2, "condition": "existing.git_origin_url = None", "action": "self.git_origin_url не перезаписывается"}
+        ],
+        "edge_cases": [
+          {"condition": "self и other полностью идентичны", "action": "diff_fields возвращает пустой Vec"}
+        ],
+        "lifecycle": null,
+        "ux": null,
+        "result": "ThreadMetadata содержит git-данные из существующей записи (если они там были); список изменённых полей доступен для логирования/upsert"
+      }
+    },
+    {
+      "id": "SRC-0006/uc.sub/parse-agent-job-row",
+      "src": "SRC-0006",
+      "composition": "use_case",
+      "level": "sub",
+      "strategic_domain": null,
+      "terms": {
+        "actor": "Agent Job Row Parser (TryFrom<AgentJobRow> for AgentJob)",
+        "goal": "Преобразовать строку SQLite (AgentJobRow) в AgentJob с валидацией всех полей",
+        "steps": [
+          "1. Agent Job Row Parser получает AgentJobRow",
+          "2. Agent Job Row Parser парсит output_schema_json: Option<&str> → serde_json::from_str → Option<Value>",
+          "3. Agent Job Row Parser парсит input_headers_json как Vec<String>",
+          "4. Agent Job Row Parser конвертирует max_runtime_seconds: Option<i64> → Option<u64> (через u64::try_from)",
+          "5. Agent Job Row Parser парсит status через AgentJobStatus::parse(value.status)",
+          "6. Agent Job Row Parser конвертирует auto_export: i64 → bool (auto_export != 0)",
+          "7. Agent Job Row Parser конвертирует timestamps: created_at, updated_at (epoch_seconds_to_datetime); started_at и completed_at — Option (transpose)",
+          "8. Agent Job Row Parser возвращает AgentJob"
+        ],
+        "extensions (Cockburn)": [
+          {"step": 4, "condition": "max_runtime_seconds < 0 (u64::try_from fail)", "action": "вернуть anyhow ошибку 'invalid max_runtime_seconds value'"},
+          {"step": 5, "condition": "status не входит в {pending, running, completed, failed, cancelled}", "action": "вернуть anyhow ошибку 'invalid agent job status: <value>'"},
+          {"step": 7, "condition": "epoch_seconds невалидный (DateTime::from_timestamp вернул None)", "action": "вернуть anyhow ошибку 'invalid unix timestamp: <secs>'"},
+          {"step": 2, "condition": "output_schema_json не валидный JSON", "action": "проброс serde_json error через ?"}
+        ],
+        "edge_cases": [
+          {"condition": "auto_export = 0", "action": "auto_export = false"},
+          {"condition": "auto_export = любое не-0", "action": "auto_export = true"}
+        ],
+        "lifecycle": null,
+        "ux": null,
+        "result": "Корректный AgentJob или anyhow::Error с описанием невалидного поля"
+      }
+    },
+    {
+      "id": "SRC-0006/uc.sub/parse-agent-job-item-row",
+      "src": "SRC-0006",
+      "composition": "use_case",
+      "level": "sub",
+      "strategic_domain": null,
+      "terms": {
+        "actor": "Agent Job Item Row Parser (TryFrom<AgentJobItemRow> for AgentJobItem)",
+        "goal": "Преобразовать строку SQLite (AgentJobItemRow) в AgentJobItem с валидацией",
+        "steps": [
+          "1. Agent Job Item Row Parser получает AgentJobItemRow",
+          "2. Agent Job Item Row Parser парсит row_json как Value (serde_json::from_str)",
+          "3. Agent Job Item Row Parser парсит status через AgentJobItemStatus::parse",
+          "4. Agent Job Item Row Parser парсит result_json: Option<&str> → Option<Value>",
+          "5. Agent Job Item Row Parser конвертирует timestamps: created_at, updated_at (epoch_seconds_to_datetime); completed_at и reported_at — Option (transpose)",
+          "6. Agent Job Item Row Parser возвращает AgentJobItem"
+        ],
+        "extensions (Cockburn)": [
+          {"step": 3, "condition": "status не входит в {pending, running, completed, failed}", "action": "вернуть anyhow ошибку 'invalid agent job item status: <value>'"},
+          {"step": 5, "condition": "epoch_seconds невалидный", "action": "вернуть anyhow ошибку 'invalid unix timestamp: <secs>'"},
+          {"step": 2, "condition": "row_json не валидный JSON", "action": "проброс serde_json error через ?"},
+          {"step": 4, "condition": "result_json не валидный JSON", "action": "проброс serde_json error через ?"}
+        ],
+        "edge_cases": null,
+        "lifecycle": null,
+        "ux": null,
+        "result": "Корректный AgentJobItem или anyhow::Error"
+      }
+    },
+    {
+      "id": "SRC-0006/uc.sub/parse-backfill-state",
+      "src": "SRC-0006",
+      "composition": "use_case",
+      "level": "sub",
+      "strategic_domain": null,
+      "terms": {
+        "actor": "Backfill State Parser (BackfillState::try_from_row)",
+        "goal": "Прочитать BackfillState из строки SQLite (status, last_watermark, last_success_at)",
+        "steps": [
+          "1. Backfill State Parser получает SqliteRow",
+          "2. Backfill State Parser извлекает status: String через try_get",
+          "3. Backfill State Parser парсит status через BackfillStatus::parse",
+          "4. Backfill State Parser извлекает last_success_at: Option<i64> и конвертирует через epoch_seconds_to_datetime (transpose)",
+          "5. Backfill State Parser извлекает last_watermark: Option<String>",
+          "6. Backfill State Parser возвращает BackfillState"
+        ],
+        "extensions (Cockburn)": [
+          {"step": 3, "condition": "status не входит в {pending, running, complete}", "action": "вернуть anyhow ошибку 'invalid backfill status: <value>'"},
+          {"step": 4, "condition": "last_success_at — невалидный epoch", "action": "вернуть anyhow ошибку 'invalid unix timestamp: <secs>'"}
+        ],
+        "edge_cases": [
+          {"condition": "BackfillState::default() (нет строки)", "action": "status=Pending, last_watermark=None, last_success_at=None"}
+        ],
+        "lifecycle": {
+          "entity": "SRC-0006/entity/backfill-state",
+          "states": ["pending", "running", "complete"],
+          "transition": {
+            "from": "pending → running → complete",
+            "to": "complete",
+            "guard": "переходы определяются вызывающей стороной (orchestrator backfill); в SRC хранится только текущий статус",
+            "side_effect": "при complete — обновляется last_success_at и last_watermark"
+          }
+        },
+        "ux": null,
+        "result": "Корректный BackfillState или anyhow::Error"
+      }
+    },
+    {
+      "id": "SRC-0006/uc.sub/parse-stage1-output",
+      "src": "SRC-0006",
+      "composition": "use_case",
+      "level": "sub",
+      "strategic_domain": null,
+      "terms": {
+        "actor": "Stage1 Output Parser (Stage1OutputRow::try_from_row + TryFrom<Stage1OutputRow>)",
+        "goal": "Прочитать Stage1Output из строки SQLite через двухэтапную конверсию (row → row struct → Stage1Output)",
+        "steps": [
+          "1. Stage1 Output Parser считывает все поля строки (thread_id, rollout_path, source_updated_at, raw_memory, rollout_summary, rollout_slug, cwd, git_branch, generated_at) в Stage1OutputRow",
+          "2. Stage1 Output Parser конвертирует thread_id: String → ThreadId (try_from)",
+          "3. Stage1 Output Parser конвертирует rollout_path и cwd: String → PathBuf",
+          "4. Stage1 Output Parser конвертирует source_updated_at и generated_at через epoch_seconds_to_datetime",
+          "5. Stage1 Output Parser возвращает Stage1Output"
+        ],
+        "extensions (Cockburn)": [
+          {"step": 2, "condition": "thread_id невалидный", "action": "проброс ThreadId::try_from ошибки"},
+          {"step": 4, "condition": "epoch_seconds невалидный", "action": "вернуть anyhow ошибку 'invalid unix timestamp: <secs>'"}
+        ],
+        "edge_cases": null,
+        "lifecycle": null,
+        "ux": null,
+        "result": "Корректный Stage1Output или anyhow::Error"
+      }
+    },
+    {
+      "id": "SRC-0006/uc.sub/build-stage1-output-ref",
+      "src": "SRC-0006",
+      "composition": "use_case",
+      "level": "sub",
+      "strategic_domain": null,
+      "terms": {
+        "actor": "Stage1 Output Ref Builder (stage1_output_ref_from_parts)",
+        "goal": "Собрать Stage1OutputRef из частей (thread_id, source_updated_at_secs, rollout_slug)",
+        "steps": [
+          "1. Stage1 Output Ref Builder получает thread_id: String, source_updated_at: i64, rollout_slug: Option<String>",
+          "2. Stage1 Output Ref Builder конвертирует thread_id через ThreadId::try_from",
+          "3. Stage1 Output Ref Builder конвертирует source_updated_at через epoch_seconds_to_datetime",
+          "4. Stage1 Output Ref Builder возвращает Stage1OutputRef"
+        ],
+        "extensions (Cockburn)": [
+          {"step": 2, "condition": "thread_id невалидный", "action": "проброс ThreadId::try_from ошибки"},
+          {"step": 3, "condition": "source_updated_at невалидный", "action": "проброс anyhow ошибки"}
+        ],
+        "edge_cases": null,
+        "lifecycle": null,
+        "ux": null,
+        "result": "Корректный Stage1OutputRef или anyhow::Error"
+      }
+    },
+    {
+      "id": "SRC-0006/uc.sub/parse-thread-row",
+      "src": "SRC-0006",
+      "composition": "use_case",
+      "level": "sub",
+      "strategic_domain": null,
+      "terms": {
+        "actor": "Thread Row Parser (ThreadRow::try_from_row + TryFrom<ThreadRow>)",
+        "goal": "Прочитать ThreadMetadata из строки SQLite state DB (через ThreadRow)",
+        "steps": [
+          "1. Thread Row Parser считывает 22 поля строки в ThreadRow",
+          "2. Thread Row Parser конвертирует id: String → ThreadId (try_from)",
+          "3. Thread Row Parser конвертирует rollout_path и cwd: String → PathBuf",
+          "4. Thread Row Parser конвертирует created_at и updated_at через epoch_millis_to_datetime",
+          "5. Thread Row Parser конвертирует reasoning_effort: Option<String> → Option<ReasoningEffort> через .parse(), при ошибке — None",
+          "6. Thread Row Parser конвертирует first_user_message: пустая String → None, иначе Some(String)",
+          "7. Thread Row Parser конвертирует archived_at через epoch_seconds_to_datetime (transpose)",
+          "8. Thread Row Parser возвращает ThreadMetadata"
+        ],
+        "extensions (Cockburn)": [
+          {"step": 2, "condition": "id невалидный", "action": "проброс ThreadId::try_from ошибки"},
+          {"step": 4, "condition": "epoch_millis невалидный", "action": "вернуть anyhow ошибку 'invalid unix timestamp millis: <value>'"},
+          {"step": 5, "condition": "reasoning_effort содержит неизвестное значение (например, 'future')", "action": "результат = None (см. тест thread_row_ignores_unknown_reasoning_effort_values)"},
+          {"step": 7, "condition": "archived_at невалидный", "action": "вернуть anyhow ошибку 'invalid unix timestamp seconds: <value>'"}
+        ],
+        "edge_cases": [
+          {"condition": "epoch_millis < MIN_EPOCH_MILLIS (1_577_836_800_000 = 2020-01-01)", "action": "значение интерпретируется как секунды и умножается на 1000 (legacy миграция: старые строки с секундной точностью)"},
+          {"condition": "first_user_message в БД хранится как пустая строка", "action": "конвертируется в None"}
+        ],
+        "lifecycle": null,
+        "ux": null,
+        "result": "Корректная ThreadMetadata из БД или anyhow::Error"
+      }
+    },
+    {
+      "id": "SRC-0006/uc.sub/compute-pagination-anchor",
+      "src": "SRC-0006",
+      "composition": "use_case",
+      "level": "sub",
+      "strategic_domain": null,
+      "terms": {
+        "actor": "Pagination Anchor Computer (anchor_from_item)",
+        "goal": "Сформировать пагинационный Anchor для keyset-пагинации thread'ов из ThreadMetadata и SortKey",
+        "steps": [
+          "1. Pagination Anchor Computer получает ThreadMetadata и SortKey",
+          "2. Pagination Anchor Computer парсит item.id (ThreadId) → Uuid через Uuid::parse_str",
+          "3. Pagination Anchor Computer выбирает ts: SortKey::CreatedAt → item.created_at; SortKey::UpdatedAt → item.updated_at",
+          "4. Pagination Anchor Computer возвращает Some(Anchor { ts, id })"
+        ],
+        "extensions (Cockburn)": [
+          {"step": 2, "condition": "Uuid::parse_str вернул Err (id не парсится в Uuid)", "action": "вернуть None — anchor не сформирован"}
+        ],
+        "edge_cases": null,
+        "lifecycle": null,
+        "ux": null,
+        "result": "Some(Anchor) или None при невалидном UUID id"
+      }
+    },
+    {
+      "id": "SRC-0006/uc.sub/canonicalize-datetime",
+      "src": "SRC-0006",
+      "composition": "use_case",
+      "level": "sub",
+      "strategic_domain": null,
+      "terms": {
+        "actor": "Datetime Canonicalizer (canonicalize_datetime)",
+        "goal": "Привести DateTime<Utc> к канонической форме с миллисекундной точностью (для согласованности при чтении из старых записей с секундной точностью)",
+        "steps": [
+          "1. Datetime Canonicalizer получает dt: DateTime<Utc>",
+          "2. Datetime Canonicalizer конвертирует dt → epoch_millis (datetime_to_epoch_millis)",
+          "3. Datetime Canonicalizer конвертирует epoch_millis обратно в DateTime через epoch_millis_to_datetime",
+          "4. Datetime Canonicalizer возвращает результат, или исходный dt при ошибке"
+        ],
+        "extensions (Cockburn)": [
+          {"step": 3, "condition": "epoch_millis_to_datetime вернул Err", "action": "вернуть исходный dt (unwrap_or(dt))"}
+        ],
+        "edge_cases": [
+          {"condition": "значение epoch_millis < MIN_EPOCH_MILLIS (2020-01-01)", "action": "интерпретируется как секунды и умножается на 1000 (legacy second-precision rows)"}
+        ],
+        "lifecycle": null,
+        "ux": null,
+        "result": "DateTime<Utc> с миллисекундной точностью"
+      }
+    },
+    {
+      "id": "SRC-0006/uc.sub/initialize-state-databases",
+      "src": "SRC-0006",
+      "composition": "use_case",
+      "level": "sub",
+      "strategic_domain": null,
+      "terms": {
+        "actor": "State DB Migrator (runtime_state_migrator + runtime_logs_migrator + StateRuntime::init)",
+        "goal": "Применить встроенные SQL миграции к локальным SQLite файлам state и logs DB при инициализации, разрешая параллельную работу разных версий бинарника",
+        "steps": [
+          "1. State DB Migrator определяет CODEX_HOME (env var или ~/.codex)",
+          "2. State DB Migrator формирует пути logs_db_path и state_db_path внутри CODEX_HOME (имена 'logs', 'state' из LOGS_DB_FILENAME/STATE_DB_FILENAME)",
+          "3. State DB Migrator создаёт runtime_state_migrator на основе встроенного STATE_MIGRATOR (sqlx::migrate!('./migrations')) с ignore_missing=true",
+          "4. State DB Migrator создаёт runtime_logs_migrator на основе встроенного LOGS_MIGRATOR (sqlx::migrate!('./logs_migrations')) с ignore_missing=true",
+          "5. State DB Migrator применяет миграции к state DB (текущая версия = STATE_DB_VERSION=5)",
+          "6. State DB Migrator применяет миграции к logs DB (текущая версия = LOGS_DB_VERSION=2)"
+        ],
+        "extensions (Cockburn)": [
+          {"step": 5, "condition": "БД содержит applied миграции, отсутствующие во встроенном наборе (например, parallel-running newer binary применил новые миграции)", "action": "ignore_missing=true → старший бинарник игнорирует новые миграции, открывает БД и продолжает работу; checksum для известных версий по-прежнему проверяется"},
+          {"step": 5, "condition": "checksum существующей миграции не совпадает", "action": "стандартное поведение sqlx::migrate — ошибка применения миграций"}
+        ],
+        "edge_cases": [
+          {"condition": "STATE_DB_VERSION или LOGS_DB_VERSION в БД старше встроенной версии", "action": "стандартный путь sqlx::migrate — применение недостающих миграций"}
+        ],
+        "lifecycle": null,
+        "ux": null,
+        "result": "Локальные SQLite БД 'state' и 'logs' инициализированы и совместимы для одновременной работы старого и нового бинарника"
+      }
+    }
+  ]
+}

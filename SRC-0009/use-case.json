@@ -1,0 +1,806 @@
+{
+  "src": "SRC-0009",
+  "schema_version": "2.0",
+  "lens": "use_case",
+  "compositions": [
+    {
+      "id": "SRC-0009/uc.user/start-new-codex-thread",
+      "src": "SRC-0009",
+      "composition": "use_case",
+      "level": "user",
+      "strategic_domain": "управление жизненным циклом Codex-тредов",
+      "terms": {
+        "actor": "Пользователь/клиент через ThreadManager (cli/vscode/exec/mcp)",
+        "goal": "Запустить новый Codex-тред с заданным Config и получить рабочий CodexThread + первое событие SessionConfigured",
+        "steps": [
+          "1. Клиент вызывает ThreadManager::start_thread (или start_thread_with_tools / start_thread_with_tools_and_service_name) с Config, optional dynamic_tools, persist_extended_history, metrics_service_name, parent_trace",
+          "2. ThreadManager делегирует в ThreadManagerState::spawn_thread → spawn_thread_with_source (session_source = текущий session_source менеджера)",
+          "3. ThreadManagerState получает current environment из EnvironmentManager, регистрирует config в SkillsWatcher если environment не remote",
+          "4. ThreadManagerState вызывает Codex::spawn(CodexSpawnArgs{...}) →triggers SRC-0009/uc.sub/spawn-codex-session",
+          "5. ThreadManagerState вызывает finalize_thread_spawn: читает первое событие через codex.next_event(); требует EventMsg::SessionConfigured с id == INITIAL_SUBMIT_ID (\"\")",
+          "6. ThreadManagerState создаёт CodexThread::new(codex, session_configured.rollout_path.clone(), watch_registration), вставляет в threads map под thread_id",
+          "7. ThreadManagerState notify_thread_created(thread_id) — broadcast в thread_created_tx (capacity 1024)",
+          "8. Клиент получает NewThread { thread_id, thread: Arc<CodexThread>, session_configured }"
+        ],
+        "extensions (Cockburn)": [
+          {"step": 3, "condition": "environment_manager.current().await вернул Err", "action": "CodexErr::Fatal(\"failed to create environment: {err}\") и return"},
+          {"step": 4, "condition": "parent_trace задан, но context_from_w3c_trace_context(trace) отсутствует", "action": "warn!(\"ignoring invalid thread spawn trace carrier\"); parent_trace=None, продолжить spawn"},
+          {"step": 4, "condition": "Session::new вернул ошибку", "action": "map_session_init_error(&e, &config.codex_home) → возврат ошибки"},
+          {"step": 5, "condition": "первое событие не SessionConfigured или id != INITIAL_SUBMIT_ID", "action": "return CodexErr::SessionConfiguredNotFirstEvent"}
+        ],
+        "edge_cases": [
+          {"condition": "подзадача Codex — SubAgent с depth >= config.agent_max_depth", "action": "отключить Feature::SpawnCsv и Feature::Collab для этой сессии"},
+          {"condition": "SessionSource::SubAgent(_)", "action": "RefreshStrategy::Offline для models_manager (не тянуть онлайн список моделей)"},
+          {"condition": "test mode: current-thread tokio runtime", "action": "build_skills_watcher возвращает SkillsWatcher::noop() чтобы не стравить test runtime"}
+        ],
+        "lifecycle": {
+          "entity": "SRC-0009/entity/codex-thread",
+          "states": ["not_created", "spawning", "session_configured", "tracked_in_manager"],
+          "transition": {
+            "from": "spawning",
+            "to": "session_configured",
+            "guard": "первое событие = SessionConfigured с id == INITIAL_SUBMIT_ID",
+            "side_effect": "threads.insert(thread_id, thread) + broadcast thread_created"
+          }
+        },
+        "ux": null,
+        "result": "ThreadManager возвращает NewThread; thread доступен через get_thread(thread_id); подписчики subscribe_thread_created получают thread_id"
+      }
+    },
+    {
+      "id": "SRC-0009/uc.user/resume-thread-from-rollout",
+      "src": "SRC-0009",
+      "composition": "use_case",
+      "level": "user",
+      "strategic_domain": "восстановление истории Codex-тредов",
+      "terms": {
+        "actor": "Пользователь/клиент (cli/vscode) через ThreadManager",
+        "goal": "Продолжить прерванный тред с полной историей из rollout-файла",
+        "steps": [
+          "1. Клиент вызывает ThreadManager::resume_thread_from_rollout(config, rollout_path, auth_manager, parent_trace)",
+          "2. ThreadManager вызывает RolloutRecorder::get_rollout_history(&rollout_path) — читает persisted историю",
+          "3. ThreadManager::resume_thread_with_history спавнит тред с initial_history через spawn_thread",
+          "4. В Session::new: conversation_id = resumed_history.conversation_id (не новый), RolloutRecorderParams::resume(rollout_path, persistence_mode)",
+          "5. window_generation = число RolloutItem::Compacted в resumed.history (u64, usize::MAX при overflow)",
+          "6. state_builder = metadata::builder_from_items(resumed.history, resumed.rollout_path) — восстанавливает метаданные треда",
+          "7. base_instructions = conversation_history.get_base_instructions() (если есть) иначе model default",
+          "8. dynamic_tools = из persisted_tools (state_db.get_dynamic_tools) или из rollout (conversation_history.get_dynamic_tools) или Vec::new()"
+        ],
+        "extensions (Cockburn)": [
+          {"step": 2, "condition": "rollout_path не читается", "action": "ошибка распространяется из get_rollout_history"}
+        ],
+        "edge_cases": [
+          {"condition": "InitialHistory::Resumed в неefемerной сессии", "action": "rollout_params = RolloutRecorderParams::resume; не создаётся новый thread_id"},
+          {"condition": "subagent=true (SessionSource::SubAgent)", "action": "history_meta_fut возвращает (0,0) — не читать глобальную history metadata"}
+        ],
+        "lifecycle": {
+          "entity": "SRC-0009/entity/codex-thread",
+          "states": ["resumed_history_loaded", "session_reconstructed", "tracked_in_manager"],
+          "transition": {
+            "from": "resumed_history_loaded",
+            "to": "session_reconstructed",
+            "guard": "RolloutRecorder::new(params=resume) успешно открыл файл",
+            "side_effect": "state_builder применяется к SessionState; dynamic_tools восстанавливаются"
+          }
+        },
+        "ux": null,
+        "result": "Возобновлённый CodexThread с теми же thread_id, rollout_path и историей; готов принимать новые Op"
+      }
+    },
+    {
+      "id": "SRC-0009/uc.user/fork-thread",
+      "src": "SRC-0009",
+      "composition": "use_case",
+      "level": "user",
+      "strategic_domain": "ветвление истории Codex-тредов",
+      "terms": {
+        "actor": "Пользователь/клиент через ThreadManager",
+        "goal": "Создать форк существующего треда с усечённой историей (по N-ому user message или как interrupted) и получить свежий thread_id",
+        "steps": [
+          "1. Клиент вызывает ThreadManager::fork_thread(snapshot: S where S: Into<ForkSnapshot>, config, path, persist_extended_history, parent_trace)",
+          "2. ThreadManager читает историю: RolloutRecorder::get_rollout_history(&path)",
+          "3. ThreadManager вычисляет snapshot_turn_state(&history) через ThreadHistoryBuilder (определяет ends_mid_turn/active_turn_id/active_turn_start_index)",
+          "4. Для ForkSnapshot::TruncateBeforeNthUserMessage(n): вызывается truncate_before_nth_user_message →triggers SRC-0009/uc.sub/truncate-before-nth-user-message",
+          "5. Для ForkSnapshot::Interrupted: история нормализуется (Resumed→Forked), если ends_mid_turn — append_interrupted_boundary (маркер + TurnAborted{reason: Interrupted, turn_id, completed_at=None, duration_ms=None})",
+          "6. ThreadManager вызывает state.spawn_thread(config, history, auth_manager, agent_control, dynamic_tools=empty, persist_extended_history, metrics_service_name=None, parent_trace, user_shell_override=None) →triggers SRC-0009/uc.user/start-new-codex-thread"
+        ],
+        "extensions (Cockburn)": [
+          {"step": 4, "condition": "n >= user_positions.len() && ends_mid_turn", "action": "обрезка до active_turn_start_index или до последнего user message; если ничего — вернуть все items"},
+          {"step": 4, "condition": "n == usize::MAX", "action": "вернуть всю историю без обрезки (полный rollout)"},
+          {"step": 4, "condition": "user_positions.len() <= n (и not mid-turn)", "action": "вернуть все items (полная история сохранена)"},
+          {"step": 5, "condition": "InitialHistory::New или Cleared при Interrupted", "action": "результат = Forked([interrupted_turn_history_marker, TurnAborted{...}])"}
+        ],
+        "edge_cases": [
+          {"condition": "active_turn имеет status != InProgress", "action": "snapshot_turn_state возвращает ends_mid_turn=false, active_turn_id=None, start_index=None"},
+          {"condition": "rollout содержит user/assistant items без явных TurnComplete/TurnAborted после последнего user message", "action": "считать ends_mid_turn=true (synthetic fork/resume без lifecycle)"},
+          {"condition": "rolled.is_empty() после усечения", "action": "InitialHistory::New (не Forked пустым)"}
+        ],
+        "lifecycle": {
+          "entity": "SRC-0009/entity/fork-snapshot",
+          "states": ["TruncateBeforeNthUserMessage(n)", "Interrupted"],
+          "transition": {
+            "from": "source_history",
+            "to": "forked_history",
+            "guard": "snapshot_state, n/Interrupted правила",
+            "side_effect": "создаётся новый ThreadId при spawn_thread"
+          }
+        },
+        "ux": null,
+        "result": "NewThread с новым thread_id и усечённой историей; старый тред не изменяется"
+      }
+    },
+    {
+      "id": "SRC-0009/uc.user/shutdown-all-threads",
+      "src": "SRC-0009",
+      "composition": "use_case",
+      "level": "user",
+      "strategic_domain": "bulk-завершение Codex-тредов",
+      "terms": {
+        "actor": "Администратор/host процесс через ThreadManager",
+        "goal": "Корректно завершить все треды внутри заданного timeout и получить отчёт, сколько завершилось, упало или зависло",
+        "steps": [
+          "1. Клиент вызывает ThreadManager::shutdown_all_threads_bounded(timeout: Duration)",
+          "2. ThreadManager делает snapshot threads map: Vec<(ThreadId, Arc<CodexThread>)>",
+          "3. Для каждого треда параллельно: tokio::time::timeout(timeout, thread.shutdown_and_wait()) → ShutdownOutcome (Complete/SubmitFailed/TimedOut)",
+          "4. ThreadManager аккумулирует ShutdownOutcome в ThreadShutdownReport { completed, submit_failed, timed_out }",
+          "5. ThreadManager удаляет только completed треды из threads map (submit_failed/timed_out остаются, чтобы можно было retry или inspect)",
+          "6. ThreadManager сортирует каждый из списков по ToString и возвращает report"
+        ],
+        "extensions (Cockburn)": [
+          {"step": 3, "condition": "thread.shutdown_and_wait() завершилось с Ok(Err(_)) — отправка Shutdown упала, но not timeout", "action": "SubmitFailed"},
+          {"step": 3, "condition": "таймаут вышел", "action": "TimedOut — тред остаётся в map"}
+        ],
+        "edge_cases": [
+          {"condition": "threads map пустой", "action": "report = ThreadShutdownReport::default() (все списки пустые)"}
+        ],
+        "lifecycle": null,
+        "ux": null,
+        "result": "ThreadShutdownReport с рассортированными thread_id по исходам; завершённые удалены из менеджера"
+      }
+    },
+    {
+      "id": "SRC-0009/uc.user/submit-op-and-receive-events",
+      "src": "SRC-0009",
+      "composition": "use_case",
+      "level": "user",
+      "strategic_domain": "взаимодействие с Codex по протоколу Submission/Event",
+      "terms": {
+        "actor": "Клиент (пользователь cli/tui/app-server) через CodexThread/Codex",
+        "goal": "Отправить Op в Codex и получать поток Event'ов до TurnComplete/TurnAborted/ShutdownComplete",
+        "steps": [
+          "1. Клиент вызывает Codex::submit(op) (или CodexThread::submit) → submit_with_trace(op, None) → submit_with_id",
+          "2. Codex генерирует id = Uuid::now_v7().to_string(); sub = Submission { id, op, trace: current_span_w3c_trace_context() если нет }",
+          "3. Codex отправляет submission в tx_sub (bounded channel SUBMISSION_CHANNEL_CAPACITY=512); ошибка канала → CodexErr::InternalAgentDied",
+          "4. submission_loop (фоновой task) принимает sub через rx_sub.recv(); строит submission_dispatch_span + парентинг от sub.trace если задан",
+          "5. submission_loop диспатчит по sub.op.kind() в handlers::<op>",
+          "6. handlers::<op> мутирует Session.state (active_turn, history, pending input/approval/permissions, realtime и т.п.) и эмитит Event'ы в tx_event",
+          "7. Клиент в цикле вызывает Codex::next_event() → rx_event.recv().await; ошибка → CodexErr::InternalAgentDied",
+          "8. Клиент интерпретирует Event'ы (включая TurnStarted, ItemStarted/ItemCompleted, AgentMessageDelta, TokenCount, TurnComplete, TurnAborted и т.п.)"
+        ],
+        "extensions (Cockburn)": [
+          {"step": 3, "condition": "tx_sub закрыт (submission_loop уже завершился)", "action": "CodexErr::InternalAgentDied"},
+          {"step": 4, "condition": "sub.trace не None, но невалиден (set_parent_from_w3c_trace_context возвращает false)", "action": "warn!(\"ignoring invalid submission trace carrier\")"},
+          {"step": 5, "condition": "unknown op (enum non_exhaustive)", "action": "игнорируется (match arm _ => false)"},
+          {"step": 6, "condition": "Op::Shutdown", "action": "handlers::shutdown возвращает true → submission_loop breaks; дополнительно при закрытии канала вне shutdown — guardian_review_session.shutdown()"}
+        ],
+        "edge_cases": [
+          {"condition": "Op::Interrupt с активным turn", "action": "sess.interrupt_task() → abort_all_tasks(Interrupted)"},
+          {"condition": "Op::Interrupt без активного turn", "action": "cancel_mcp_startup() вместо abort"},
+          {"condition": "pre-compact reset websocket", "action": "если run_pre_sampling_compact сработал, prewarmed_client_session.reset_websocket_session()"}
+        ],
+        "lifecycle": null,
+        "ux": null,
+        "result": "Клиент получает стрим Event, заканчивающийся TurnComplete/TurnAborted или ShutdownComplete; при ошибке — Error event; state сессии обновлён"
+      }
+    },
+    {
+      "id": "SRC-0009/uc.user/steer-active-turn",
+      "src": "SRC-0009",
+      "composition": "use_case",
+      "level": "user",
+      "strategic_domain": "инкрементальный ввод в активный turn",
+      "terms": {
+        "actor": "Клиент через Codex::steer_input / CodexThread::steer_input",
+        "goal": "Дополнить активный regular turn пользовательским вводом без прерывания и без старта нового turn",
+        "steps": [
+          "1. Клиент вызывает steer_input(input: Vec<UserInput>, expected_turn_id, responsesapi_client_metadata)",
+          "2. Session проверяет input.is_empty() → SteerInputError::EmptyInput",
+          "3. Session берёт active_turn.lock(); если None → SteerInputError::NoActiveTurn(items) (items возвращаются для последующего spawn regular task)",
+          "4. Session берёт активный turn_id из первого task; если expected_turn_id задан и не совпадает → SteerInputError::ExpectedTurnMismatch { expected, actual }",
+          "5. Session проверяет TaskKind первого task: Regular → ok; Review → ActiveTurnNotSteerable{Review}; Compact → ActiveTurnNotSteerable{Compact}; None → NoActiveTurn",
+          "6. Если responsesapi_client_metadata задан — записать через turn_metadata_state.set_responsesapi_client_metadata",
+          "7. turn_state.lock(): push_pending_input(input.into()) + accept_mailbox_delivery_for_current_turn",
+          "8. Возвращается active_turn_id"
+        ],
+        "extensions (Cockburn)": [
+          {"step": 3, "condition": "нет активного turn и это был user_input_or_turn", "action": "items используются для spawn нового RegularTask с current_context"},
+          {"step": 5, "condition": "active turn = Review/Compact", "action": "SteerInputError::ActiveTurnNotSteerable{turn_kind} → to_error_event → CodexErrorInfo::ActiveTurnNotSteerable{turn_kind}"}
+        ],
+        "edge_cases": [
+          {"condition": "empty input в steer_input", "action": "SteerInputError::EmptyInput с message \"input must not be empty\""},
+          {"condition": "active_turn.tasks.first() == None внутри Some(at)", "action": "NoActiveTurn (fallback защита от несогласованности)"}
+        ],
+        "lifecycle": {
+          "entity": "SRC-0009/entity/active-turn",
+          "states": ["idle", "regular_active", "review_active", "compact_active"],
+          "transition": {
+            "from": "regular_active",
+            "to": "regular_active_with_new_pending",
+            "guard": "input непустой, turn_id совпадает с expected (если задан)",
+            "side_effect": "pending_input дополняется; mailbox delivery phase = CurrentTurn"
+          }
+        },
+        "ux": null,
+        "result": "active_turn_id возвращён; run_turn цикл подхватит pending_input на следующей итерации после sampling"
+      }
+    },
+    {
+      "id": "SRC-0009/uc.user/delegate-to-sub-codex-one-shot",
+      "src": "SRC-0009",
+      "composition": "use_case",
+      "level": "user",
+      "strategic_domain": "делегирование задач саб-агентам (multi-agent)",
+      "terms": {
+        "actor": "Parent Codex (через spawn_agent tool)",
+        "goal": "Запустить короткий одноразовый суб-тред с заранее известным prompt, автоматически завершающийся по TurnComplete/TurnAborted, и пробрасывающий события/approvals через parent session",
+        "steps": [
+          "1. Parent вызывает run_codex_thread_one_shot(config, auth_manager, models_manager, input: Vec<UserInput>, parent_session, parent_ctx, cancel_token, subagent_source, final_output_json_schema, initial_history)",
+          "2. Создаётся child_cancel = cancel_token.child_token(); вызывается run_codex_thread_interactive →triggers SRC-0009/uc.sub/spawn-delegated-interactive-child",
+          "3. Parent отправляет Op::UserInput { items: input, final_output_json_schema, responsesapi_client_metadata: None } в interactive io",
+          "4. Запускается bridge task: читает next_event; все события форвардятся в rx_bridge; при TurnComplete/TurnAborted → Op::Shutdown в ops_tx + child_cancel.cancel; break",
+          "5. Возвращается Codex с закрытым tx_sub (tx_closed, rx_closed дропнут) — чтобы caller не мог слать новые ops после одноразового запуска"
+        ],
+        "extensions (Cockburn)": [
+          {"step": 4, "condition": "событие Error/ошибка на next_event", "action": "while let Ok — цикл прерывается, bridge завершается"}
+        ],
+        "edge_cases": [
+          {"condition": "parent_session.enabled(Feature::GeneralAnalytics)", "action": "emit_subagent_session_started(thread_id, parent_thread_id, thread_config, subagent_source) при старте interactive варианта"}
+        ],
+        "lifecycle": null,
+        "ux": null,
+        "result": "Каналы возвращаются caller'у; sub-agent завершается автоматически после первого TurnComplete/TurnAborted, ресурсы чистятся child_cancel"
+      }
+    },
+    {
+      "id": "SRC-0009/uc.user/register-agent-identity",
+      "src": "SRC-0009",
+      "composition": "use_case",
+      "level": "user",
+      "strategic_domain": "криптографическая аутентификация агента для ChatGPT backend",
+      "terms": {
+        "actor": "Session (через AgentIdentityManager в background task, запущенный start_agent_identity_registration)",
+        "goal": "Для сессии с Feature::UseAgentIdentity и ChatGPT auth — зарегистрировать (или переиспользовать) ed25519 identity с сервером ChatGPT и получить agent_runtime_id, чтобы все последующие запросы шли от имени агента",
+        "steps": [
+          "1. Session::start_agent_identity_registration проверяет is_enabled(); если нет — return",
+          "2. Background task в цикле вызывает AgentIdentityManager::ensure_registered_identity",
+          "3. ensure_registered_identity: если !feature_enabled → return Ok(None); если auth_manager.auth().await == None → log debug + return Ok(None); если AgentIdentityBinding::from_auth(auth, forced_chatgpt_workspace_id) == None → return Ok(None)",
+          "4. Под ensure_lock.lock: load_stored_identity(&auth, &binding) — если найден валидный → info!(\"reusing stored agent identity\") и return Ok(Some(stored))",
+          "5. Иначе register_agent_identity(&binding): →triggers SRC-0009/uc.sub/mint-human-biscuit + →triggers SRC-0009/uc.sub/generate-agent-key-material + POST /v1/agent/register",
+          "6. store_identity: auth.set_agent_identity(stored.to_auth_record()) — сохранить для reuse",
+          "7. Если Ok(Some(_)) на любой итерации — task завершается; если Ok(None) — task ждёт auth_state_rx.changed() и повторяет; если Err — fail_agent_identity_registration"
+        ],
+        "extensions (Cockburn)": [
+          {"step": 4, "condition": "StoredAgentIdentity.from_auth_record вернул Err (mismatched workspace или bad private key)", "action": "warn! + auth.remove_agent_identity() + return None (перейти к регистрации)"},
+          {"step": 4, "condition": "stored_identity.matches_binding вернул false (разные chatgpt_user_id)", "action": "warn!(\"stored agent identity binding no longer matches current auth; deleting cached value\") + auth.remove_agent_identity()"},
+          {"step": 4, "condition": "validate_key_material вернул Err (public key не совпадает с derived из private)", "action": "warn!(\"stored agent identity key material is invalid; deleting cached value\") + auth.remove_agent_identity()"},
+          {"step": 5, "condition": "register_agent/response.status != success", "action": "anyhow::bail!(\"agent identity registration failed with status {status} from {url}: {body}\")"},
+          {"step": 5, "condition": "mint_human_biscuit: status != success", "action": "anyhow::bail!(\"agent identity biscuit minting failed with status {status} from {url}: {body}\")"},
+          {"step": 5, "condition": "biscuit response без header x-openai-authorization", "action": "context error \"agent identity biscuit response did not include x-openai-authorization\""}
+        ],
+        "edge_cases": [
+          {"condition": "sess дропнулся (weak_sess.upgrade() == None)", "action": "task завершается тихо"},
+          {"condition": "ensure_registered_identity вернул Err", "action": "fail_agent_identity_registration: warn + emit EventMsg::Error + handlers::shutdown(sess, next_internal_sub_id) — сессия не может работать с включённым feature"},
+          {"condition": "forced_chatgpt_workspace_id задан, но пустой", "action": "игнорируется (filter !value.is_empty()), fallback на token_data.account_id"},
+          {"condition": "chatgpt_user_id пустая строка", "action": "отфильтровывается (.filter(!value.is_empty()))"}
+        ],
+        "lifecycle": {
+          "entity": "SRC-0009/entity/stored-agent-identity",
+          "states": ["none", "stored_but_stale", "stored_valid", "registered_fresh"],
+          "transition": {
+            "from": "stored_but_stale (binding mismatch или invalid key)",
+            "to": "none",
+            "guard": "matches_binding==false OR validate_key_material==Err OR from_auth_record==Err",
+            "side_effect": "auth.remove_agent_identity() и затем registration"
+          }
+        },
+        "ux": null,
+        "result": "Сессия получила агентскую ed25519 identity; последующие authenticated вызовы могут использовать agent_runtime_id; при ошибке — сессия аварийно завершена с сообщением пользователю"
+      }
+    },
+    {
+      "id": "SRC-0009/uc.user/run-model-turn",
+      "src": "SRC-0009",
+      "composition": "use_case",
+      "level": "user",
+      "strategic_domain": "исполнение одного turn с моделью",
+      "terms": {
+        "actor": "Session через run_turn (запускается из RegularTask/ReviewTask/CompactTask)",
+        "goal": "Обработать user input за один turn: инжектировать skills/plugins/context, запустить цикл sampling ↔ tool execution, применить стоп-хуки, вернуть last_agent_message",
+        "steps": [
+          "1. run_turn проверяет, если input пуст и нет pending_input → return None",
+          "2. run_pre_sampling_compact: maybe_run_previous_model_inline_compact (при переключении на меньшую context window); если total_usage_tokens >= auto_compact_limit → run_auto_compact(ContextLimit, PreTurn); если сработало — client_session.reset_websocket_session",
+          "3. record_context_updates_and_set_reference_context_item — фиксирует новый reference_context_item для диффов следующих turn",
+          "4. plugins_manager.plugins_for_config + collect_explicit_plugin_mentions + mcp_tools (если apps_enabled или есть plugin mentions) + build_connector_slug_counts + collect_explicit_skill_mentions",
+          "5. Если Feature::SkillEnvVarDependencyPrompt: collect_env_var_dependencies + resolve_skill_dependencies_for_turn",
+          "6. maybe_prompt_and_install_mcp_dependencies (по mentioned_skills)",
+          "7. build_skill_injections + build_plugin_injections; для каждого skill warning → send_event Warning; если skill_items/plugin_items не пусты → record_conversation_items",
+          "8. run_pending_session_start_hooks → если block → break; run_user_prompt_submit_hooks → если should_stop → record additional_contexts и return None",
+          "9. record_user_prompt_and_emit_turn_item + track app_mentioned/plugin_used + merge_connector_selection + record_additional_contexts",
+          "10. Если !input.is_empty(): set_previous_turn_settings(PreviousTurnSettings{model, realtime_active}) — baseline только с regular user-turn path",
+          "11. track_turn_resolved_config_analytics (если Feature::GeneralAnalytics)",
+          "12. maybe_start_ghost_snapshot — подготовить snapshot на случай прерывания",
+          "13. Цикл loop: run_pending_session_start_hooks → get_pending_input (+ mailbox) → inspect_pending_input (blocked/accepted) → sampling_request_input = clone_history.for_prompt(input_modalities) → run_sampling_request → SamplingRequestResult",
+          "14. Если token_limit_reached && needs_follow_up → run_auto_compact(ContextLimit, MidTurn) + reset websocket + continue",
+          "15. Если !needs_follow_up: Stop hooks preview → run_stop → hook_events emitted; если should_block + hook_prompt_message — записать continuation + stop_hook_active=true + continue; если should_stop → break",
+          "16. Dispatch AfterAgent hook; при HookResult::FailedAbort — send EventMsg::Error и return None; иначе break",
+          "17. Вернуть last_agent_message"
+        ],
+        "extensions (Cockburn)": [
+          {"step": 13, "condition": "inspect_pending_input возвратил Blocked", "action": "prepend_pending_input для remaining, record additional_contexts, continue или break (если нет accepted)"},
+          {"step": 13, "condition": "mcp_connection_manager.list_all_tools отменён cancellation_token и apps_enabled", "action": "return None"},
+          {"step": 13, "condition": "run_sampling_request вернул CodexErr::InvalidImageRequest()", "action": "если history.replace_last_turn_images(\"Invalid image\") → continue; иначе send EventMsg::Error('Invalid image in your last message...') + break"},
+          {"step": 13, "condition": "run_sampling_request вернул CodexErr::TurnAborted", "action": "break (отчёт о прерывании идёт через другие events)"},
+          {"step": 13, "condition": "run_sampling_request вернул прочую ошибку", "action": "info! + send EventMsg::Error(e.to_error_event(None)) + break"},
+          {"step": 15, "condition": "Stop hook should_block но continuation_fragments нет", "action": "send Warning 'Stop hook requested continuation without a prompt; ignoring the block' и не continue"}
+        ],
+        "edge_cases": [
+          {"condition": "model вернул требование follow-up, но пользователь прислал pending input", "action": "needs_follow_up = model_needs_follow_up || has_pending_input — продолжить цикл"},
+          {"condition": "auto_compact_limit отсутствует в model_info", "action": "fallback = i64::MAX (ограничение не срабатывает)"},
+          {"condition": "turn_context.approval_policy == Never при stop hook", "action": "permission_mode = \"bypassPermissions\"; иначе \"default\" (для UnlessTrusted/OnFailure/OnRequest/Granular)"}
+        ],
+        "lifecycle": {
+          "entity": "SRC-0009/entity/run-turn",
+          "states": ["pre_sampling", "sampling_loop", "auto_compact_mid_turn", "stop_hooks", "after_agent", "finished"],
+          "transition": {
+            "from": "sampling_loop",
+            "to": "auto_compact_mid_turn",
+            "guard": "total_usage_tokens >= auto_compact_limit && needs_follow_up",
+            "side_effect": "run_auto_compact(ContextLimit, MidTurn); client_session.reset_websocket_session"
+          }
+        },
+        "ux": null,
+        "result": "Session получила last_agent_message; history обновлена; events TurnComplete/TurnAborted/ItemCompleted/AgentMessage и пр. отправлены клиенту"
+      }
+    },
+    {
+      "id": "SRC-0009/uc.user/approval-request-through-delegate",
+      "src": "SRC-0009",
+      "composition": "use_case",
+      "level": "user",
+      "strategic_domain": "делегирование approval-запросов от саб-агента к parent",
+      "terms": {
+        "actor": "Delegate forward_events (от имени parent Session)",
+        "goal": "Получив approval-запрос от child Codex, спросить parent (через guardian или через parent_session.request_*) и отправить решение обратно child",
+        "steps": [
+          "1. forward_events принимает EventMsg::ExecApprovalRequest/ApplyPatchApprovalRequest/RequestPermissions/RequestUserInput от child",
+          "2. handle_exec_approval: если routes_approval_to_guardian(parent_ctx) → spawn_guardian_review(session, turn, review_id, GuardianApprovalRequest::Shell{...}, reason, review_cancel), await_approval_with_cancel; иначе parent_session.request_command_approval(...) + await_approval_with_cancel",
+          "3. handle_patch_approval аналогично: guardian для routes_approval_to_guardian, иначе parent_session.request_patch_approval(changes); patch форматируется как \"*** Add File/Delete File/Update File/Move to ...\" для guardian",
+          "4. handle_request_user_input: если routes_approval_to_guardian и есть MCP approval question → maybe_auto_review_mcp_request_user_input (автоматический guardian-review на основе кешированного McpToolCallBegin); иначе parent_session.request_user_input + await_user_input_with_cancel",
+          "5. handle_request_permissions: parent_session.request_permissions + await_request_permissions_with_cancel",
+          "6. Решение (ReviewDecision/RequestUserInputResponse/RequestPermissionsResponse) упаковывается в соответствующий Op (ExecApproval/PatchApproval/UserInputAnswer/RequestPermissionsResponse) и отправляется child через codex.submit"
+        ],
+        "extensions (Cockburn)": [
+          {"step": 2, "condition": "approval_id отсутствует в event", "action": "effective_approval_id = call_id"},
+          {"step": 2, "condition": "additional_permissions.is_some()", "action": "sandbox_permissions = WithAdditionalPermissions; иначе UseDefault"},
+          {"step": 4, "condition": "MCP question не найден или invocation нет в pending_mcp_invocations", "action": "fallback на стандартный parent_session.request_user_input"},
+          {"step": 4, "condition": "MCP review ApprovedForSession", "action": "найти option с label == MCP_TOOL_APPROVAL_ACCEPT_FOR_SESSION; fallback MCP_TOOL_APPROVAL_ACCEPT"},
+          {"step": 4, "condition": "MCP review Denied/TimedOut/Abort", "action": "selected_label = MCP_TOOL_APPROVAL_DECLINE_SYNTHETIC"},
+          {"step": 6, "condition": "cancel_token отменён во время await", "action": "review_cancel_token.cancel() (если задан) + notify_approval/user_input/permissions с empty/Abort + возвращается дефолтный ответ"}
+        ],
+        "edge_cases": [
+          {"condition": "forward_event_or_shutdown не смог отправить (канал закрыт)", "action": "shutdown_delegate(codex) + return false из forward_event_or_shutdown"},
+          {"condition": "await_user_input_with_cancel cancel hit", "action": "empty response (answers пустой HashMap); notify_user_input_response с empty"},
+          {"condition": "await_request_permissions_with_cancel cancel hit", "action": "пустой RequestPermissionsResponse { permissions: Default, scope: PermissionGrantScope::Turn } + notify parent"}
+        ],
+        "lifecycle": null,
+        "ux": null,
+        "result": "Child Codex получает Op с решением и продолжает исполнение; parent sees/logs approval (или guardian auto-review выполняется)"
+      }
+    },
+    {
+      "id": "SRC-0009/uc.user/override-turn-context",
+      "src": "SRC-0009",
+      "composition": "use_case",
+      "level": "user",
+      "strategic_domain": "переконфигурация treats/моделей/политик между turns",
+      "terms": {
+        "actor": "Клиент через Op::OverrideTurnContext или Op::UserTurn (включая session_settings_update в UI)",
+        "goal": "Поменять набор сеансовых настроек (cwd, approval_policy, sandbox_policy, model, reasoning effort, personality, collaboration_mode и т.п.) перед следующим turn",
+        "steps": [
+          "1. submission_loop получает Op::OverrideTurnContext с полями cwd, approval_policy, approvals_reviewer, sandbox_policy, windows_sandbox_level, model, effort, summary, service_tier, collaboration_mode, personality",
+          "2. Если collaboration_mode не задан — взять из текущего SessionConfiguration.collaboration_mode.with_updates(model, effort, developer_instructions=None)",
+          "3. handlers::override_turn_context → session.update_settings(SessionSettingsUpdate)",
+          "4. SessionConfiguration::apply(&updates): клон текущей; если sandbox_policy.set вернул Err → возвращается ConstraintResult::Err; если задан windows_sandbox_level — обновить",
+          "5. Если cwd задан — нормализовать через normalize_for_native_workdir + AbsolutePathBuf::relative_to_current_dir; при ошибке warn! + оставить старый cwd",
+          "6. Если sandbox_policy изменён или (cwd изменён и file_system_sandbox_policy matches legacy) — file_system_sandbox_policy = FileSystemSandboxPolicy::from_legacy_sandbox_policy(new_sandbox, new_cwd) (иначе сохраняем richer split policies)",
+          "7. Если sandbox_policy_changed — refresh_managed_network_proxy_for_current_sandbox_policy",
+          "8. Если cwd изменён — maybe_refresh_shell_snapshot_for_cwd"
+        ],
+        "extensions (Cockburn)": [
+          {"step": 4, "condition": "apply вернул ConstraintResult::Err", "action": "send EventMsg::Error(err.to_string(), CodexErrorInfo::BadRequest); return Err"},
+          {"step": 5, "condition": "AbsolutePathBuf::relative_to_current_dir вернула Err", "action": "warn!(\"failed to normalize update cwd: {cwd:?}: {e}\"); использовать старый cwd"}
+        ],
+        "edge_cases": [
+          {"condition": "app_server_client_name или _version задан", "action": "записать в next_configuration как Some"},
+          {"condition": "network_sandbox_policy derived при sandbox_policy changed", "action": "next.network_sandbox_policy = NetworkSandboxPolicy::from(new_sandbox_policy)"}
+        ],
+        "lifecycle": {
+          "entity": "SRC-0009/entity/session-configuration",
+          "states": ["current", "applied_next"],
+          "transition": {
+            "from": "current",
+            "to": "applied_next",
+            "guard": "updates.apply() == Ok(next)",
+            "side_effect": "рефреш network proxy + shell snapshot при необходимости; new_turn_from_configuration при new_turn_with_sub_id"
+          }
+        },
+        "ux": null,
+        "result": "SessionConfiguration обновлён; следующий turn использует новые параметры; ошибки отправляются как Error event"
+      }
+    },
+    {
+      "id": "SRC-0009/uc.user/inject-message-without-turn",
+      "src": "SRC-0009",
+      "composition": "use_case",
+      "level": "user",
+      "strategic_domain": "управление history без создания user turn boundary",
+      "terms": {
+        "actor": "Клиент через CodexThread::inject_user_message_without_turn / inject_response_items",
+        "goal": "Вложить session-prefix сообщение или набор raw ResponseItems в model-visible history без старта нового user turn",
+        "steps": [
+          "1. inject_user_message_without_turn(message: String): собирается ResponseItem::Message { id: None, role: \"user\", content: [InputText{message}], end_turn: None, phase: None }",
+          "2. pending_message_input_item(&message) → ResponseInputItem::Message { role, content } (только Message, иначе CodexErr::InvalidRequest)",
+          "3. session.inject_response_items(vec![pending_item]): если есть активный turn → push_pending_input; если нет — вернуть Err(items)",
+          "4. Если Err — создать new_default_turn + record_conversation_items (history получит сообщение как часть нового default turn)",
+          "5. inject_response_items(items: Vec<ResponseItem>) — более общая версия: если items пуст → CodexErr::InvalidRequest",
+          "6. new_default_turn → если reference_context_item == None → record_context_updates_and_set_reference_context_item → record_conversation_items(items) → flush_rollout"
+        ],
+        "extensions (Cockburn)": [
+          {"step": 2, "condition": "message не Message (Tool call и т.п.)", "action": "CodexErr::InvalidRequest(\"append_message only supports ResponseItem::Message\")"},
+          {"step": 5, "condition": "items.is_empty()", "action": "Err(CodexErr::InvalidRequest(\"items must not be empty\"))"},
+          {"step": 3, "condition": "pending_message_input_item вернул Err в inject_user_message_without_turn", "action": "debug_assert!(false, ...); silent return (тестовый режим)"}
+        ],
+        "edge_cases": [
+          {"condition": "нет активного turn (idle session)", "action": "создаётся new_default_turn и сообщение записывается в history — не start user turn boundary, но виден модели на следующем turn"}
+        ],
+        "lifecycle": null,
+        "ux": null,
+        "result": "Сообщение попадает в model-visible history без создания user turn; flush_rollout обеспечивает persistance"
+      }
+    },
+    {
+      "id": "SRC-0009/uc.user/out-of-band-elicitation-pause",
+      "src": "SRC-0009",
+      "composition": "use_case",
+      "level": "user",
+      "strategic_domain": "пауза сессии для out-of-band elicitation",
+      "terms": {
+        "actor": "Клиент (UI, app-server) через CodexThread::increment_out_of_band_elicitation_count / decrement_out_of_band_elicitation_count",
+        "goal": "Приостанавливать сессию, пока обрабатываются параллельные elicitation запросы, и возобновлять её, когда счётчик обнуляется",
+        "steps": [
+          "1. increment: взять guard = out_of_band_elicitation_count.lock; was_zero = (*guard == 0); *guard = guard.checked_add(1)?",
+          "2. Если checked_add переполнился — Err(CodexErr::Fatal(\"out-of-band elicitation count overflowed\"))",
+          "3. Если was_zero → session.set_out_of_band_elicitation_pause_state(paused=true) — публикует в watch::Sender",
+          "4. decrement: взять guard; если *guard == 0 → Err(CodexErr::InvalidRequest(\"out-of-band elicitation count is already zero\"))",
+          "5. *guard -= 1; now_zero = (*guard == 0); если now_zero → session.set_out_of_band_elicitation_pause_state(paused=false)",
+          "6. Возвращается текущее значение счётчика"
+        ],
+        "extensions (Cockburn)": [
+          {"step": 2, "condition": "checked_add overflow (практически невозможно, но защищено)", "action": "Fatal ошибка"},
+          {"step": 4, "condition": "decrement при нулевом счётчике", "action": "InvalidRequest"}
+        ],
+        "edge_cases": [
+          {"condition": "много параллельных increment/decrement", "action": "guard = Mutex<u64> обеспечивает атомарность; pause_state меняется только на границах 0↔1"}
+        ],
+        "lifecycle": {
+          "entity": "SRC-0009/entity/codex-thread",
+          "states": ["running", "paused_for_elicitation"],
+          "transition": {
+            "from": "running",
+            "to": "paused_for_elicitation",
+            "guard": "was_zero == true при increment",
+            "side_effect": "set_out_of_band_elicitation_pause_state(true) публикует в watch канал"
+          }
+        },
+        "ux": null,
+        "result": "Сессия видна как paused, пока есть активные out-of-band elicitations; возобновляется, когда все decrement'ы прошли"
+      }
+    },
+    {
+      "id": "SRC-0009/uc.user/start-review-thread",
+      "src": "SRC-0009",
+      "composition": "use_case",
+      "level": "user",
+      "strategic_domain": "спавн специализированного review-turn поверх сессии",
+      "terms": {
+        "actor": "Клиент через Op::Review (handlers::review)",
+        "goal": "Запустить задачу Review (ReviewTask) с выделенной моделью/конфигурацией под review, не ломая основной turn context",
+        "steps": [
+          "1. handlers::review создаёт turn_context = new_default_turn_with_sub_id(sub_id); maybe_emit_unknown_model_warning_for_turn; refresh_mcp_servers_if_requested",
+          "2. resolve_review_request(review_request, cwd) — резолвит target, prompt и user_facing_hint",
+          "3. spawn_review_thread: model = config.review_model.unwrap_or(parent_turn_context.model_info.slug); получает review_model_info через models_manager",
+          "4. review_features: клон sess.features с disabled(WebSearchRequest), disabled(WebSearchCached); review_web_search_mode = Disabled",
+          "5. Построить tools_config через ToolsConfig::new с review features + with_unified_exec_shell_mode_for_session/with_web_search_config(None)/with_allow_login_shell/with_has_environment/with_spawn_agent_usage_hint... + with_agent_type_description",
+          "6. per_turn_config = clone config; задать model, features=review_features; если web_search_mode.set(Disabled) вернул Err — warn и оставить старое значение",
+          "7. Новый TurnContext для review (с reasoning_effort/summary, session_telemetry.with_model, TurnMetadataState::new с parent cwd/sandbox/windows_level)",
+          "8. input = [UserInput::Text{text: review_prompt, text_elements: []}]; turn_metadata_state.spawn_git_enrichment_task",
+          "9. sess.spawn_task(tc.clone(), input, ReviewTask::new()) → запускает задачу Review",
+          "10. send_event(tc, EventMsg::EnteredReviewMode(ReviewRequest{target, user_facing_hint}))"
+        ],
+        "extensions (Cockburn)": [
+          {"step": 2, "condition": "resolve_review_request вернул Err", "action": "send Event { id: sub_id, msg: Error{...} }; return"},
+          {"step": 6, "condition": "review_web_search_mode недопустим по config_requirements", "action": "warn + оставить fallback значение (не прерывать)"}
+        ],
+        "edge_cases": [
+          {"condition": "config.review_model отсутствует", "action": "использовать parent model slug"}
+        ],
+        "lifecycle": {
+          "entity": "SRC-0009/entity/active-turn",
+          "states": ["idle_or_regular", "review_active"],
+          "transition": {
+            "from": "idle_or_regular",
+            "to": "review_active",
+            "guard": "spawn_task(ReviewTask) + send EnteredReviewMode",
+            "side_effect": "UI может переключиться в режим review"
+          }
+        },
+        "ux": ["EnteredReviewMode event для UI — переключение в режим ревью"],
+        "result": "Review task запущен; первый user-facing prompt = review_prompt; параллельный доступ блокирован (ActiveTurnNotSteerable{Review})"
+      }
+    },
+    {
+      "id": "SRC-0009/uc.user/shutdown-codex-session",
+      "src": "SRC-0009",
+      "composition": "use_case",
+      "level": "user",
+      "strategic_domain": "корректное завершение Codex-сессии",
+      "terms": {
+        "actor": "Клиент через Op::Shutdown (Codex::shutdown_and_wait или прямой submit)",
+        "goal": "Корректно прервать активные задачи, закрыть realtime/unified_exec/guardian, сфлашить rollout, отметить метрики и эмитнуть ShutdownComplete",
+        "steps": [
+          "1. Клиент вызывает Codex::shutdown_and_wait: submit(Op::Shutdown); игнорирует CodexErr::InternalAgentDied (submission_loop уже мёртв)",
+          "2. handlers::shutdown: abort_all_tasks(TurnAbortReason::Interrupted); conversation.shutdown (realtime); unified_exec_manager.terminate_all_processes; guardian_review_session.shutdown",
+          "3. Считать turn_count как число ResponseItem с is_user_turn_boundary в clone_history — передать в session_telemetry counter \"codex.conversation.turn.count\"",
+          "4. Взять rollout recorder guard и извлечь (take); если Some → rec.shutdown().await; при Err → warn + send EventMsg::Error(\"Failed to shutdown rollout recorder\")",
+          "5. Send Event { id: sub_id, msg: EventMsg::ShutdownComplete }",
+          "6. Вернуть true из handlers::shutdown → submission_loop breaks",
+          "7. session_loop_termination future резолвится; Codex::shutdown_and_wait.await завершается"
+        ],
+        "extensions (Cockburn)": [
+          {"step": 4, "condition": "rollout recorder отсутствует (ephemeral)", "action": "шаг пропускается"},
+          {"step": 1, "condition": "submit вернул CodexErr, отличный от InternalAgentDied", "action": "propagate Err"}
+        ],
+        "edge_cases": [
+          {"condition": "submission_loop exited по закрытому каналу без Op::Shutdown", "action": "финальный drain: sess.guardian_review_session.shutdown() + debug!(\"Agent loop exited\")"},
+          {"condition": "clone_history возвращает пустую", "action": "turn_count = 0"}
+        ],
+        "lifecycle": {
+          "entity": "SRC-0009/entity/session",
+          "states": ["running", "shutting_down", "terminated"],
+          "transition": {
+            "from": "running",
+            "to": "shutting_down",
+            "guard": "Op::Shutdown получен",
+            "side_effect": "abort_all_tasks + conversation.shutdown + unified_exec.terminate + guardian.shutdown + rollout.shutdown"
+          }
+        },
+        "ux": null,
+        "result": "Event ShutdownComplete эмитится; все фоновые подсистемы остановлены; rollout закрыт; session_loop_termination future резолвится"
+      }
+    },
+    {
+      "id": "SRC-0009/uc.sub/spawn-codex-session",
+      "src": "SRC-0009",
+      "composition": "use_case",
+      "level": "sub",
+      "strategic_domain": null,
+      "terms": {
+        "actor": "Codex::spawn/spawn_internal",
+        "goal": "Собрать полную SessionConfiguration + Session + запустить submission_loop и вернуть CodexSpawnOk",
+        "steps": [
+          "1. Codex::spawn оборачивает в info_span!(\"thread_spawn\"); если parent_trace невалиден — warn и сбросить в None",
+          "2. spawn_internal разбирает CodexSpawnArgs; создаёт bounded(SUBMISSION_CHANNEL_CAPACITY) tx_sub/rx_sub и unbounded tx_event/rx_event",
+          "3. environment_manager.current; environment.get_filesystem; plugins_manager.plugins_for_config → effective_skill_roots; skills_manager.skills_for_config (логирует ошибки загрузки скиллов)",
+          "4. SubAgent depth gate: если SessionSource::SubAgent(ThreadSpawn{depth,...}) и depth >= config.agent_max_depth → disable Feature::SpawnCsv + Feature::Collab",
+          "5. JsRepl guard: если Feature::JsRepl включён, но resolve_compatible_node fails → disable JsRepl/JsReplToolsOnly; для CodeMode — аналогично (с разным сообщением)",
+          "6. user_instructions = get_user_instructions(&config, environment)",
+          "7. exec_policy: если guardian reviewer source → ExecPolicyManager::default (чистые built-in safety checks, без caller-provided rules); иначе inherited_exec_policy или ExecPolicyManager::load(&config_layer_stack)",
+          "8. refresh_strategy: SubAgent → Offline; иначе OnlineIfUncached; возможно предзагрузить list_models",
+          "9. model = models_manager.get_default_model; model_info = get_model_info; base_instructions priority: config.base_instructions > conversation_history.get_base_instructions > model_info.get_model_instructions(personality)",
+          "10. dynamic_tools: если пустые → persisted_tools из state_db (для Resumed/Forked) или conversation_history.get_dynamic_tools; иначе то что передали",
+          "11. Построить SessionConfiguration (provider, collaboration_mode ModeKind::Default, policies, cwd, codex_home, dynamic_tools, session_source, persist_extended_history, inherited_shell_snapshot, user_shell_override и т.п.)",
+          "12. agent_status watch channel с AgentStatus::PendingInit; Session::new (большая функция) — инициализирует rollout, history_meta, auth+mcp, telemetry, shell и остальные services",
+          "13. tokio::spawn(async move { submission_loop(session, config, rx_sub).instrument(info_span!(\"session_loop\", thread_id)) })",
+          "14. Собрать Codex { tx_sub, rx_event, agent_status, session, session_loop_termination: session_loop_termination_from_handle(handle) } и вернуть CodexSpawnOk { codex, thread_id }"
+        ],
+        "extensions (Cockburn)": [
+          {"step": 3, "condition": "environment_manager.current().await Err", "action": "CodexErr::Fatal(\"failed to create environment: {err}\")"},
+          {"step": 5, "condition": "JsRepl остался enabled после fallback (enterprise requirement)", "action": "startup_warnings.push(\"`js_repl` remains enabled because enterprise requirements pin it on...\")"},
+          {"step": 7, "condition": "ExecPolicyManager::load failed", "action": "CodexErr::Fatal(\"failed to load rules: {err}\")"},
+          {"step": 12, "condition": "Session::new failed", "action": "error!(\"Failed to create session: {e:#}\") + map_session_init_error(&e, &codex_home)"}
+        ],
+        "edge_cases": [
+          {"condition": "tests: prelude skip models_manager.list_models если config.model is_some и refresh_strategy == Offline"}
+        ],
+        "lifecycle": null,
+        "ux": null,
+        "result": "CodexSpawnOk с новым thread_id; submission_loop запущен; подписчики могут читать agent_status"
+      }
+    },
+    {
+      "id": "SRC-0009/uc.sub/spawn-delegated-interactive-child",
+      "src": "SRC-0009",
+      "composition": "use_case",
+      "level": "sub",
+      "strategic_domain": null,
+      "terms": {
+        "actor": "run_codex_thread_interactive (codex_delegate)",
+        "goal": "Запустить interactive саб-Codex, унаследовав managers parent_session, и поднять 2 background-таска (forward_events + forward_ops)",
+        "steps": [
+          "1. Создать bounded(SUBMISSION_CHANNEL_CAPACITY) каналы: (tx_sub, rx_sub) для событий к caller; (tx_ops, rx_ops) для op'ов от caller",
+          "2. Box::pin(Codex::spawn(CodexSpawnArgs{config, auth_manager, models_manager, environment_manager from parent_ctx.environment, skills/plugins/mcp/skills_watcher наследуются Arc::clone от parent_session.services, conversation_history=initial_history или New, session_source=SessionSource::SubAgent(subagent_source), agent_control от parent, dynamic_tools=empty, persist_extended_history=false, metrics_service_name=None, inherited_shell_snapshot=None, user_shell_override=None, inherited_exec_policy=Some(Arc::clone(parent.services.exec_policy)), parent_trace=None, analytics_events_client=Some(parent.services.analytics_events_client.clone())}))",
+          "3. Если parent_session.enabled(Feature::GeneralAnalytics): получить thread_config = codex.thread_config_snapshot, client_metadata = parent_session.app_server_client_metadata; emit_subagent_session_started",
+          "4. codex обернуть в Arc; child_token для events и для ops",
+          "5. Создать pending_mcp_invocations: Arc<Mutex<HashMap<String, McpInvocation>>> — кеш для восстановления delegated MCP approval контекста",
+          "6. tokio::spawn forward_events(codex, tx_sub, parent_session, parent_ctx, pending_mcp_invocations, cancel_token_events) — фильтрует delta/token events, ловит approval-events, кеширует McpToolCallBegin/End",
+          "7. tokio::spawn forward_ops(codex, rx_ops, cancel_token_ops) — проксирует Op'ы от caller в child.submit_with_id, уважая cancellation",
+          "8. Вернуть Codex { tx_sub: tx_ops, rx_event: rx_sub, agent_status: child.agent_status.clone, session: Arc::clone(child.session), session_loop_termination }"
+        ],
+        "extensions (Cockburn)": [
+          {"step": 3, "condition": "client_name или client_version отсутствуют", "action": "warn!(\"skipping subagent thread analytics: missing inherited client metadata\"); return без analytics"}
+        ],
+        "edge_cases": [
+          {"condition": "emit_subagent_session_started: parent_thread_id передаётся как Some(parent_session.conversation_id), created_at = UNIX_EPOCH.elapsed() как u64 секунд"}
+        ],
+        "lifecycle": null,
+        "ux": null,
+        "result": "Caller получает пару каналов (tx_ops/rx_sub), child Codex управляется своими background-тасками"
+      }
+    },
+    {
+      "id": "SRC-0009/uc.sub/forward-events-from-child",
+      "src": "SRC-0009",
+      "composition": "use_case",
+      "level": "sub",
+      "strategic_domain": null,
+      "terms": {
+        "actor": "Delegate forward_events task",
+        "goal": "Читать events от child Codex, фильтровать/роутить приватные события и форвардить остальное консюмеру, корректно обрабатывая cancellation",
+        "steps": [
+          "1. tokio::pin!(cancelled = cancel_token.cancelled());",
+          "2. loop tokio::select! на cancelled и codex.next_event()",
+          "3. Если cancelled отработал → shutdown_delegate(codex) + break",
+          "4. Если next_event() вернул Err → break",
+          "5. match event: EventMsg::AgentMessageDelta/AgentReasoningDelta/TokenCount/SessionConfigured/ThreadNameUpdated — не форвардить",
+          "6. EventMsg::ExecApprovalRequest → handle_exec_approval →triggers SRC-0009/uc.user/approval-request-through-delegate (ветка exec)",
+          "7. EventMsg::ApplyPatchApprovalRequest → handle_patch_approval",
+          "8. EventMsg::RequestPermissions → handle_request_permissions",
+          "9. EventMsg::RequestUserInput → handle_request_user_input (может auto-review через guardian для delegated MCP)",
+          "10. EventMsg::McpToolCallBegin → pending_mcp_invocations.insert(call_id, invocation); затем forward_event_or_shutdown",
+          "11. EventMsg::McpToolCallEnd → pending_mcp_invocations.remove(call_id); forward_event_or_shutdown",
+          "12. other → forward_event_or_shutdown(codex, tx_sub, cancel_token, event)",
+          "13. forward_event_or_shutdown: tx_sub.send(event).or_cancel(cancel_token): если Ok(Ok(())) → true; иначе shutdown_delegate + false"
+        ],
+        "extensions (Cockburn)": [
+          {"step": 13, "condition": "tx_sub.send cancelled или send err", "action": "shutdown_delegate(codex) + return false из forward_event_or_shutdown"}
+        ],
+        "edge_cases": [
+          {"condition": "shutdown_delegate: submit(Op::Interrupt) + submit(Op::Shutdown); drain events до TurnAborted/TurnComplete или 500ms timeout"}
+        ],
+        "lifecycle": null,
+        "ux": null,
+        "result": "Консюмер получает fed событий (без internal delta/token), approval-события обрабатываются автоматически"
+      }
+    },
+    {
+      "id": "SRC-0009/uc.sub/forward-ops-to-child",
+      "src": "SRC-0009",
+      "composition": "use_case",
+      "level": "sub",
+      "strategic_domain": null,
+      "terms": {
+        "actor": "Delegate forward_ops task",
+        "goal": "Проксировать Submission'ы от caller в child codex, уважая cancellation",
+        "steps": [
+          "1. loop: submission = rx_ops.recv().or_cancel(&cancel_token_ops)",
+          "2. match: Ok(Ok(sub)) → codex.submit_with_id(sub) (игнорируя результат); Ok(Err(_)) (канал закрыт) или Err(_) (cancel) → break"
+        ],
+        "extensions (Cockburn)": [
+          {"step": 2, "condition": "rx_ops дропнулся со стороны caller", "action": "break"},
+          {"step": 2, "condition": "cancel_token_ops сработал", "action": "break"}
+        ],
+        "edge_cases": null,
+        "lifecycle": null,
+        "ux": null,
+        "result": "Child получает те же Op'ы, что отправил caller (1-к-1), пока не отменят или канал не закроется"
+      }
+    },
+    {
+      "id": "SRC-0009/uc.sub/truncate-before-nth-user-message",
+      "src": "SRC-0009",
+      "composition": "use_case",
+      "level": "sub",
+      "strategic_domain": null,
+      "terms": {
+        "actor": "thread_manager::truncate_before_nth_user_message (вызывается из fork_thread)",
+        "goal": "Сформировать усечённую InitialHistory перед указанным 0-based user message boundary, корректно обрабатывая mid-turn состояние и rollback маркеры",
+        "steps": [
+          "1. items = history.get_rollout_items()",
+          "2. user_positions = truncation::user_message_positions_in_rollout(items) — учёт ThreadRolledBack маркеров (saturating_sub num_turns по накопленному списку)",
+          "3. Если snapshot_state.ends_mid_turn && n >= user_positions.len(): cut_idx = active_turn_start_index.or(user_positions.last()); если есть — items[..cut_idx]; иначе items",
+          "4. Иначе: truncate_rollout_before_nth_user_message_from_start(&items, n) — если n == usize::MAX → все items; если user_positions.len() <= n → все items; иначе items[..user_positions[n]]",
+          "5. Если результат пуст → InitialHistory::New; иначе InitialHistory::Forked(rolled)"
+        ],
+        "extensions (Cockburn)": [
+          {"step": 2, "condition": "ThreadRolledBack встречается", "action": "usize::try_from(rollback.num_turns).unwrap_or(usize::MAX); user_positions.truncate(saturating_sub)"}
+        ],
+        "edge_cases": [
+          {"condition": "items пуст", "action": "InitialHistory::New"},
+          {"condition": "n == 0", "action": "вырезать всё, включая первый user message"},
+          {"condition": "ends_mid_turn но active_turn_start_index None и user_positions пусты", "action": "вернуть все items"}
+        ],
+        "lifecycle": null,
+        "ux": null,
+        "result": "InitialHistory (Forked или New), используется для spawn_thread как стартовая история"
+      }
+    },
+    {
+      "id": "SRC-0009/uc.sub/mint-human-biscuit",
+      "src": "SRC-0009",
+      "composition": "use_case",
+      "level": "sub",
+      "strategic_domain": null,
+      "terms": {
+        "actor": "AgentIdentityManager.mint_human_biscuit",
+        "goal": "Получить короткоживущий human-biscuit токен (OpenAI Authorization) для последующего POST /v1/agent/register",
+        "steps": [
+          "1. Собрать url = agent_identity_biscuit_url(chatgpt_base_url) → \"{trimmed}/authenticate_app_v2\"",
+          "2. Сгенерировать request_id: 16 байт через OsRng.try_fill_bytes; формат \"codex-agent-identity-{URL_SAFE_NO_PAD(bytes)}\"",
+          "3. GET url с headers: Authorization: Bearer {binding.access_token} (bearer_auth), X-Request-Id, X-Original-Method=target_method, X-Original-Url=target_url",
+          "4. Timeout = AGENT_IDENTITY_BISCUIT_TIMEOUT (15s)",
+          "5. Если status.is_success: взять response.headers.get(\"x-openai-authorization\").to_str().to_string(); info!(\"minted human biscuit...\") + return",
+          "6. Иначе: status+body → bail!(\"agent identity biscuit minting failed with status {status} from {url}: {body}\")"
+        ],
+        "extensions (Cockburn)": [
+          {"step": 5, "condition": "header отсутствует", "action": "context error \"agent identity biscuit response did not include x-openai-authorization\""},
+          {"step": 5, "condition": "header не UTF-8", "action": "context error \"agent identity biscuit response header was not valid UTF-8\""},
+          {"step": 3, "condition": "send error (timeout/network)", "action": "with_context(\"failed to send agent identity biscuit request to {url}\")"}
+        ],
+        "edge_cases": [
+          {"condition": "OsRng.try_fill_bytes вернул Err", "action": "context \"failed to generate agent identity request id\""}
+        ],
+        "lifecycle": null,
+        "ux": null,
+        "result": "human_biscuit: String используется как X-OpenAI-Authorization в register_agent"
+      }
+    },
+    {
+      "id": "SRC-0009/uc.sub/generate-agent-key-material",
+      "src": "SRC-0009",
+      "composition": "use_case",
+      "level": "sub",
+      "strategic_domain": null,
+      "terms": {
+        "actor": "agent_identity::generate_agent_key_material",
+        "goal": "Сгенерировать свежую ed25519 пару ключей для agent identity в формате PKCS#8-base64 + SSH",
+        "steps": [
+          "1. secret_key_bytes = [0u8;32]; OsRng.try_fill_bytes(&mut secret_key_bytes) — контекст \"failed to generate agent identity private key bytes\" при ошибке",
+          "2. signing_key = SigningKey::from_bytes(&secret_key_bytes)",
+          "3. private_key_pkcs8 = signing_key.to_pkcs8_der() — контекст \"failed to encode agent identity private key as PKCS#8\"",
+          "4. private_key_pkcs8_base64 = BASE64_STANDARD.encode(private_key_pkcs8.as_bytes())",
+          "5. public_key_ssh = encode_ssh_ed25519_public_key(&signing_key.verifying_key()) — собирает SSH wire blob: 4-byte BE len + \"ssh-ed25519\" (11 bytes) + 4-byte BE len + 32-byte key; всё base64; в строке \"ssh-ed25519 {base64}\""
+        ],
+        "extensions (Cockburn)": [
+          {"step": 1, "condition": "OsRng.try_fill_bytes Err", "action": "context ошибки + propagate"},
+          {"step": 3, "condition": "to_pkcs8_der Err", "action": "context ошибки + propagate"}
+        ],
+        "edge_cases": [
+          {"condition": "wire shape invariant", "action": "тест encode_ssh_ed25519_public_key_matches_expected_wire_shape: decoded[..4]==11u32.BE, decoded[4..15]==\"ssh-ed25519\", decoded[15..19]==32u32.BE, len==51"}
+        ],
+        "lifecycle": null,
+        "ux": null,
+        "result": "GeneratedAgentKeyMaterial с private (PKCS#8 base64) и public (SSH) ключами для отправки в register_agent_identity"
+      }
+    }
+  ]
+}

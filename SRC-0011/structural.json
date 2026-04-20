@@ -1,0 +1,391 @@
+{
+  "src": "SRC-0011",
+  "schema_version": "2.0",
+  "lens": "structural",
+  "compositions": [
+    {
+      "id": "SRC-0011/entity/context-manager",
+      "src": "SRC-0011",
+      "composition": "entity",
+      "terms": {
+        "object": "ContextManager (transcript of thread history)",
+        "attributes": [
+          "items: Vec<ResponseItem> (ordered oldest → newest)",
+          "history_version: u64 (bumped whenever history is rewritten, e.g. compaction or rollback)",
+          "token_info: Option<TokenUsageInfo> (last API response token usage + cumulative)",
+          "reference_context_item: Option<TurnContextItem> (baseline snapshot used for diffing and producing model-visible settings update items; None means next turn emits full reinjection of context state)"
+        ],
+        "relationships": [
+          {"to": "SRC-0011/entity/total-token-usage-breakdown", "rel": "produces", "card": "1:1"},
+          {"to": "SRC-0011/entity/initial-context-injection", "rel": "uses", "card": "N:1"},
+          {"to": "SRC-0011/entity/environment-context", "rel": "uses", "card": "1:1"}
+        ],
+        "enumerations": null,
+        "data_flows": [
+          {"source": "ResponseItem stream (record_items)", "transform": "filter non-api messages and non-GhostSnapshot, then process_item (truncate function output payloads with policy * 1.2 serialization budget)", "sink": "ContextManager.items"},
+          {"source": "ContextManager.items", "transform": "normalize_history: ensure_call_outputs_present + remove_orphan_outputs + strip_images_when_unsupported + drop GhostSnapshot", "sink": "for_prompt() → Vec<ResponseItem> (sent to model)"},
+          {"source": "TokenUsage (from API response)", "transform": "TokenUsageInfo::new_or_append with model_context_window", "sink": "ContextManager.token_info"}
+        ],
+        "config": {
+          "RESIZED_IMAGE_BYTES_ESTIMATE": {"value": 7373, "source": "hardcoded const in history.rs", "default": 7373, "note": "approximate model-visible byte cost for one resized image input; 7373 bytes maps to ~1844 tokens via 4-bytes/token heuristic with ceiling division"},
+          "ORIGINAL_IMAGE_PATCH_SIZE": {"value": 32, "source": "hardcoded const in history.rs", "default": 32, "note": "patch size in pixels for detail=original image token estimation"},
+          "ORIGINAL_IMAGE_ESTIMATE_CACHE_SIZE": {"value": 32, "source": "hardcoded const in history.rs", "default": 32, "note": "LRU cache size for original-image byte estimates"}
+        }
+      }
+    },
+    {
+      "id": "SRC-0011/entity/total-token-usage-breakdown",
+      "src": "SRC-0011",
+      "composition": "entity",
+      "terms": {
+        "object": "TotalTokenUsageBreakdown (token usage snapshot produced by ContextManager)",
+        "attributes": [
+          "last_api_response_total_tokens: i64 (total_tokens from most recent API response)",
+          "all_history_items_model_visible_bytes: i64 (sum of estimate_response_item_model_visible_bytes across every item in history)",
+          "estimated_tokens_of_items_added_since_last_successful_api_response: i64 (local items added after most recent model-generated item, not yet reflected in last_token_usage.total_tokens)",
+          "estimated_bytes_of_items_added_since_last_successful_api_response: i64 (byte-level counterpart for local items added after last model-generated item)"
+        ],
+        "relationships": [
+          {"to": "SRC-0011/entity/context-manager", "rel": "produces_from", "card": "1:1"}
+        ],
+        "enumerations": null,
+        "data_flows": [
+          {"source": "token_info.last_token_usage.total_tokens", "sink": "last_api_response_total_tokens"},
+          {"source": "items_after_last_model_generated_item()", "transform": "sum estimate_item_token_count / estimate_response_item_model_visible_bytes", "sink": "estimated_tokens / estimated_bytes"}
+        ],
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0011/entity/response-item-classification",
+      "src": "SRC-0011",
+      "composition": "entity",
+      "terms": {
+        "object": "Response Item (classification of items stored in history)",
+        "attributes": [
+          "role: string (for Message items: user, assistant, developer, system)",
+          "kind: variant (Message, Reasoning, FunctionCall, FunctionCallOutput, ToolSearchCall, ToolSearchOutput, CustomToolCall, CustomToolCallOutput, LocalShellCall, WebSearchCall, ImageGenerationCall, Compaction, GhostSnapshot, Other)",
+          "is_api_message: bool (true for non-system Message and all tool/reasoning/compaction kinds, false for GhostSnapshot and Other)",
+          "is_model_generated: bool (true for assistant Message, Reasoning, FunctionCall, ToolSearchCall, WebSearchCall, ImageGenerationCall, CustomToolCall, LocalShellCall, Compaction)",
+          "is_codex_generated: bool (FunctionCallOutput, ToolSearchOutput, CustomToolCallOutput, or developer Message)",
+          "is_user_turn_boundary: bool (user Message with non-contextual content, or assistant Message with InterAgentCommunication content)"
+        ],
+        "relationships": [
+          {"to": "SRC-0011/entity/context-manager", "rel": "stored_in", "card": "N:1"},
+          {"to": "SRC-0011/entity/contextual-user-fragment", "rel": "classified_by", "card": "N:1"}
+        ],
+        "enumerations": {
+          "role": ["user", "assistant", "developer", "system"],
+          "kind": ["Message", "Reasoning", "FunctionCall", "FunctionCallOutput", "ToolSearchCall", "ToolSearchOutput", "CustomToolCall", "CustomToolCallOutput", "LocalShellCall", "WebSearchCall", "ImageGenerationCall", "Compaction", "GhostSnapshot", "Other"]
+        },
+        "data_flows": null,
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0011/entity/initial-context-injection",
+      "src": "SRC-0011",
+      "composition": "entity",
+      "terms": {
+        "object": "InitialContextInjection (controls whether compaction replacement history must include initial context)",
+        "attributes": [
+          "variant: enum"
+        ],
+        "relationships": [
+          {"to": "SRC-0011/entity/compaction-attempt", "rel": "parameterizes", "card": "N:1"}
+        ],
+        "enumerations": {
+          "InitialContextInjection": [
+            "BeforeLastUserMessage (mid-turn compaction: inject initial context into replacement history just above the last real user message, because model is trained to see compaction summary as last item)",
+            "DoNotInject (pre-turn/manual compaction: replace history with summary and clear reference_context_item so next regular turn fully reinjects initial context)"
+          ]
+        },
+        "data_flows": null,
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0011/entity/compaction-attempt",
+      "src": "SRC-0011",
+      "composition": "entity",
+      "terms": {
+        "object": "CompactionAnalyticsAttempt (analytics record for one compaction attempt)",
+        "attributes": [
+          "enabled: bool (feature-gated by Feature::GeneralAnalytics)",
+          "thread_id: string (conversation id)",
+          "turn_id: string (turn sub_id)",
+          "trigger: CompactionTrigger (Auto | Manual)",
+          "reason: CompactionReason",
+          "implementation: CompactionImplementation (Responses | ResponsesCompact)",
+          "phase: CompactionPhase (StandaloneTurn | others)",
+          "strategy: CompactionStrategy (Memento — hardcoded)",
+          "status: CompactionStatus (Completed | Interrupted | Failed)",
+          "active_context_tokens_before: i64 (snapshot at begin)",
+          "active_context_tokens_after: i64 (snapshot at track)",
+          "started_at: u64 (unix seconds)",
+          "completed_at: u64 (unix seconds)",
+          "duration_ms: u64 (elapsed from start_instant)",
+          "error: Option<string>"
+        ],
+        "relationships": [
+          {"to": "SRC-0011/entity/context-manager", "rel": "measures", "card": "N:1"},
+          {"to": "SRC-0011/entity/initial-context-injection", "rel": "uses", "card": "N:1"}
+        ],
+        "enumerations": {
+          "CompactionTrigger": ["Auto", "Manual"],
+          "CompactionReason": ["UserRequested", "..."],
+          "CompactionImplementation": ["Responses (inline local compaction)", "ResponsesCompact (remote compaction)"],
+          "CompactionPhase": ["StandaloneTurn", "..."],
+          "CompactionStatus": ["Completed", "Interrupted", "Failed"],
+          "CompactionStrategy": ["Memento"]
+        },
+        "data_flows": [
+          {"source": "sess.get_total_token_usage() at begin", "sink": "active_context_tokens_before"},
+          {"source": "sess.get_total_token_usage() at track", "sink": "active_context_tokens_after"},
+          {"source": "CompactionAnalyticsAttempt.track()", "transform": "build CodexCompactionEvent", "sink": "services.analytics_events_client.track_compaction"}
+        ],
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0011/entity/compacted-item",
+      "src": "SRC-0011",
+      "composition": "entity",
+      "terms": {
+        "object": "CompactedItem (result of one compaction: summary + replacement history)",
+        "attributes": [
+          "message: string (summary text; for remote compaction this is empty, for inline it is SUMMARY_PREFIX + last assistant message or '(no summary available)')",
+          "replacement_history: Option<Vec<ResponseItem>> (full history that replaces the pre-compaction history)"
+        ],
+        "relationships": [
+          {"to": "SRC-0011/entity/context-manager", "rel": "replaces", "card": "1:1"}
+        ],
+        "enumerations": null,
+        "data_flows": [
+          {"source": "pre-compaction history (user messages + last assistant summary)", "transform": "build_compacted_history: keep user messages truncated to COMPACT_USER_MESSAGE_MAX_TOKENS then append summary_text as user message", "sink": "CompactedItem.replacement_history"},
+          {"source": "remote compaction output", "transform": "should_keep_compacted_history_item filter + insert_initial_context_before_last_real_user_or_summary + extend ghost_snapshots", "sink": "CompactedItem.replacement_history"}
+        ],
+        "config": {
+          "COMPACT_USER_MESSAGE_MAX_TOKENS": {"value": 20000, "source": "hardcoded const in compact.rs", "default": 20000, "note": "maximum tokens of user messages preserved when building compacted history from most recent back"},
+          "SUMMARIZATION_PROMPT": {"value": "include_str!(\"../templates/compact/prompt.md\")", "source": "compile-time embedded template file", "default": null, "note": "synthesized prompt text sent to model for auto-compaction"},
+          "SUMMARY_PREFIX": {"value": "include_str!(\"../templates/compact/summary_prefix.md\")", "source": "compile-time embedded template file", "default": null, "note": "prefix prepended to last assistant message to form compaction summary; is_summary_message() recognizes user messages starting with this prefix"}
+        }
+      }
+    },
+    {
+      "id": "SRC-0011/entity/environment-context",
+      "src": "SRC-0011",
+      "composition": "entity",
+      "terms": {
+        "object": "EnvironmentContext (turn-level environment snapshot injected as contextual user message)",
+        "attributes": [
+          "cwd: Option<PathBuf> (current working directory)",
+          "shell: Shell (user shell; ignored when comparing turn-to-turn because only initial context includes it)",
+          "current_date: Option<string>",
+          "timezone: Option<string>",
+          "network: Option<NetworkContext>",
+          "subagents: Option<string> (subagent description block; only set via with_subagents when non-empty)"
+        ],
+        "relationships": [
+          {"to": "SRC-0011/entity/network-context", "rel": "contains", "card": "1:0..1"},
+          {"to": "SRC-0011/entity/context-manager", "rel": "emitted_as_response_item_into", "card": "N:1"}
+        ],
+        "enumerations": null,
+        "data_flows": [
+          {"source": "TurnContext (cwd, current_date, timezone, config.config_layer_stack.requirements.network, shell)", "transform": "from_turn_context", "sink": "EnvironmentContext"},
+          {"source": "TurnContextItem (previous turn snapshot) + next TurnContext", "transform": "diff_from_turn_context_item: cwd diffed, current_date/timezone always from next, network diffed and only changed emitted", "sink": "EnvironmentContext diff-only payload"},
+          {"source": "EnvironmentContext fields", "transform": "serialize_to_xml: emit <cwd>, <shell>, <current_date>, <timezone>, <network enabled=true> with <allowed>/<denied> children, <subagents> lines; wrap in ENVIRONMENT_CONTEXT_FRAGMENT tags", "sink": "ResponseItem::Message (role=user, role-tagged contextual user message)"}
+        ],
+        "config": {
+          "include_environment_context": {"value": "bool (per-turn TurnContext.config)", "source": "next.config.include_environment_context", "default": null, "note": "gates whether build_environment_update_item emits any diff"}
+        }
+      }
+    },
+    {
+      "id": "SRC-0011/entity/network-context",
+      "src": "SRC-0011",
+      "composition": "entity",
+      "terms": {
+        "object": "NetworkContext (network permissions subset of EnvironmentContext)",
+        "attributes": [
+          "allowed_domains: Vec<string>",
+          "denied_domains: Vec<string>"
+        ],
+        "relationships": [
+          {"to": "SRC-0011/entity/environment-context", "rel": "embedded_in", "card": "1:1"}
+        ],
+        "enumerations": null,
+        "data_flows": [
+          {"source": "turn_context.config.config_layer_stack.requirements().network.domains (NetworkDomainPermissionsToml)", "transform": "extract allowed_domains()/denied_domains(), default empty vec", "sink": "NetworkContext"}
+        ],
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0011/entity/contextual-user-fragment",
+      "src": "SRC-0011",
+      "composition": "entity",
+      "terms": {
+        "object": "Contextual User Fragment (injected user-role message containing prompt scaffolding rather than real user conversation)",
+        "attributes": [
+          "open_tag: string",
+          "close_tag: string",
+          "kind: enum (which fragment it is)"
+        ],
+        "relationships": [
+          {"to": "SRC-0011/entity/environment-context", "rel": "wraps", "card": "1:1"},
+          {"to": "SRC-0011/entity/response-item-classification", "rel": "identifies", "card": "1:N"}
+        ],
+        "enumerations": {
+          "CONTEXTUAL_USER_FRAGMENTS": [
+            "AGENTS_MD_FRAGMENT (AGENTS.md guidance; excluded from memory stage-1 inputs because it is prompt scaffolding)",
+            "ENVIRONMENT_CONTEXT_FRAGMENT (<environment_context> ... </environment_context>; kept in memory inputs because it carries useful execution context)",
+            "SKILL_FRAGMENT (skill payload; excluded from memory stage-1 inputs)",
+            "USER_SHELL_COMMAND_FRAGMENT (<user_shell_command> ... </user_shell_command>)",
+            "TURN_ABORTED_FRAGMENT (<turn_aborted> ... </turn_aborted>)",
+            "SUBAGENT_NOTIFICATION_FRAGMENT (<subagent_notification> ... </subagent_notification>; kept in memory inputs because it carries subtask outcomes)"
+          ]
+        },
+        "data_flows": [
+          {"source": "ContentItem::InputText.text", "transform": "is_contextual_user_fragment: parse_hook_prompt_fragment OR any CONTEXTUAL_USER_FRAGMENTS.matches_text", "sink": "classification used by is_user_turn_boundary and rollback trimming"},
+          {"source": "hook fragments + standard contextual fragments", "transform": "parse_visible_hook_prompt_message: collect parsed hook fragments, skip standard contextual text, fail when any other text present", "sink": "HookPromptItem::from_fragments"}
+        ],
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0011/entity/token-usage-info",
+      "src": "SRC-0011",
+      "composition": "entity",
+      "terms": {
+        "object": "TokenUsageInfo (cumulative + last-API-response token usage tracker stored in ContextManager)",
+        "attributes": [
+          "last_token_usage: TokenUsage (with total_tokens: i64)",
+          "model_context_window: Option<i64>"
+        ],
+        "relationships": [
+          {"to": "SRC-0011/entity/context-manager", "rel": "stored_in", "card": "1:1"}
+        ],
+        "enumerations": null,
+        "data_flows": [
+          {"source": "TokenUsage from API response (Completed event)", "transform": "TokenUsageInfo::new_or_append(prev, next, model_context_window)", "sink": "ContextManager.token_info"},
+          {"source": "set_token_usage_full(context_window)", "transform": "info.fill_to_context_window(context_window) OR TokenUsageInfo::full_context_window(context_window)", "sink": "ContextManager.token_info (marks all tokens consumed — used when ContextWindowExceeded with history of 1 item)"}
+        ],
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0011/entity/history-entry",
+      "src": "SRC-0011",
+      "composition": "entity",
+      "terms": {
+        "object": "HistoryEntry (persisted global message-history record for one user message)",
+        "attributes": [
+          "session_id: string (field named conversation_id in original schema but the field value now stores thread id; name preserved for backwards compatibility)",
+          "ts: u64 (seconds since Unix epoch at append time)",
+          "text: string (user message text)"
+        ],
+        "relationships": [
+          {"to": "SRC-0011/entity/message-history-file", "rel": "line_of", "card": "N:1"}
+        ],
+        "enumerations": null,
+        "data_flows": [
+          {"source": "append_entry(text, thread_id, config)", "transform": "serialize HistoryEntry to JSON + newline, open ~/.codex/history.jsonl with O_APPEND, try_lock with retry, seek to end, write_all, flush, enforce_history_limit", "sink": "history.jsonl line"},
+          {"source": "lookup(log_id, offset, config)", "transform": "verify file inode/creation_time matches log_id, try_lock_shared with retry, read lines and parse JSON at given offset", "sink": "HistoryEntry returned to caller"}
+        ],
+        "config": {
+          "history.persistence": {"value": "HistoryPersistence enum", "source": "config.history.persistence", "default": null, "note": "when None, append_entry silently skips"},
+          "history.max_bytes": {"value": "Option<usize>", "source": "config.history.max_bytes", "default": null, "note": "hard cap on history file bytes; when exceeded, trim to HISTORY_SOFT_CAP_RATIO * max_bytes"}
+        }
+      }
+    },
+    {
+      "id": "SRC-0011/entity/message-history-file",
+      "src": "SRC-0011",
+      "composition": "entity",
+      "terms": {
+        "object": "Message History File (global append-only JSONL at ~/.codex/history.jsonl)",
+        "attributes": [
+          "path: codex_home/history.jsonl",
+          "format: JSONL (one HistoryEntry per line, terminated by \\n)",
+          "permissions_unix: 0o600 (rw------- owner-only)",
+          "log_id: u64 (inode on Unix, creation_time on Windows; used to detect file recreation between write and read)",
+          "entry_count: usize (derived by counting \\n bytes)"
+        ],
+        "relationships": [
+          {"to": "SRC-0011/entity/history-entry", "rel": "contains", "card": "1:N"}
+        ],
+        "enumerations": {
+          "HistoryPersistence": [
+            "SaveAll (append every user text entry to history)",
+            "None (silently skip all append_entry calls — no history persistence)"
+          ]
+        },
+        "data_flows": [
+          {"source": "multiple concurrent TUI processes", "transform": "File::try_lock advisory exclusive lock with up to MAX_RETRIES retries, seek to end, single write(2) of full prepared line, flush, then enforce_history_limit", "sink": "history.jsonl"},
+          {"source": "history.jsonl over hard cap max_bytes", "transform": "enforce_history_limit: read all line lengths, compute trim_target = max(soft_cap, newest_entry_len), drop leading lines until size ≤ trim_target, rewrite tail to offset 0, set_len(0), flush", "sink": "trimmed history.jsonl"}
+        ],
+        "config": {
+          "HISTORY_FILENAME": {"value": "history.jsonl", "source": "hardcoded const in message_history.rs", "default": "history.jsonl"},
+          "HISTORY_SOFT_CAP_RATIO": {"value": 0.8, "source": "hardcoded const in message_history.rs", "default": 0.8, "note": "when history exceeds hard cap, trim it down to this fraction of max_bytes to avoid trimming again immediately on next write"},
+          "MAX_RETRIES": {"value": 10, "source": "hardcoded const in message_history.rs", "default": 10, "note": "retry count for try_lock/try_lock_shared before giving up"},
+          "RETRY_SLEEP": {"value": "100ms (Duration::from_millis(100))", "source": "hardcoded const in message_history.rs", "default": "100ms", "note": "sleep between file lock retries"},
+          "unix_file_mode": {"value": "0o600", "source": "hardcoded in OpenOptions (unix cfg) and ensure_owner_only_permissions", "default": "0o600", "note": "owner-only read/write permissions enforced on history file"}
+        }
+      }
+    },
+    {
+      "id": "SRC-0011/entity/compact-request-log-data",
+      "src": "SRC-0011",
+      "composition": "entity",
+      "terms": {
+        "object": "CompactRequestLogData (diagnostic payload captured when remote compaction request fails)",
+        "attributes": [
+          "failing_compaction_request_model_visible_bytes: i64 (sum of estimate_response_item_model_visible_bytes across prompt.input, plus length of base_instructions text)"
+        ],
+        "relationships": [
+          {"to": "SRC-0011/entity/compaction-attempt", "rel": "augments_error_log_of", "card": "1:1"}
+        ],
+        "enumerations": null,
+        "data_flows": [
+          {"source": "prompt.input Vec<ResponseItem> + prompt.base_instructions.text", "transform": "build_compact_request_log_data: fold bytes per item + text length", "sink": "tracing::error! log with turn_id, last_api_response_total_tokens, all_history_items_model_visible_bytes, estimated_tokens_added_since_last_response, estimated_bytes_added_since_last_response, model_context_window_tokens, failing_compaction_request_model_visible_bytes, compact_error"}
+        ],
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0011/entity/settings-update-bundle",
+      "src": "SRC-0011",
+      "composition": "entity",
+      "terms": {
+        "object": "Settings Update Bundle (per-turn model-visible delta of turn context settings)",
+        "attributes": [
+          "developer_message: Option<ResponseItem> (role=developer; concatenates model-switch / permissions / collaboration-mode / realtime / personality update sections — in this fixed order)",
+          "contextual_user_message: Option<ResponseItem> (role=user; environment-context diff wrapped in <environment_context> tags)",
+          "items: Vec<ResponseItem> (at most 2 items, developer message first then contextual user message)"
+        ],
+        "relationships": [
+          {"to": "SRC-0011/entity/environment-context", "rel": "uses", "card": "1:1"},
+          {"to": "SRC-0011/entity/context-manager", "rel": "emitted_into", "card": "1:1"}
+        ],
+        "enumerations": {
+          "developer_update_sections_order": [
+            "model_instructions_update (first, so model-specific guidance is read before any other context diffs)",
+            "permissions_update (DeveloperInstructions::from_policy when sandbox_policy or approval_policy changed)",
+            "collaboration_mode_update (DeveloperInstructions::from_collaboration_mode when mode changed)",
+            "realtime_update (realtime_start_message / realtime_end_message based on active transitions)",
+            "personality_update (DeveloperInstructions::personality_spec_message when personality changed and model_info.slug unchanged)"
+          ]
+        },
+        "data_flows": [
+          {"source": "(previous TurnContextItem, previous_turn_settings, next TurnContext, shell, exec_policy, personality_feature_enabled)", "transform": "build_settings_update_items: flatten 5 update sections into developer message + build_environment_update_item for contextual user message", "sink": "Vec<ResponseItem> appended to history"}
+        ],
+        "config": {
+          "include_permissions_instructions": {"value": "bool", "source": "next.config.include_permissions_instructions", "default": null, "note": "gates whether build_permissions_update_item emits developer text"},
+          "experimental_realtime_start_instructions": {"value": "Option<string>", "source": "next.config.experimental_realtime_start_instructions", "default": "None (use DeveloperInstructions::realtime_start_message())", "note": "when Some, used as custom realtime-start instructions via realtime_start_message_with_instructions"},
+          "personality_feature_enabled": {"value": "bool", "source": "build_settings_update_items parameter (feature flag)", "default": null, "note": "when false, build_personality_update_item returns None unconditionally"}
+        }
+      }
+    }
+  ]
+}

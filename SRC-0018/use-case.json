@@ -1,0 +1,939 @@
+{
+  "src": "SRC-0018",
+  "schema_version": "2.0",
+  "lens": "use_case",
+  "compositions": [
+    {
+      "id": "SRC-0018/uc.sub/apply-verified-patch",
+      "src": "SRC-0018",
+      "composition": "use_case",
+      "level": "sub",
+      "strategic_domain": null,
+      "terms": {
+        "actor": "ApplyPatchRuntime",
+        "goal": "Применить verified-патч к файловой системе в текущей sandbox-попытке",
+        "steps": [
+          "1. ApplyPatchRuntime получает ApplyPatchRequest и SandboxAttempt с текущей polici",
+          "2. ApplyPatchRuntime извлекает environment из TurnContext (turn.environment.as_ref())",
+          "3. ApplyPatchRuntime строит FileSystemSandboxContext для попытки (None если SandboxType::None)",
+          "4. ApplyPatchRuntime получает filesystem из environment.get_filesystem()",
+          "5. ApplyPatchRuntime вызывает codex_apply_patch::apply_patch с patch, cwd, fs, sandbox_context, буферами stdout/stderr",
+          "6. ApplyPatchRuntime эмитит ExecCommandOutputDelta-события (Stdout и Stderr chunks) в session event bus",
+          "7. ApplyPatchRuntime собирает ExecToolCallOutput с exit_code (0 при Ok, 1 при Err), duration, aggregated_output"
+        ],
+        "extensions (Cockburn)": [
+          {"step": 2, "condition": "TurnContext.environment отсутствует", "action": "ToolError::Rejected('apply_patch is unavailable in this session')"},
+          {"step": 5, "condition": "apply_patch вернул Err и результат похож на sandbox denied (is_likely_sandbox_denied)", "action": "ToolError::Codex(Sandbox(Denied{output, network_policy_decision=None}))"},
+          {"step": 5, "condition": "apply_patch вернул Err, но не sandbox denied", "action": "вернуть output с exit_code=1 как Ok (ошибка приложения, не sandbox)"}
+        ],
+        "edge_cases": [
+          {"condition": "chunk пустой при emit_output_delta", "action": "ранний return, не отправлять пустой delta-event"},
+          {"condition": "SandboxType::None", "action": "file_system_sandbox_context_for_attempt возвращает None → apply_patch работает без sandbox-контекста"}
+        ],
+        "lifecycle": null,
+        "ux": null,
+        "result": "Файлы изменены согласно patch; stdout/stderr-дельты отправлены в event bus; ExecToolCallOutput возвращён с exit_code и duration"
+      }
+    },
+    {
+      "id": "SRC-0018/uc.sub/approve-apply-patch",
+      "src": "SRC-0018",
+      "composition": "use_case",
+      "level": "sub",
+      "strategic_domain": null,
+      "terms": {
+        "actor": "ApplyPatchRuntime (Approvable)",
+        "goal": "Получить апрув на применение патча (guardian или session prompt) с учётом preapproved-флага",
+        "steps": [
+          "1. ApplyPatchRuntime формирует approval_keys из ApplyPatchRequest.file_paths",
+          "2. ApplyPatchRuntime проверяет: req.permissions_preapproved && retry_reason.is_none() — сразу Approved",
+          "3. ApplyPatchRuntime проверяет: если ctx.guardian_review_id присутствует → build_guardian_review_request(ApplyPatch{id, cwd, files, patch}) →triggers review_approval_request и вернуть decision",
+          "4. ApplyPatchRuntime проверяет: если retry_reason присутствует → session.request_patch_approval(turn, call_id, changes, Some(reason), grant_root=None) и вернуть decision (default при ошибке)",
+          "5. ApplyPatchRuntime иначе вызывает with_cached_approval('apply_patch', approval_keys=file_paths, closure→session.request_patch_approval без reason)"
+        ],
+        "extensions (Cockburn)": [
+          {"step": 4, "condition": "rx_approve канал закрылся", "action": "unwrap_or_default — использовать ReviewDecision::default()"},
+          {"step": 5, "condition": "rx_approve канал закрылся внутри closure", "action": "unwrap_or_default — использовать default decision"}
+        ],
+        "edge_cases": [
+          {"condition": "AskForApproval::Never", "action": "wants_no_sandbox_approval=false"},
+          {"condition": "AskForApproval::Granular", "action": "wants_no_sandbox_approval=granular_config.allows_sandbox_approval()"},
+          {"condition": "AskForApproval::OnFailure | OnRequest | UnlessTrusted", "action": "wants_no_sandbox_approval=true"},
+          {"condition": "exec_approval_requirement override", "action": "apply_patch всегда возвращает Some(req.exec_approval_requirement) — апрувы решаются upstream в assess_patch_safety"}
+        ],
+        "lifecycle": null,
+        "ux": null,
+        "result": "ReviewDecision (Approved/Denied/TimedOut/...) для продолжения или остановки применения patch"
+      }
+    },
+    {
+      "id": "SRC-0018/uc.sub/run-shell-command",
+      "src": "SRC-0018",
+      "composition": "use_case",
+      "level": "sub",
+      "strategic_domain": null,
+      "terms": {
+        "actor": "ShellRuntime",
+        "goal": "Выполнить shell-команду под sandbox attempt с правильным wrapping и выбранным backend",
+        "steps": [
+          "1. ShellRuntime читает session_shell из ctx.session.user_shell()",
+          "2. ShellRuntime вызывает maybe_wrap_shell_lc_with_snapshot для wrap shell -lc скрипта снапшотом (если конфигурирован)",
+          "3. ShellRuntime префиксует команду через prefix_powershell_script_with_utf8 если ShellType::PowerShell",
+          "4. ShellRuntime проверяет backend == ShellCommandZshFork → zsh_fork_backend::maybe_run_shell_command →triggers SRC-0018/uc.sub/run-shell-via-zsh-fork",
+          "5. ShellRuntime вызывает build_sandbox_command(command, cwd, env, additional_permissions)",
+          "6. ShellRuntime формирует ExecOptions(expiration=timeout_ms.into(), capture_policy=ShellTool)",
+          "7. ShellRuntime вызывает attempt.env_for(command, options, network) для формирования sandbox env",
+          "8. ShellRuntime вызывает execute_env(env, Self::stdout_stream(ctx)) и возвращает ExecToolCallOutput"
+        ],
+        "extensions (Cockburn)": [
+          {"step": 4, "condition": "ZshFork backend специфицирован, но conditions not met (возврат Ok(None))", "action": "tracing::warn + fallback на стандартный flow со строки 5 (normal execution)"},
+          {"step": 5, "condition": "команда пустая (split_first fails)", "action": "ToolError::Rejected('command args are empty')"},
+          {"step": 7, "condition": "attempt.env_for вернул Err", "action": "ToolError::Codex(err.into())"},
+          {"step": 8, "condition": "execute_env вернул Err", "action": "ToolError::Codex(err)"}
+        ],
+        "edge_cases": [
+          {"condition": "network отсутствует в req", "action": "network_approval_spec возвращает None"},
+          {"condition": "network присутствует", "action": "NetworkApprovalSpec{network, mode=Immediate}"}
+        ],
+        "lifecycle": null,
+        "ux": null,
+        "result": "ExecToolCallOutput (exit_code, stdout, stderr, aggregated_output, duration, timed_out) отправлен в модель через tool_runtime"
+      }
+    },
+    {
+      "id": "SRC-0018/uc.sub/approve-shell-command",
+      "src": "SRC-0018",
+      "composition": "use_case",
+      "level": "sub",
+      "strategic_domain": null,
+      "terms": {
+        "actor": "ShellRuntime (Approvable)",
+        "goal": "Получить апрув на выполнение shell-команды (guardian или session prompt) с кешированием по approval_key",
+        "steps": [
+          "1. ShellRuntime строит ApprovalKey (canonicalize_command_for_approval + cwd + sandbox_permissions + additional_permissions)",
+          "2. ShellRuntime определяет reason = retry_reason.or(req.justification)",
+          "3. ShellRuntime проверяет: если guardian_review_id присутствует → review_approval_request(Guardian::Shell{id, command, cwd, sandbox_permissions, additional_permissions, justification}, retry_reason)",
+          "4. ShellRuntime иначе вызывает with_cached_approval('shell', keys, closure → session.request_command_approval(turn, call_id, None, command, cwd, reason, network_approval_context, proposed_execpolicy_amendment, additional_permissions, available_decisions=None))"
+        ],
+        "extensions (Cockburn)": [],
+        "edge_cases": [
+          {"condition": "retry_reason присутствует", "action": "использовать retry_reason вместо justification как reason"},
+          {"condition": "sandbox_mode_for_first_attempt", "action": "делегировать sandbox_override_for_first_attempt(sandbox_permissions, exec_approval_requirement)"}
+        ],
+        "lifecycle": null,
+        "ux": null,
+        "result": "ReviewDecision из guardian или session UI — готовность продолжить shell-исполнение"
+      }
+    },
+    {
+      "id": "SRC-0018/uc.sub/run-shell-via-zsh-fork",
+      "src": "SRC-0018",
+      "composition": "use_case",
+      "level": "sub",
+      "strategic_domain": null,
+      "terms": {
+        "actor": "ZshFork Backend Adapter (try_run_zsh_fork, unix only)",
+        "goal": "Запустить shell-команду через zsh-fork escalation server с policy-driven escalation решениями",
+        "steps": [
+          "1. ZshFork Adapter проверяет session.services.shell_zsh_path.as_ref() — если None → warn + вернуть Ok(None) (fallback)",
+          "2. ZshFork Adapter проверяет session.features().enabled(Feature::ShellZshFork) — если false → warn + Ok(None)",
+          "3. ZshFork Adapter проверяет session.user_shell().shell_type == Zsh — иначе warn + Ok(None)",
+          "4. ZshFork Adapter вызывает build_sandbox_command(command, cwd, env, additional_permissions)",
+          "5. ZshFork Adapter формирует ExecOptions и вызывает attempt.env_for → ExecRequest",
+          "6. ZshFork Adapter извлекает (program, script, login) через extract_shell_script",
+          "7. ZshFork Adapter вычисляет effective_timeout = timeout_ms.unwrap_or(DEFAULT_EXEC_COMMAND_TIMEOUT_MS)",
+          "8. ZshFork Adapter стартует Stopwatch(effective_timeout) и получает cancellation_token",
+          "9. ZshFork Adapter нормализует approval_sandbox_permissions (если preapproved && WithAdditionalPermissions → UseDefault)",
+          "10. ZshFork Adapter строит CoreShellActionProvider (EscalationPolicy) + CoreShellCommandExecutor",
+          "11. ZshFork Adapter создаёт EscalateServer(shell_zsh_path, main_execve_wrapper_exe, escalation_policy)",
+          "12. ZshFork Adapter вызывает escalate_server.exec(ExecParams{command=script, workdir, timeout_ms, login}, cancel_token, executor)",
+          "13. ZshFork Adapter мапит ExecResult → ExecToolCallOutput через map_exec_result"
+        ],
+        "extensions (Cockburn)": [
+          {"step": 1, "condition": "shell_zsh_path не настроен", "action": "warn 'ZshFork backend specified, but shell_zsh_path is not configured.' + Ok(None) — fallback на стандартный shell flow"},
+          {"step": 2, "condition": "Feature::ShellZshFork выключена", "action": "warn 'ZshFork backend specified, but ShellZshFork feature is not enabled.' + Ok(None)"},
+          {"step": 3, "condition": "user shell ≠ Zsh", "action": "warn 'ZshFork backend specified, but user shell is not Zsh.' + Ok(None)"},
+          {"step": 5, "condition": "attempt.env_for Err", "action": "ToolError::Codex(err)"},
+          {"step": 6, "condition": "extract_shell_script не нашёл -c/-lc тройку", "action": "ToolError::Rejected('unexpected shell command format for zsh-fork execution')"},
+          {"step": 10, "condition": "main_execve_wrapper_exe не настроен", "action": "ToolError::Rejected('zsh fork feature enabled, but execve wrapper is not configured')"},
+          {"step": 12, "condition": "escalate_server.exec Err", "action": "ToolError::Rejected(err.to_string())"},
+          {"step": 13, "condition": "result.timed_out", "action": "ToolError::Codex(Sandbox(Timeout{output}))"},
+          {"step": 13, "condition": "is_likely_sandbox_denied(sandbox, output)", "action": "ToolError::Codex(Sandbox(Denied{output, network_policy_decision=None}))"}
+        ],
+        "edge_cases": [
+          {"condition": "non-unix платформа", "action": "imp::maybe_run_shell_command возвращает Ok(None) — fallback"}
+        ],
+        "lifecycle": null,
+        "ux": null,
+        "result": "Если все gates пройдены — ExecToolCallOutput с результатом escalated исполнения; иначе Ok(None) → вызывающий shell runtime выполняет fallback"
+      }
+    },
+    {
+      "id": "SRC-0018/uc.sub/escalate-intercepted-execve",
+      "src": "SRC-0018",
+      "composition": "use_case",
+      "level": "sub",
+      "strategic_domain": null,
+      "terms": {
+        "actor": "CoreShellActionProvider (EscalationPolicy)",
+        "goal": "Определить допустимое действие для перехваченного execve-вызова внутри zsh-fork — run/escalate/deny на основе execpolicy и пользовательского апрува",
+        "steps": [
+          "1. CoreShellActionProvider получает (program, argv, workdir) из EscalateServer",
+          "2. CoreShellActionProvider читает policy через RwLock и вызывает evaluate_intercepted_exec_policy (fallback-функция render_decision_for_unmatched_command, resolve_host_executables=true)",
+          "3. CoreShellActionProvider вычисляет decision_driven_by_policy (любой non-HeuristicsRuleMatch rule с тем же decision)",
+          "4. CoreShellActionProvider вычисляет needs_escalation = sandbox_permissions.requires_escalated_permissions() OR decision_driven_by_policy",
+          "5. CoreShellActionProvider определяет decision_source: PrefixRule (policy-driven) или UnmatchedCommandFallback",
+          "6. CoreShellActionProvider выбирает escalation_execution: PrefixRule → Unsandboxed; Fallback → shell_request_escalation_execution(sandbox_permissions, policies, additional_permissions)",
+          "7. CoreShellActionProvider вызывает process_decision(decision, needs_escalation, program, argv, workdir, prompt_permissions, escalation_execution, decision_source)",
+          "8. Для Decision::Forbidden → EscalationDecision::deny('Execution forbidden by policy')",
+          "9. Для Decision::Prompt → execve_prompt_is_rejected_by_policy? если да → deny; если нет → запросить апрув через prompt() и обработать ReviewDecision",
+          "10. Для Decision::Allow → если needs_escalation → escalate(escalation_execution); иначе run()",
+          "11. CoreShellActionProvider логирует policy-decision + action"
+        ],
+        "extensions (Cockburn)": [
+          {"step": 9, "condition": "AskForApproval::Never и любой decision_source", "action": "deny с reason PROMPT_CONFLICT_REASON ('approval required by policy, but AskForApproval is set to Never')"},
+          {"step": 9, "condition": "AskForApproval::Granular и decision_source=PrefixRule и !allows_rules_approval()", "action": "deny с REJECT_RULES_APPROVAL_REASON"},
+          {"step": 9, "condition": "AskForApproval::Granular и decision_source=UnmatchedCommandFallback и !allows_sandbox_approval()", "action": "deny с REJECT_SANDBOX_APPROVAL_REASON"},
+          {"step": 9, "condition": "ReviewDecision::Approved | ApprovedForSession | ApprovedExecpolicyAmendment", "action": "если needs_escalation → escalate; иначе run()"},
+          {"step": 9, "condition": "ReviewDecision::NetworkPolicyAmendment с Allow", "action": "escalate или run() как и Approved"},
+          {"step": 9, "condition": "ReviewDecision::NetworkPolicyAmendment с Deny", "action": "deny('User denied execution')"},
+          {"step": 9, "condition": "ReviewDecision::Denied, guardian_review_id=Some", "action": "deny с guardian_rejection_message(session, review_id)"},
+          {"step": 9, "condition": "ReviewDecision::Denied, guardian_review_id=None", "action": "deny('User denied execution')"},
+          {"step": 9, "condition": "ReviewDecision::TimedOut", "action": "deny(guardian_timeout_message())"},
+          {"step": 9, "condition": "ReviewDecision::Abort", "action": "deny('User cancelled execution')"}
+        ],
+        "edge_cases": [
+          {"condition": "enable_shell_wrapper_parsing=false (const default)", "action": "в fallback candidates только одна — join_program_and_argv; used_complex_parsing=false"},
+          {"condition": "enable_shell_wrapper_parsing=true", "action": "parse_shell_lc_plain_commands → если Some использовать как commands; иначе parse_shell_lc_single_command_prefix → used_complex_parsing=true"},
+          {"condition": "shell_request_escalation_execution SandboxPermissions::WithAdditionalPermissions без additional_permissions", "action": "fallback на TurnDefault"}
+        ],
+        "lifecycle": null,
+        "ux": null,
+        "result": "EscalationDecision (run | escalate(EscalationExecution) | deny(reason)) для EscalateServer"
+      }
+    },
+    {
+      "id": "SRC-0018/uc.sub/prompt-execve-approval",
+      "src": "SRC-0018",
+      "composition": "use_case",
+      "level": "sub",
+      "strategic_domain": null,
+      "terms": {
+        "actor": "CoreShellActionProvider (prompt)",
+        "goal": "Запросить у пользователя апрув на конкретный intercepted-execve (через guardian или session prompt) с паузой Stopwatch",
+        "steps": [
+          "1. CoreShellActionProvider формирует command через join_program_and_argv(program, argv)",
+          "2. CoreShellActionProvider генерирует approval_id = Some(Uuid::new_v4().to_string())",
+          "3. CoreShellActionProvider вычисляет guardian_review_id = routes_approval_to_guardian(&turn).then(new_guardian_review_id)",
+          "4. CoreShellActionProvider выполняет stopwatch.pause_for(async): если guardian_review_id → review_approval_request(Guardian::Execve{id, source=tool_name, program, argv, cwd=workdir, additional_permissions}, retry_reason=None); иначе → session.request_command_approval(turn, call_id, approval_id, command, workdir, reason=None, network_approval_context=None, proposed_execpolicy_amendment=None, additional_permissions, available_decisions=Some([Approved, Abort]))",
+          "5. CoreShellActionProvider возвращает PromptDecision{decision, guardian_review_id}"
+        ],
+        "extensions (Cockburn)": [],
+        "edge_cases": [
+          {"condition": "pause_for приостанавливает таймер Stopwatch на время запроса", "action": "таймаут не тикает пока пользователь думает"}
+        ],
+        "lifecycle": null,
+        "ux": null,
+        "result": "PromptDecision с ReviewDecision пользователя и (опционально) guardian_review_id для последующего сообщения об отказе"
+      }
+    },
+    {
+      "id": "SRC-0018/uc.sub/execute-shell-command-in-sandbox",
+      "src": "SRC-0018",
+      "composition": "use_case",
+      "level": "sub",
+      "strategic_domain": null,
+      "terms": {
+        "actor": "CoreShellCommandExecutor (ShellCommandExecutor)",
+        "goal": "Выполнить решённую shell-команду с merge env от escalation-сессии (CODEX_ESCALATE_SOCKET, EXEC_WRAPPER) и вернуть ExecResult",
+        "steps": [
+          "1. CoreShellCommandExecutor клонирует self.env как базовое окружение",
+          "2. CoreShellCommandExecutor мержит из env_overlay только ключи 'CODEX_ESCALATE_SOCKET' и 'EXEC_WRAPPER' (если присутствуют)",
+          "3. CoreShellCommandExecutor формирует ExecRequest (command, cwd, env, sandbox_policy, file_system_sandbox_policy, network_sandbox_policy, sandbox, windows_sandbox_level, windows_sandbox_private_desktop=false, expiration=Cancellation(cancel_rx), capture_policy=ShellTool, arg0)",
+          "4. CoreShellCommandExecutor вызывает execute_exec_request_with_after_spawn(request, stdout_stream=None, after_spawn)",
+          "5. CoreShellCommandExecutor формирует ExecResult (exit_code, stdout=result.stdout.text, stderr=result.stderr.text, output=result.aggregated_output.text, duration, timed_out)"
+        ],
+        "extensions (Cockburn)": [
+          {"step": 4, "condition": "execute_exec_request_with_after_spawn Err", "action": "пропагировать anyhow::Error вверх"}
+        ],
+        "edge_cases": [
+          {"condition": "env_overlay не содержит 'CODEX_ESCALATE_SOCKET' или 'EXEC_WRAPPER'", "action": "переменная не вставляется — работает исходный env сессии"}
+        ],
+        "lifecycle": null,
+        "ux": null,
+        "result": "ExecResult с результатом исполнения переданной EscalateServer команды (с escalation env merged)"
+      }
+    },
+    {
+      "id": "SRC-0018/uc.sub/prepare-escalated-exec",
+      "src": "SRC-0018",
+      "composition": "use_case",
+      "level": "sub",
+      "strategic_domain": null,
+      "terms": {
+        "actor": "CoreShellCommandExecutor (prepare_escalated_exec)",
+        "goal": "Подготовить PreparedExec под выбранный режим эскалации (Unsandboxed / TurnDefault / Permissions)",
+        "steps": [
+          "1. CoreShellCommandExecutor формирует command = join_program_and_argv(program, argv); извлекает first_arg = argv.first() (ошибка если argv пустой)",
+          "2. CoreShellCommandExecutor обрабатывает EscalationExecution::Unsandboxed → PreparedExec{command, cwd=workdir, env, arg0=Some(first_arg)}",
+          "3. CoreShellCommandExecutor обрабатывает TurnDefault → prepare_sandboxed_exec с текущими turn policies, additional_permissions=None",
+          "4. CoreShellCommandExecutor обрабатывает Permissions(PermissionProfile(profile)) → prepare_sandboxed_exec с текущими policies + additional_permissions=Some(profile)",
+          "5. CoreShellCommandExecutor обрабатывает Permissions(Permissions(escalated)) → prepare_sandboxed_exec с полностью специфицированным policy из escalated (не merge)",
+          "6. prepare_sandboxed_exec: split_first (command must not be empty) → SandboxManager.new + select_initial → SandboxCommand → ExecOptions(DefaultTimeout, ShellTool) → SandboxManager.transform → ExecRequest::from_sandbox_exec_request → network.apply_to_env если network present → PreparedExec"
+        ],
+        "extensions (Cockburn)": [
+          {"step": 1, "condition": "argv пустой", "action": "anyhow!('intercepted exec request must contain argv[0]')"},
+          {"step": 6, "condition": "command пустой в prepare_sandboxed_exec", "action": "anyhow!('prepared command must not be empty')"},
+          {"step": 6, "condition": "SandboxManager.transform Err", "action": "пропагировать anyhow::Error"}
+        ],
+        "edge_cases": [
+          {"condition": "TurnDefault + PermissionProfile", "action": "additive permissions merged с turn policy"},
+          {"condition": "Permissions::Permissions(full)", "action": "используется полностью свой policy вместо turn policy"}
+        ],
+        "lifecycle": null,
+        "ux": null,
+        "result": "PreparedExec{command, cwd, env, arg0} для запуска EscalateServer"
+      }
+    },
+    {
+      "id": "SRC-0018/uc.sub/wrap-shell-lc-with-snapshot",
+      "src": "SRC-0018",
+      "composition": "use_case",
+      "level": "sub",
+      "strategic_domain": null,
+      "terms": {
+        "actor": "Snapshot Wrapper (maybe_wrap_shell_lc_with_snapshot)",
+        "goal": "Переписать argv 'shell -lc <script>' в 'user_shell -c \". SNAPSHOT; exec shell -c <script>\"' при наличии snapshot на session shell",
+        "steps": [
+          "1. Wrapper проверяет platform: если Windows → вернуть command без изменений",
+          "2. Wrapper читает session_shell.shell_snapshot() — если None → вернуть command без изменений",
+          "3. Wrapper проверяет snapshot.path.exists() — если нет → вернуть command",
+          "4. Wrapper проверяет paths_match_after_normalization(snapshot.cwd, cwd) — если не совпадает → вернуть command",
+          "5. Wrapper проверяет command.len() >= 3 и command[1] == '-lc' — иначе вернуть command",
+          "6. Wrapper экранирует через shell_single_quote: original_shell, original_script, snapshot_path, trailing_args",
+          "7. Wrapper формирует override_env = explicit_env_overrides.clone() + опционально CODEX_THREAD_ID из env",
+          "8. Wrapper вызывает build_override_exports(override_env) — возвращает (captures, restores); пустые если нет валидных ключей",
+          "9. Wrapper формирует rewritten_script: без overrides — 'if . SNAPSHOT >/dev/null 2>&1; then :; fi\\n\\nexec SHELL -c SCRIPT trailing'; с overrides — добавляются captures сверху и restores перед exec",
+          "10. Wrapper возвращает [shell_path, '-c', rewritten_script]"
+        ],
+        "extensions (Cockburn)": [
+          {"step": 2, "condition": "snapshot не конфигурирован на session shell", "action": "no-op — вернуть исходную command"},
+          {"step": 3, "condition": "snapshot.path не существует", "action": "no-op"},
+          {"step": 4, "condition": "cwd команды не совпадает с snapshot.cwd", "action": "no-op"},
+          {"step": 5, "condition": "command короче 3 или флаг не '-lc'", "action": "no-op — command возвращается без wrap"}
+        ],
+        "edge_cases": [
+          {"condition": "is_valid_shell_variable_name проверяет имя env-ключа: первый символ _ или ASCII letter, остальные _ или alphanum", "action": "ключи с невалидными именами игнорируются в override"},
+          {"condition": "shell_single_quote — заменяет ' на '\"'\"'", "action": "безопасное экранирование внутри одиночных кавычек"}
+        ],
+        "lifecycle": null,
+        "ux": null,
+        "result": "Команда либо возвращена без изменений (no-op), либо переписана в non-login shell с sourcing snapshot и restore overrides перед exec оригинала"
+      }
+    },
+    {
+      "id": "SRC-0018/uc.sub/run-unified-exec",
+      "src": "SRC-0018",
+      "composition": "use_case",
+      "level": "sub",
+      "strategic_domain": null,
+      "terms": {
+        "actor": "UnifiedExecRuntime",
+        "goal": "Запустить unified-exec команду (PTY-сессию) под sandbox с возможным прохождением через zsh-fork backend",
+        "steps": [
+          "1. UnifiedExecRuntime определяет environment_is_remote через turn.environment.is_remote()",
+          "2. UnifiedExecRuntime выбирает command: если remote — base_command.to_vec(); иначе → maybe_wrap_shell_lc_with_snapshot",
+          "3. UnifiedExecRuntime префиксует через prefix_powershell_script_with_utf8 для ShellType::PowerShell",
+          "4. UnifiedExecRuntime клонирует req.env и применяет network.apply_to_env если network present",
+          "5. UnifiedExecRuntime проверяет shell_mode == ZshFork(cfg) → build_sandbox_command + ExecOptions(DefaultTimeout, ShellTool) + attempt.env_for → exec_env.exec_server_env_config = req.exec_server_env_config",
+          "6. UnifiedExecRuntime вызывает zsh_fork_backend::maybe_prepare_unified_exec →triggers SRC-0018/uc.sub/prepare-unified-exec-zsh-fork",
+          "7. При Some(prepared) и non-remote environment → manager.open_session_with_exec_env(process_id, prepared.exec_request, tty, prepared.spawn_lifecycle, environment)",
+          "8. При None (zsh-fork conditions not met) → warn + fallback на direct execution",
+          "9. Fallback: build_sandbox_command + ExecOptions(DefaultTimeout) + attempt.env_for → exec_server_env_config → manager.open_session_with_exec_env(process_id, exec_env, tty, NoopSpawnLifecycle, environment)"
+        ],
+        "extensions (Cockburn)": [
+          {"step": 5, "condition": "build_sandbox_command Err (команда пустая)", "action": "ToolError::Rejected('missing command line for PTY')"},
+          {"step": 5, "condition": "attempt.env_for Err", "action": "ToolError::Codex(err.into())"},
+          {"step": 7, "condition": "turn.environment отсутствует", "action": "ToolError::Rejected('exec_command is unavailable in this session')"},
+          {"step": 7, "condition": "environment.is_remote() при zsh-fork ветке", "action": "ToolError::Rejected('unified_exec zsh-fork is not supported when exec_server_url is configured')"},
+          {"step": 7, "condition": "manager.open_session_with_exec_env вернул UnifiedExecError::SandboxDenied{output}", "action": "ToolError::Codex(Sandbox(Denied{output, network_policy_decision=None}))"},
+          {"step": 7, "condition": "manager.open_session_with_exec_env другая ошибка", "action": "ToolError::Rejected(err.to_string())"},
+          {"step": 9, "condition": "turn.environment отсутствует в fallback", "action": "ToolError::Rejected('exec_command is unavailable in this session')"},
+          {"step": 9, "condition": "SandboxDenied", "action": "ToolError::Codex(Sandbox(Denied{output, network_policy_decision=None}))"}
+        ],
+        "edge_cases": [
+          {"condition": "network отсутствует", "action": "network_approval_spec возвращает None"},
+          {"condition": "network присутствует", "action": "NetworkApprovalSpec{network, mode=Deferred}"}
+        ],
+        "lifecycle": null,
+        "ux": null,
+        "result": "UnifiedExecProcess — handle на запущенную PTY-сессию, готовую принимать stdin/stdout"
+      }
+    },
+    {
+      "id": "SRC-0018/uc.sub/prepare-unified-exec-zsh-fork",
+      "src": "SRC-0018",
+      "composition": "use_case",
+      "level": "sub",
+      "strategic_domain": null,
+      "terms": {
+        "actor": "ZshFork Backend Adapter (prepare_unified_exec_zsh_fork)",
+        "goal": "Подготовить ExecRequest и SpawnLifecycle для unified-exec через zsh-fork escalation server",
+        "steps": [
+          "1. ZshFork Adapter парсит shell-скрипт через extract_shell_script(exec_request.command)",
+          "2. ZshFork Adapter проверяет parsed.program == shell_zsh_path (string) — иначе warn + вернуть Ok(None)",
+          "3. ZshFork Adapter формирует CoreShellCommandExecutor с текущими policies и env",
+          "4. ZshFork Adapter формирует CoreShellActionProvider с GuardianCommandSource::UnifiedExec и Stopwatch::unlimited",
+          "5. ZshFork Adapter создаёт EscalateServer(shell_zsh_path, main_execve_wrapper_exe, escalation_policy)",
+          "6. ZshFork Adapter вызывает escalate_server.start_session(CancellationToken::new(), executor)",
+          "7. ZshFork Adapter мержит escalation_session.env() в exec_request.env",
+          "8. ZshFork Adapter возвращает PreparedUnifiedExecZshFork{exec_request, escalation_session}",
+          "9. Верхний слой оборачивает в PreparedUnifiedExecSpawn{exec_request, spawn_lifecycle=ZshForkSpawnLifecycle(escalation_session)}"
+        ],
+        "extensions (Cockburn)": [
+          {"step": 1, "condition": "extract_shell_script Err", "action": "warn 'ZshFork unified exec fallback: ...' + Ok(None)"},
+          {"step": 2, "condition": "parsed.program ≠ shell_zsh_path", "action": "warn 'ZshFork backend specified, but unified exec command targets `X` instead of `Y`.' + Ok(None)"},
+          {"step": 6, "condition": "start_session Err", "action": "ToolError::Rejected(err.to_string())"}
+        ],
+        "edge_cases": [
+          {"condition": "non-unix платформа", "action": "imp::maybe_prepare_unified_exec возвращает Ok(None)"}
+        ],
+        "lifecycle": null,
+        "ux": null,
+        "result": "Some(PreparedUnifiedExecSpawn) — готовая PTY-спецификация с lifecycle, либо Ok(None) → fallback на прямой запуск"
+      }
+    },
+    {
+      "id": "SRC-0018/uc.sub/manage-zsh-fork-spawn-lifecycle",
+      "src": "SRC-0018",
+      "composition": "use_case",
+      "level": "sub",
+      "strategic_domain": null,
+      "terms": {
+        "actor": "ZshForkSpawnLifecycle (SpawnLifecycle)",
+        "goal": "Держать escalation_session живой на время spawn PTY и закрыть клиентский сокет после spawn",
+        "steps": [
+          "1. ZshForkSpawnLifecycle в inherited_fds читает env CODEX_ESCALATE_SOCKET из escalation_session.env()",
+          "2. ZshForkSpawnLifecycle парсит значение как i32 fd и возвращает Vec с этим fd (или пустой)",
+          "3. После spawn PTY ZshForkSpawnLifecycle.after_spawn() вызывает escalation_session.close_client_socket()"
+        ],
+        "extensions (Cockburn)": [
+          {"step": 1, "condition": "CODEX_ESCALATE_SOCKET отсутствует в env", "action": "inherited_fds возвращает пустой Vec"},
+          {"step": 2, "condition": "fd не парсится как i32", "action": "inherited_fds возвращает пустой Vec (and_then parse ok)"}
+        ],
+        "edge_cases": null,
+        "lifecycle": {
+          "entity": "SRC-0018/entity/zsh-fork-spawn-lifecycle",
+          "states": ["pre-spawn (fd inherited via env)", "post-spawn (client socket closed)"],
+          "transition": {
+            "from": "pre-spawn",
+            "to": "post-spawn",
+            "guard": "spawn PTY выполнен",
+            "side_effect": "escalation_session.close_client_socket()"
+          }
+        },
+        "ux": null,
+        "result": "FD унаследован в child процесс; после spawn клиентская часть сокета закрыта на хост-стороне"
+      }
+    },
+    {
+      "id": "SRC-0018/uc.sub/handle-code-mode-execute",
+      "src": "SRC-0018",
+      "composition": "use_case",
+      "level": "sub",
+      "strategic_domain": null,
+      "terms": {
+        "actor": "CodeModeExecuteHandler (ToolHandler)",
+        "goal": "Принять raw JavaScript source от модели и запустить его через CodeModeService с форматированием ответа",
+        "steps": [
+          "1. CodeModeExecuteHandler получает ToolInvocation{session, turn, call_id, tool_name, payload}",
+          "2. CodeModeExecuteHandler проверяет payload = ToolPayload::Custom{input}, namespace None, name == PUBLIC_TOOL_NAME — иначе error",
+          "3. CodeModeExecuteHandler парсит args через codex_code_mode::parse_exec_source(input) → {code, yield_time_ms, max_output_tokens}",
+          "4. CodeModeExecuteHandler формирует ExecContext{session, turn} и строит enabled_tools через build_enabled_tools(&exec) →triggers SRC-0018/uc.sub/build-code-mode-enabled-tools",
+          "5. CodeModeExecuteHandler получает stored_values через session.services.code_mode_service.stored_values()",
+          "6. CodeModeExecuteHandler фиксирует started_at = Instant::now()",
+          "7. CodeModeExecuteHandler вызывает code_mode_service.execute(ExecuteRequest{tool_call_id, enabled_tools, source=args.code, stored_values, yield_time_ms, max_output_tokens})",
+          "8. CodeModeExecuteHandler вызывает handle_runtime_response(exec, response, max_output_tokens, started_at) →triggers SRC-0018/uc.sub/format-code-mode-runtime-response"
+        ],
+        "extensions (Cockburn)": [
+          {"step": 2, "condition": "payload не Custom или tool_name не PUBLIC_TOOL_NAME или namespace Some", "action": "FunctionCallError::RespondToModel('{PUBLIC_TOOL_NAME} expects raw JavaScript source text')"},
+          {"step": 3, "condition": "parse_exec_source Err", "action": "FunctionCallError::RespondToModel(err)"},
+          {"step": 7, "condition": "code_mode_service.execute Err", "action": "FunctionCallError::RespondToModel(err)"},
+          {"step": 8, "condition": "handle_runtime_response Err", "action": "FunctionCallError::RespondToModel(err)"}
+        ],
+        "edge_cases": null,
+        "lifecycle": null,
+        "ux": null,
+        "result": "FunctionToolOutput с форматированными content items и success флагом, возвращаемый модели"
+      }
+    },
+    {
+      "id": "SRC-0018/uc.sub/handle-code-mode-wait",
+      "src": "SRC-0018",
+      "composition": "use_case",
+      "level": "sub",
+      "strategic_domain": null,
+      "terms": {
+        "actor": "CodeModeWaitHandler (ToolHandler)",
+        "goal": "Ожидать завершения cell_id в code-mode runtime с возможностью терминирования и получить форматированный ответ",
+        "steps": [
+          "1. CodeModeWaitHandler получает ToolInvocation, проверяет ToolPayload::Function{arguments} + namespace None + name == WAIT_TOOL_NAME",
+          "2. CodeModeWaitHandler парсит arguments как ExecWaitArgs{cell_id, yield_time_ms=DEFAULT, max_tokens=None, terminate=false}",
+          "3. CodeModeWaitHandler формирует ExecContext{session, turn} и фиксирует started_at",
+          "4. CodeModeWaitHandler вызывает code_mode_service.wait(WaitRequest{cell_id, yield_time_ms, terminate})",
+          "5. CodeModeWaitHandler вызывает handle_runtime_response(exec, response, max_tokens, started_at)"
+        ],
+        "extensions (Cockburn)": [
+          {"step": 1, "condition": "неверный payload или name", "action": "FunctionCallError::RespondToModel('{WAIT_TOOL_NAME} expects JSON arguments')"},
+          {"step": 2, "condition": "serde_json::from_str Err", "action": "FunctionCallError::RespondToModel('failed to parse function arguments: {err}')"},
+          {"step": 4, "condition": "code_mode_service.wait Err", "action": "FunctionCallError::RespondToModel(err)"}
+        ],
+        "edge_cases": [
+          {"condition": "terminate=true", "action": "передано в WaitRequest — инструкция терминировать ячейку"}
+        ],
+        "lifecycle": null,
+        "ux": null,
+        "result": "FunctionToolOutput с результатом ожидания cell_id (Yielded/Terminated/Result)"
+      }
+    },
+    {
+      "id": "SRC-0018/uc.sub/format-code-mode-runtime-response",
+      "src": "SRC-0018",
+      "composition": "use_case",
+      "level": "sub",
+      "strategic_domain": null,
+      "terms": {
+        "actor": "handle_runtime_response (code_mode)",
+        "goal": "Преобразовать RuntimeResponse (Yielded/Terminated/Result) в FunctionToolOutput с статусом скрипта, wall time, truncation и санитизацией image detail",
+        "steps": [
+          "1. Formatter вычисляет script_status через format_script_status: 'Script running with cell ID X' / 'Script terminated' / 'Script completed' / 'Script failed'",
+          "2. Formatter на варианте Yielded/Terminated: into_function_call_output_content_items(content_items) → sanitize_runtime_image_detail → truncate_code_mode_result(max_output_tokens) → prepend_script_status → FunctionToolOutput::from_content(items, Some(true))",
+          "3. Formatter на варианте Result: into_function_call_output_content_items → sanitize_runtime_image_detail → replace_stored_values(stored_values) → если error_text Some: push InputText 'Script error:\\n{error_text}'; success = error_text.is_none() → truncate → prepend_script_status → FunctionToolOutput::from_content(items, Some(success))",
+          "4. Formatter в prepend_script_status считает wall_time_seconds = round(elapsed*10)/10 и формирует header '{status}\\nWall time {wall_time_seconds:.1} seconds\\nOutput:\\n' → вставляет в позицию 0"
+        ],
+        "extensions (Cockburn)": [
+          {"step": 3, "condition": "Result.error_text Some", "action": "append text content item 'Script error:\\n{error_text}' + success=false"},
+          {"step": 3, "condition": "Result.error_text None", "action": "success=true, ошибки не добавляем"}
+        ],
+        "edge_cases": [
+          {"condition": "все items InputText", "action": "truncate_code_mode_result использует formatted_truncate_text_content_items_with_policy"},
+          {"condition": "смесь InputText+Image", "action": "truncate_function_output_items_with_policy"},
+          {"condition": "!can_request_original_image_detail(model_info)", "action": "sanitize_original_image_detail — нормализация detail (Original → лимитированное)"}
+        ],
+        "lifecycle": {
+          "entity": "SRC-0018/entity/runtime-response",
+          "states": ["Yielded (cell_id, running)", "Terminated (script stopped)", "Result (completed with optional error_text)"],
+          "transition": null
+        },
+        "ux": null,
+        "result": "FunctionToolOutput готов для возврата модели: статус + wall time + output; stored_values актуализированы при Result"
+      }
+    },
+    {
+      "id": "SRC-0018/uc.sub/build-code-mode-enabled-tools",
+      "src": "SRC-0018",
+      "composition": "use_case",
+      "level": "sub",
+      "strategic_domain": null,
+      "terms": {
+        "actor": "build_enabled_tools + build_nested_router",
+        "goal": "Построить список ToolDefinition для кода, исполняемого внутри code_mode runtime (nested tools)",
+        "steps": [
+          "1. build_nested_router получает exec.turn.tools_config.for_code_mode_nested_tools()",
+          "2. build_nested_router читает session.services.mcp_connection_manager.read().list_all_tools()",
+          "3. build_nested_router фильтрует turn.config.mcp_servers где supports_parallel_tool_calls в HashSet имён",
+          "4. build_nested_router вызывает ToolRouter::from_config(nested_tools_config, ToolRouterParams{deferred_mcp_tools=None, mcp_tools=Some(list), unavailable_called_tools=[], parallel_mcp_server_names, discoverable_tools=None, dynamic_tools=turn.dynamic_tools.as_slice()})",
+          "5. build_enabled_tools берёт router.specs() и вызывает collect_code_mode_tool_definitions(specs) → Vec<ToolDefinition>"
+        ],
+        "extensions (Cockburn)": [],
+        "edge_cases": [
+          {"condition": "mcp_connection_manager пустой", "action": "mcp_tools=Some(empty)"},
+          {"condition": "нет серверов с supports_parallel_tool_calls", "action": "parallel_mcp_server_names=HashSet::new()"}
+        ],
+        "lifecycle": null,
+        "ux": null,
+        "result": "Список ToolDefinition доступных коду (как функции window.tools.*) внутри code_mode kernel"
+      }
+    },
+    {
+      "id": "SRC-0018/uc.sub/dispatch-nested-tool-call",
+      "src": "SRC-0018",
+      "composition": "use_case",
+      "level": "sub",
+      "strategic_domain": null,
+      "terms": {
+        "actor": "call_nested_tool (CoreTurnHost.invoke_tool)",
+        "goal": "Диспатчить вложенный tool-вызов из code_mode-скрипта через ToolCallRuntime с правильным payload (Function/Freeform/Mcp)",
+        "steps": [
+          "1. Dispatcher проверяет: если tool_name.namespace is None и name == PUBLIC_TOOL_NAME → error 'cannot invoke itself'",
+          "2. Dispatcher пытается session.resolve_mcp_tool_info(tool_name) — если Some → canonical_tool_name + ToolPayload::Mcp{server, tool, raw_arguments=serialize_function_tool_arguments}",
+          "3. Dispatcher иначе build_nested_tool_payload(tool_runtime.find_spec(tool_name), tool_name, input)",
+          "4. build_nested_tool_payload: tool_kind_for_spec — Freeform(_) → Freeform; иначе → Function; spec=None → err 'tool X is not enabled in PUBLIC_TOOL_NAME'",
+          "5. Для Function kind: serialize_function_tool_arguments (None → '{}', Object → to_string, иначе err 'expects JSON object') → ToolPayload::Function{arguments}",
+          "6. Для Freeform kind: input должен быть String → ToolPayload::Custom{input}; иначе err 'expects a string input'",
+          "7. Dispatcher формирует ToolCall{tool_name, call_id='{PUBLIC_TOOL_NAME}-{uuid v4}', payload}",
+          "8. Dispatcher вызывает tool_runtime.handle_tool_call_with_source(call, ToolCallSource::CodeMode, cancellation_token)",
+          "9. Dispatcher возвращает result.code_mode_result() как JsonValue"
+        ],
+        "extensions (Cockburn)": [
+          {"step": 1, "condition": "self-invoke attempt", "action": "FunctionCallError::RespondToModel('{PUBLIC_TOOL_NAME} cannot invoke itself')"},
+          {"step": 2, "condition": "MCP serialize_function_tool_arguments Err", "action": "FunctionCallError::RespondToModel(err)"},
+          {"step": 4, "condition": "spec не найден", "action": "err 'tool `{tool_name}` is not enabled in {PUBLIC_TOOL_NAME}'"},
+          {"step": 5, "condition": "input не Object", "action": "err 'tool `{tool_name}` expects a JSON object for arguments'"},
+          {"step": 6, "condition": "input не String", "action": "err 'tool `{tool_name}` expects a string input'"},
+          {"step": 8, "condition": "tool_runtime Err", "action": "пропагировать FunctionCallError"}
+        ],
+        "edge_cases": null,
+        "lifecycle": null,
+        "ux": null,
+        "result": "JsonValue результата tool-вызова, возвращаемый обратно в kernel"
+      }
+    },
+    {
+      "id": "SRC-0018/uc.sub/notify-from-code-mode",
+      "src": "SRC-0018",
+      "composition": "use_case",
+      "level": "sub",
+      "strategic_domain": null,
+      "terms": {
+        "actor": "CoreTurnHost.notify",
+        "goal": "Инжектить сообщение notify из code_mode-скрипта в response items текущего турна",
+        "steps": [
+          "1. CoreTurnHost.notify получает call_id, cell_id, text",
+          "2. CoreTurnHost.notify проверяет text.trim().is_empty() — если пусто → Ok(()) без действий",
+          "3. CoreTurnHost.notify вызывает session.inject_response_items([ResponseInputItem::CustomToolCallOutput{call_id, name=Some(PUBLIC_TOOL_NAME), output=FunctionCallOutputPayload::from_text(text)}])",
+          "4. CoreTurnHost.notify возвращает Ok(()) или map error в 'failed to inject exec notify message for cell {cell_id}: no active turn'"
+        ],
+        "extensions (Cockburn)": [
+          {"step": 2, "condition": "text пустой после trim", "action": "ранний Ok(()) — ничего не инжектим"},
+          {"step": 3, "condition": "inject_response_items Err (no active turn)", "action": "вернуть 'failed to inject exec notify message for cell {cell_id}: no active turn'"}
+        ],
+        "edge_cases": null,
+        "lifecycle": null,
+        "ux": null,
+        "result": "notify-сообщение добавлено как CustomToolCallOutput в текущий turn"
+      }
+    },
+    {
+      "id": "SRC-0018/uc.sub/start-code-mode-turn-worker",
+      "src": "SRC-0018",
+      "composition": "use_case",
+      "level": "sub",
+      "strategic_domain": null,
+      "terms": {
+        "actor": "CodeModeService.start_turn_worker",
+        "goal": "Запустить code_mode turn worker для текущего турна только если фича CodeMode включена",
+        "steps": [
+          "1. CodeModeService проверяет turn.features.enabled(Feature::CodeMode) — если false → return None",
+          "2. CodeModeService формирует ExecContext{session, turn}",
+          "3. CodeModeService создаёт ToolCallRuntime::new(router, session, turn, tracker)",
+          "4. CodeModeService создаёт Arc<CoreTurnHost{exec, tool_runtime}>",
+          "5. CodeModeService вызывает inner.start_turn_worker(host) и возвращает Some(worker)"
+        ],
+        "extensions (Cockburn)": [
+          {"step": 1, "condition": "Feature::CodeMode выключена на турне", "action": "вернуть None — воркер не создаётся"}
+        ],
+        "edge_cases": null,
+        "lifecycle": null,
+        "ux": null,
+        "result": "Some(CodeModeTurnWorker) — фоновый обработчик code_mode исполнения, или None если фича выключена"
+      }
+    },
+    {
+      "id": "SRC-0018/uc.sub/execute-js-repl",
+      "src": "SRC-0018",
+      "composition": "use_case",
+      "level": "sub",
+      "strategic_domain": null,
+      "terms": {
+        "actor": "JsReplManager",
+        "goal": "Выполнить JavaScript-код в Node-kernel js_repl с обработкой timeout, регистрацией top-level exec и сбором content items от nested tools",
+        "steps": [
+          "1. JsReplManager получает exec_lock через Semaphore(1) — единственная активная execute",
+          "2. JsReplManager проверяет kernel.is_none() — если нужно, вызывает start_kernel →triggers SRC-0018/uc.sub/start-js-repl-kernel и устанавливает TopLevelExecState::FreshKernel{turn_id, exec_id=None}",
+          "3. JsReplManager генерирует req_id (Uuid::new_v4), создаёт oneshot channel, вставляет в pending_execs и exec_contexts{req_id → ExecContext{session, turn, tracker}}",
+          "4. JsReplManager вызывает register_top_level_exec(req_id, turn.sub_id) → FreshKernel(Some) или ReusedKernelPending",
+          "5. JsReplManager вызывает register_exec_tool_calls(req_id)",
+          "6. JsReplManager формирует HostToKernel::Exec{id=req_id, code=args.code, timeout_ms=args.timeout_ms}",
+          "7. JsReplManager вызывает mark_top_level_exec_submitted(req_id) → Submitted (ДО фактической записи — т.к. kernel может увидеть код даже при ранней отмене)",
+          "8. JsReplManager вызывает write_message(stdin, payload) — serde_json + write_all + '\\n'",
+          "9. JsReplManager ожидает rx с timeout Duration::from_millis(timeout_ms.unwrap_or(30_000))",
+          "10. При Ok(ExecResultMessage::Ok{content_items}) — split_exec_result_content_items → JsExecResult{output, content_items}",
+          "11. При Ok(ExecResultMessage::Err{message}) — FunctionCallError::RespondToModel(message)"
+        ],
+        "extensions (Cockburn)": [
+          {"step": 1, "condition": "exec_lock acquire Err", "action": "FunctionCallError::RespondToModel('js_repl execution unavailable')"},
+          {"step": 2, "condition": "start_kernel Err", "action": "FunctionCallError::RespondToModel(err)"},
+          {"step": 2, "condition": "kernel is_none после успешного start", "action": "FunctionCallError::RespondToModel('js_repl kernel unavailable')"},
+          {"step": 8, "condition": "write_message Err", "action": "удалить из pending_execs+exec_contexts, clear_exec_tool_calls, kernel_debug_snapshot → если is_kernel_status_exited(status) ИЛИ err содержит 'broken pipe' → with_model_kernel_failure_message('write_failed', err, snapshot); иначе только err_message"},
+          {"step": 9, "condition": "Ok(Err(_)) — oneshot канал закрылся (dropped)", "action": "удалить pending/ctx → clear_top_level_exec_if_matches → wait_for_exec_tool_calls → clear_exec_tool_calls → snapshot → если exited: with_model_kernel_failure_message('js_repl kernel closed unexpectedly', 'response_channel_closed', None, snapshot); иначе 'js_repl kernel closed unexpectedly'"},
+          {"step": 9, "condition": "Err(_) — elapsed timeout", "action": "reset_kernel → wait_for_exec_tool_calls → exec_tool_calls.clear() → clear_top_level_exec_if_matches → FunctionCallError::RespondToModel('js_repl execution timed out; kernel reset, rerun your request')"}
+        ],
+        "edge_cases": [
+          {"condition": "default timeout", "action": "args.timeout_ms.unwrap_or(30_000) мс"},
+          {"condition": "split_exec_result_content_items: первый item InputText → output=text, rest=content_items; Image first → output='', content_items=все", "action": "унифицированный вид JsExecResult"}
+        ],
+        "lifecycle": {
+          "entity": "SRC-0018/entity/top-level-exec-state",
+          "states": ["Idle", "FreshKernel{turn_id, exec_id:None}", "FreshKernel{turn_id, exec_id:Some}", "ReusedKernelPending{turn_id, exec_id}", "Submitted{turn_id, exec_id}", "Idle (after exec clear)"],
+          "transition": {
+            "from": "Idle | FreshKernel{..}",
+            "to": "Submitted{turn_id, exec_id}",
+            "guard": "register_top_level_exec + mark_top_level_exec_submitted успешно; write_message не Err",
+            "side_effect": "HostToKernel::Exec записан в stdin kernel"
+          }
+        },
+        "ux": null,
+        "result": "JsExecResult с текстовым output и дополнительными content_items (emitted images, tool outputs) или FunctionCallError"
+      }
+    },
+    {
+      "id": "SRC-0018/uc.sub/start-js-repl-kernel",
+      "src": "SRC-0018",
+      "composition": "use_case",
+      "level": "sub",
+      "strategic_domain": null,
+      "terms": {
+        "actor": "JsReplManager.start_kernel",
+        "goal": "Запустить Node-kernel процесс js_repl под sandbox с правильным env и спавнить read_stdout/read_stderr задачи",
+        "steps": [
+          "1. JsReplManager валидирует Node через resolve_compatible_node(node_path) → ensure_node_version (found >= required из node-version.txt) →triggers SRC-0018/uc.sub/resolve-js-repl-node",
+          "2. JsReplManager записывает kernel.js и meriyah.umd.min.js в tmp_dir через write_kernel_script",
+          "3. JsReplManager создаёт env через create_env(shell_environment_policy, thread_id) + dependency_env extend + CODEX_JS_TMP_DIR + CODEX_JS_REPL_NODE_MODULE_DIRS (если node_module_dirs не пустой и не установлен уже)",
+          "4. JsReplManager выбирает sandbox_type через SandboxManager::new().select_initial(fs_policy, network_policy, Auto, windows_sandbox_level, managed_network_active=turn.network.is_some())",
+          "5. JsReplManager формирует SandboxCommand{program=node_path, args=['--experimental-vm-modules', kernel_path], cwd, env, additional_permissions=None}",
+          "6. JsReplManager формирует ExecOptions{DefaultTimeout, ShellTool} и вызывает sandbox.transform(SandboxTransformRequest{...})",
+          "7. JsReplManager строит tokio::process::Command с exec_env.command[0] + args + arg0 + current_dir + env_clear + envs + Stdio::piped для stdin/stdout/stderr + kill_on_drop",
+          "8. JsReplManager cmd.spawn и берёт stdin/stdout/stderr handles",
+          "9. JsReplManager создаёт CancellationToken shutdown, pending_execs, exec_contexts, recent_stderr VecDeque(cap=20)",
+          "10. JsReplManager спавнит задачи read_stdout и read_stderr (если stderr present, иначе warn)",
+          "11. JsReplManager возвращает KernelState{child, recent_stderr, stdin, pending_execs, exec_contexts, top_level_exec_state=Idle, shutdown}"
+        ],
+        "extensions (Cockburn)": [
+          {"step": 1, "condition": "resolve_node вернул None", "action": "err 'Node runtime not found; install Node or set CODEX_JS_REPL_NODE_PATH'"},
+          {"step": 1, "condition": "ensure_node_version found < required", "action": "err 'Node runtime too old for js_repl (resolved {path}): found v{found}, requires >= v{required}. Install/update Node or set js_repl_node_path to a newer runtime.'"},
+          {"step": 3, "condition": "join_paths(node_module_dirs) Err", "action": "err 'failed to join js_repl_node_module_dirs: {err}'"},
+          {"step": 6, "condition": "sandbox.transform Err", "action": "err 'failed to configure sandbox for js_repl: {err}'"},
+          {"step": 8, "condition": "cmd.spawn Err", "action": "err 'failed to start Node runtime: {err}'"},
+          {"step": 8, "condition": "child.stdout missing", "action": "err 'js_repl kernel missing stdout'"},
+          {"step": 8, "condition": "child.stdin missing", "action": "err 'js_repl kernel missing stdin'"},
+          {"step": 10, "condition": "child.stderr missing", "action": "warn 'js_repl kernel missing stderr' + пропустить read_stderr task"}
+        ],
+        "edge_cases": [
+          {"condition": "tempfile::tempdir() failed", "action": "FunctionCallError::RespondToModel('failed to create js_repl temp dir: {err}')"}
+        ],
+        "lifecycle": null,
+        "ux": null,
+        "result": "KernelState с живыми stdin/stdout/stderr каналами и фоновыми задачами read_stdout/read_stderr"
+      }
+    },
+    {
+      "id": "SRC-0018/uc.sub/resolve-js-repl-node",
+      "src": "SRC-0018",
+      "composition": "use_case",
+      "level": "sub",
+      "strategic_domain": null,
+      "terms": {
+        "actor": "resolve_node + resolve_compatible_node + ensure_node_version",
+        "goal": "Найти Node runtime (по приоритету) и проверить, что его версия не ниже минимальной для js_repl",
+        "steps": [
+          "1. resolve_node проверяет env CODEX_JS_REPL_NODE_PATH — если путь существует → вернуть",
+          "2. resolve_node иначе проверяет config_path (переданный в JsReplHandle) — если exists → вернуть",
+          "3. resolve_node иначе which::which('node') → вернуть",
+          "4. resolve_compatible_node вызывает ensure_node_version(node_path)",
+          "5. ensure_node_version читает required_node_version из include_str!('node-version.txt')",
+          "6. ensure_node_version запускает node --version, парсит через NodeVersion::parse (strip 'v', split ['.','-','+'], major/minor/patch u64)",
+          "7. Если found < required → error; иначе Ok(())"
+        ],
+        "extensions (Cockburn)": [
+          {"step": 3, "condition": "ни одна из опций не дала путь", "action": "None → выше 'Node runtime not found; install Node or set CODEX_JS_REPL_NODE_PATH'"},
+          {"step": 6, "condition": "node --version завершился с non-zero status", "action": "err 'failed to read Node version (status {status}) ( stdout:... stderr:...)'"},
+          {"step": 6, "condition": "NodeVersion::parse Err", "action": "err 'failed to parse Node version output `{stdout}`: {err}' (missing major/minor/patch или invalid число)"}
+        ],
+        "edge_cases": [
+          {"condition": "parse: 'v18.17.0' → strip 'v' → split '.' или '-' или '+'", "action": "major=18, minor=17, patch=0"}
+        ],
+        "lifecycle": null,
+        "ux": null,
+        "result": "PathBuf на Node runtime, чья версия >= минимальной требуемой"
+      }
+    },
+    {
+      "id": "SRC-0018/uc.sub/read-js-repl-kernel-output",
+      "src": "SRC-0018",
+      "composition": "use_case",
+      "level": "sub",
+      "strategic_domain": null,
+      "terms": {
+        "actor": "JsReplManager.read_stdout",
+        "goal": "Непрерывно читать JSON-сообщения из kernel stdout и маршрутизировать их (ExecResult / RunTool / EmitImage) до завершения потока",
+        "steps": [
+          "1. Reader оборачивает stdout в BufReader.lines() и входит в loop",
+          "2. Reader в select: shutdown.cancelled → break с KernelStreamEnd::Shutdown; next_line → Ok(Some) продолжает, Ok(None) → StdoutEof, Err → StdoutReadError(err)",
+          "3. Reader парсит line в KernelToHost через serde_json — при Err только warn 'js_repl kernel sent invalid json: {err} (line: {line})' и continue",
+          "4. На ExecResult{id, ok, output, error}: wait_for_exec_tool_calls_map → собрать content_items → удалить из pending_execs → clear_top_level_exec_if_matches → сформировать ExecResultMessage::Ok (build_exec_result_content_items: output как InputText первый) или Err(message) → oneshot send → exec_contexts.remove → clear_exec_tool_calls_map",
+          "5. На EmitImage(req): взять exec_context — если найден и validate_emitted_image_url(image_url) Ok (scheme 'data:') → emitted_image_content_item(turn, url, detail) с normalize_output_image_detail → record_exec_content_item → HostToKernel::EmitImageResult{ok=true}; иначе → HostToKernel::EmitImageResult{ok=false, error='codex.emitImage only accepts data URLs' или 'js_repl exec context not found'}; отправить через write_message",
+          "6. На RunTool(req): begin_exec_tool_call → если None → отправить RunToolResult{ok=false, error='js_repl exec context not found'}; иначе спавнить task: получить exec_context → select{reset_cancel → RunToolResult{error:'js_repl execution reset'} vs run_tool_request(ctx, req) →triggers SRC-0018/uc.sub/run-js-repl-nested-tool} → finish_exec_tool_call → write RunToolResult",
+          "7. После завершения loop: exec_contexts.drain — для каждого exec_id wait_for_exec_tool_calls_map + clear_exec_tool_calls_map",
+          "8. Reader формирует kernel_exit_message: если Shutdown → None; иначе kernel_debug_snapshot → with_model_kernel_failure_message('js_repl kernel exited unexpectedly', reason, error, snapshot)",
+          "9. Reader очищает manager_kernel если still pointing на этот child; для каждого pending_exec отправляет ExecResultMessage::Err{kernel_exit_message}",
+          "10. Reader вызывает clear_top_level_exec_if_matches_any_map для all pending_exec_ids",
+          "11. Reader (если не Shutdown) warn 'js_repl kernel terminated unexpectedly' с сортированным списком exec_ids (truncate_id_list до JS_REPL_EXEC_ID_LOG_LIMIT=8 с '...+N')"
+        ],
+        "extensions (Cockburn)": [
+          {"step": 3, "condition": "невалидный JSON", "action": "warn + skip, loop продолжается"},
+          {"step": 5, "condition": "image_url не data:", "action": "error 'codex.emitImage only accepts data URLs'"},
+          {"step": 5, "condition": "exec_context не найден для emit_image", "action": "error 'js_repl exec context not found'"},
+          {"step": 5, "condition": "write_message Err для EmitImageResult", "action": "warn с snapshot; loop продолжается"},
+          {"step": 6, "condition": "begin_exec_tool_call None (exec_tool_calls нет записи)", "action": "RunToolResult{ok=false, error='js_repl exec context not found'}"},
+          {"step": 6, "condition": "reset_cancel сработал во время run_tool_request", "action": "RunToolResult{error='js_repl execution reset'}"}
+        ],
+        "edge_cases": [
+          {"condition": "pending_execs пустой при выходе", "action": "clear_top_level_exec_if_matches_any_map не вызывается"},
+          {"condition": "truncate_id_list: если ids.len() > 8 → первые 8 + '...+N'", "action": "ограничение лога на размер"}
+        ],
+        "lifecycle": {
+          "entity": "SRC-0018/entity/kernel-stream-end",
+          "states": ["running", "shutdown", "stdout_eof", "stdout_read_error"],
+          "transition": {
+            "from": "running",
+            "to": "shutdown | stdout_eof | stdout_read_error",
+            "guard": "shutdown.cancelled OR EOF OR I/O error",
+            "side_effect": "pending_execs получают ExecResultMessage::Err; kernel cleared если still same child"
+          }
+        },
+        "ux": null,
+        "result": "Все сообщения kernel обработаны, pending execs уведомлены об ошибке при неожиданном завершении, kernel cleared в manager"
+      }
+    },
+    {
+      "id": "SRC-0018/uc.sub/run-js-repl-nested-tool",
+      "src": "SRC-0018",
+      "composition": "use_case",
+      "level": "sub",
+      "strategic_domain": null,
+      "terms": {
+        "actor": "JsReplManager.run_tool_request",
+        "goal": "Выполнить запрошенный kernel-ом nested tool-вызов через ToolRouter с источником ToolCallSource::JsRepl",
+        "steps": [
+          "1. Runner проверяет is_js_repl_internal_tool(name in ['js_repl', 'js_repl_reset']) → error 'js_repl cannot invoke itself' + summary + log",
+          "2. Runner получает mcp_tools через session.services.mcp_connection_manager.read().list_all_tools()",
+          "3. Runner строит ToolRouter::from_config(turn.tools_config, ToolRouterParams{deferred_mcp_tools=None, mcp_tools=Some(list), unavailable_called_tools=[], parallel_mcp_server_names=HashSet::new() (JS REPL dispatch directly), discoverable_tools=None, dynamic_tools})",
+          "4. Runner находит requested_tool_name через router.specs(): Function/Freeform с name == req.tool_name → ToolName::plain; Namespace с tools[*].display() == req.tool_name → ToolName::namespaced; иначе fallback ToolName::plain(req.tool_name)",
+          "5. Runner формирует payload: если resolve_mcp_tool_info Some → canonical_name + Mcp{server, tool, raw_arguments=req.arguments}; Freeform spec → ToolPayload::Custom{input=req.arguments}; иначе → ToolPayload::Function{arguments=req.arguments}",
+          "6. Runner формирует ToolCall{tool_name, call_id=req.id, payload}",
+          "7. Runner вызывает router.dispatch_tool_call_with_code_mode_result(session, turn, tracker, call, ToolCallSource::JsRepl)",
+          "8. При Ok(result): response = result.into_response() → summary = summarize_tool_call_response → serde_json::to_value → log + RunToolResult{ok=true, response=Some(value)}",
+          "9. При Err(err): error_text → summary → log + RunToolResult{ok=false, error=Some}"
+        ],
+        "extensions (Cockburn)": [
+          {"step": 1, "condition": "tool_name = 'js_repl' или 'js_repl_reset'", "action": "'js_repl cannot invoke itself' — запрет self-invoke"},
+          {"step": 8, "condition": "serde_json::to_value Err", "action": "error 'failed to serialize tool output: {err}' + log"},
+          {"step": 7, "condition": "dispatch Err", "action": "error = err.to_string() + log"}
+        ],
+        "edge_cases": [
+          {"condition": "tool не найден в router.specs()", "action": "fallback ToolName::plain(req.tool_name) — router отдаст ошибку ниже"}
+        ],
+        "lifecycle": null,
+        "ux": null,
+        "result": "RunToolResult отправляется обратно в kernel через write_message"
+      }
+    },
+    {
+      "id": "SRC-0018/uc.sub/accumulate-js-repl-stderr",
+      "src": "SRC-0018",
+      "composition": "use_case",
+      "level": "sub",
+      "strategic_domain": null,
+      "terms": {
+        "actor": "JsReplManager.read_stderr + push_stderr_tail_line",
+        "goal": "Собирать bounded tail stderr строк kernel для диагностики (лимиты по количеству, байтам на строку и суммарно)",
+        "steps": [
+          "1. Reader оборачивает stderr в BufReader.lines(); в select: shutdown → break; next_line → Ok(Some) line, Ok(None) → break, Err → warn 'js_repl kernel stderr ended: {err}' + break",
+          "2. Reader trim строки; если empty → continue",
+          "3. Reader вызывает push_stderr_tail_line(tail, trimmed) под lock",
+          "4. push_stderr_tail_line: bounded_line = truncate_utf8_prefix_by_bytes(line, min(JS_REPL_STDERR_TAIL_LINE_MAX_BYTES=512, JS_REPL_STDERR_TAIL_MAX_BYTES=4096)); если пусто → return",
+          "5. push_stderr_tail_line: пока lines.len() >= JS_REPL_STDERR_TAIL_LINE_LIMIT=20 OR stderr_tail_bytes_with_candidate > 4096 → pop_front",
+          "6. push_stderr_tail_line: push_back bounded_line",
+          "7. Reader warn 'js_repl stderr: {bounded_line}' (если не пусто)"
+        ],
+        "extensions (Cockburn)": [
+          {"step": 1, "condition": "shutdown.cancelled", "action": "break loop"},
+          {"step": 1, "condition": "stderr reader Err", "action": "warn + break"}
+        ],
+        "edge_cases": [
+          {"condition": "strings > 512 bytes", "action": "обрезаются до UTF-8 границы через truncate_utf8_prefix_by_bytes"},
+          {"condition": "lines.len() > 20 ИЛИ суммарно > 4096 bytes", "action": "pop_front самых старых"},
+          {"condition": "всё пусто (bounded_line пуст)", "action": "не пушим"}
+        ],
+        "lifecycle": null,
+        "ux": null,
+        "result": "recent_stderr VecDeque содержит последние 20 строк (макс) с лимитом 4096 байт суммарно для включения в kernel_debug_snapshot"
+      }
+    },
+    {
+      "id": "SRC-0018/uc.sub/reset-js-repl-kernel",
+      "src": "SRC-0018",
+      "composition": "use_case",
+      "level": "sub",
+      "strategic_domain": null,
+      "terms": {
+        "actor": "JsReplManager.reset / reset_kernel / kill_kernel_child",
+        "goal": "Остановить текущий kernel-процесс js_repl и очистить всё связанное состояние (tool calls, top-level exec)",
+        "steps": [
+          "1. JsReplManager.reset: acquire exec_lock → reset_kernel → clear_all_exec_tool_calls_map → Ok(())",
+          "2. JsReplManager.reset_kernel: взять KernelState из Mutex (take), если Some → state.shutdown.cancel() + kill_kernel_child(child, 'reset')",
+          "3. kill_kernel_child: try_wait — если уже exited → return",
+          "4. kill_kernel_child: start_kill — при Err warn 'failed to send kill signal to js_repl kernel' и return",
+          "5. kill_kernel_child: timeout 2s на wait — Ok → ok; Err(wait err) → warn 'failed while waiting for js_repl kernel exit'; timeout → warn 'timed out waiting for js_repl kernel to exit after kill'"
+        ],
+        "extensions (Cockburn)": [
+          {"step": 3, "condition": "child.try_wait Ok(Some)", "action": "kernel уже завершён — return без kill"},
+          {"step": 3, "condition": "child.try_wait Err", "action": "warn 'failed to inspect js_repl kernel before kill' + продолжать"},
+          {"step": 4, "condition": "start_kill Err", "action": "warn + return (kill не отправлен)"},
+          {"step": 5, "condition": "wait timeout 2s", "action": "warn 'timed out waiting for js_repl kernel to exit after kill'"}
+        ],
+        "edge_cases": null,
+        "lifecycle": null,
+        "ux": null,
+        "result": "Kernel процесс завершён (или попытка завершения сделана), exec_tool_calls очищены, kernel=None в manager"
+      }
+    },
+    {
+      "id": "SRC-0018/uc.sub/interrupt-js-repl-turn",
+      "src": "SRC-0018",
+      "composition": "use_case",
+      "level": "sub",
+      "strategic_domain": null,
+      "terms": {
+        "actor": "JsReplManager.interrupt_turn_exec",
+        "goal": "Прервать top-level js_repl exec только если он относится к прерываемому турну (FreshKernel/Submitted с тем же turn_id)",
+        "steps": [
+          "1. JsReplManager.interrupt_turn_exec: acquire exec_lock",
+          "2. JsReplManager вызывает turn_interrupt_requires_reset(turn_id) — smотрит TopLevelExecState.should_reset_for_interrupt(turn_id)",
+          "3. Если false → return Ok(false) (ничего не прерываем)",
+          "4. Если true → reset_kernel + clear_all_exec_tool_calls_map → Ok(true)"
+        ],
+        "extensions (Cockburn)": [
+          {"step": 1, "condition": "exec_lock acquire Err", "action": "FunctionCallError::RespondToModel('js_repl execution unavailable')"},
+          {"step": 2, "condition": "TopLevelExecState::Idle", "action": "should_reset_for_interrupt → false → Ok(false)"},
+          {"step": 2, "condition": "ReusedKernelPending{...}", "action": "should_reset_for_interrupt → false (не относится к текущему turn, kernel переиспользован) → Ok(false)"},
+          {"step": 2, "condition": "FreshKernel{active_turn}/Submitted{active_turn} где active_turn == turn_id", "action": "should_reset_for_interrupt → true → reset"}
+        ],
+        "edge_cases": null,
+        "lifecycle": {
+          "entity": "SRC-0018/entity/top-level-exec-state",
+          "states": ["Idle", "FreshKernel", "ReusedKernelPending", "Submitted"],
+          "transition": {
+            "from": "FreshKernel{turn_id} | Submitted{turn_id}",
+            "to": "Idle (после reset_kernel)",
+            "guard": "active_turn_id == interrupted turn_id",
+            "side_effect": "kernel killed, exec_tool_calls cleared"
+          }
+        },
+        "ux": null,
+        "result": "bool — был ли сделан reset (true если прерывание попало в активный exec этого турна)"
+      }
+    }
+  ]
+}

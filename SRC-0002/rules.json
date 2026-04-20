@@ -1,0 +1,590 @@
+{
+  "src": "SRC-0002",
+  "schema_version": "2.0",
+  "lens": "rule",
+  "compositions": [
+    {
+      "id": "SRC-0002/rule/file-system-access-mode-conflict-precedence",
+      "src": "SRC-0002",
+      "composition": "rule",
+      "terms": {
+        "condition": "При двух одинаково специфичных записях на тот же путь конфликт разрешается по precedence: None > Write > Read (none beats write, write beats read). Это conflict precedence, а не capability breadth — narrower deny побеждает broader write.",
+        "numbers": null,
+        "formula": "Ord(None) > Ord(Write) > Ord(Read); precedence = (specificity_components_count, access_mode); winner = max_by_key(precedence)",
+        "gwt": {
+          "given": "policy = restricted([(Special::Root, Write), (Special::Root, None)])",
+          "when": "resolve_access_with_cwd(root, cwd)",
+          "then": "FileSystemAccessMode::None (None > Write по conflict precedence); has_full_disk_write_access() = false"
+        }
+      }
+    },
+    {
+      "id": "SRC-0002/rule/file-system-access-mode-derived-capabilities",
+      "src": "SRC-0002",
+      "composition": "rule",
+      "terms": {
+        "condition": "FileSystemAccessMode::can_read() == (mode != None); FileSystemAccessMode::can_write() == (mode == Write). Read даёт только чтение; Write даёт чтение и запись; None запрещает оба.",
+        "numbers": null,
+        "formula": "can_read = !matches!(self, None); can_write = matches!(self, Write)",
+        "gwt": {
+          "given": "modes = [Read, Write, None]",
+          "when": "вызвать can_read() и can_write()",
+          "then": "Read.can_read=true, Read.can_write=false; Write.can_read=true, Write.can_write=true; None.can_read=false, None.can_write=false"
+        }
+      }
+    },
+    {
+      "id": "SRC-0002/rule/network-sandbox-policy-default-restricted",
+      "src": "SRC-0002",
+      "composition": "rule",
+      "terms": {
+        "condition": "NetworkSandboxPolicy по умолчанию = Restricted. is_enabled() возвращает true только при Enabled. Конверсия из legacy: SandboxPolicy с has_full_network_access()=true → Enabled, иначе → Restricted.",
+        "numbers": null,
+        "formula": "default = Restricted; is_enabled = matches!(self, Enabled); from(&SandboxPolicy) = if has_full_network_access() { Enabled } else { Restricted }",
+        "gwt": {
+          "given": "SandboxPolicy::DangerFullAccess (has_full_network_access=true) и SandboxPolicy::ReadOnly{network_access:false} (has_full_network_access=false)",
+          "when": "NetworkSandboxPolicy::from(&SandboxPolicy)",
+          "then": "DangerFullAccess → Enabled (is_enabled=true); ReadOnly{network_access:false} → Restricted (is_enabled=false)"
+        }
+      }
+    },
+    {
+      "id": "SRC-0002/rule/file-system-sandbox-policy-default",
+      "src": "SRC-0002",
+      "composition": "rule",
+      "terms": {
+        "condition": "FileSystemSandboxPolicy::default() = Restricted с одной записью (Special::Root, Read) — по умолчанию агент имеет full disk read и никаких write-прав.",
+        "numbers": null,
+        "formula": "default = { kind: Restricted, entries: [(FileSystemPath::Special{Root}, FileSystemAccessMode::Read)] }",
+        "gwt": {
+          "given": "FileSystemSandboxPolicy::default()",
+          "when": "вызвать has_full_disk_read_access() и has_full_disk_write_access()",
+          "then": "has_full_disk_read_access=true (есть Root-Read и нет deny-записей); has_full_disk_write_access=false"
+        }
+      }
+    },
+    {
+      "id": "SRC-0002/rule/has-full-disk-read-access",
+      "src": "SRC-0002",
+      "composition": "rule",
+      "terms": {
+        "condition": "FileSystemSandboxPolicy имеет full disk read access если: kind ∈ {Unrestricted, ExternalSandbox} ИЛИ (kind=Restricted И есть запись (Special::Root, can_read) И нет ни одной записи с access=None).",
+        "numbers": null,
+        "formula": "has_full_disk_read = match kind { Unrestricted | ExternalSandbox => true, Restricted => has_root_access(can_read) && !has_explicit_deny_entries() }",
+        "gwt": {
+          "given": "policy = restricted([(Special::Root, None), (Path docs, Read)])",
+          "when": "resolve_access_with_cwd(docs)",
+          "then": "FileSystemAccessMode::Read; get_readable_roots_with_cwd возвращает [docs]; get_unreadable_roots_with_cwd пуст (root deny не материализуется); has_full_disk_read_access=false (есть deny-запись)"
+        }
+      }
+    },
+    {
+      "id": "SRC-0002/rule/has-full-disk-write-access",
+      "src": "SRC-0002",
+      "composition": "rule",
+      "terms": {
+        "condition": "FileSystemSandboxPolicy имеет full disk write access если: kind ∈ {Unrestricted, ExternalSandbox} ИЛИ (kind=Restricted И есть запись (Special::Root, can_write) И нет write-narrowing записей). Write-narrowing запись = не-write запись на путь без equally-specific write-перекрытия (для Special::Root deny — всегда narrowing; для Special::Minimal/Unknown — никогда).",
+        "numbers": null,
+        "formula": "has_full_disk_write = match kind { Unrestricted | ExternalSandbox => true, Restricted => has_root_access(can_write) && !has_write_narrowing_entries() }",
+        "gwt": {
+          "given": "policy A = restricted([(Special::Root, Write), (Path docs, Read)]); policy B = restricted([(Special::Root, Write), (Path docs, Read), (Path docs, Write)])",
+          "when": "вызвать has_full_disk_write_access на A и B",
+          "then": "A: has_full_disk_write_access=false (Path docs Read не перекрыт equally-specific Write); B: has_full_disk_write_access=true (shadowed Read перекрыт Write на тот же путь)"
+        }
+      }
+    },
+    {
+      "id": "SRC-0002/rule/include-platform-defaults-criterion",
+      "src": "SRC-0002",
+      "composition": "rule",
+      "terms": {
+        "condition": "include_platform_defaults() = true только если: НЕТ full disk read access И kind=Restricted И есть запись (Special::Minimal, can_read).",
+        "numbers": null,
+        "formula": "include_platform_defaults = !has_full_disk_read_access() && kind==Restricted && entries.any(path==Special::Minimal && access.can_read())",
+        "gwt": {
+          "given": "policy = restricted([(Special::Minimal, Read), (Special::CWD, Write), (Path blocked, None)])",
+          "when": "include_platform_defaults()",
+          "then": "true (нет full disk read access из-за CWD-only allow и blocked deny; есть Special::Minimal Read)"
+        }
+      }
+    },
+    {
+      "id": "SRC-0002/rule/resolve-access-precedence",
+      "src": "SRC-0002",
+      "composition": "rule",
+      "terms": {
+        "condition": "В Restricted-политике эффективный access к пути выбирается по: фильтр записей, у которых резолвленный путь является starts_with-префиксом запрашиваемого пути; max по (число компонент пути, access mode); при отсутствии — None. Unrestricted/ExternalSandbox дают Write всегда.",
+        "numbers": null,
+        "formula": "resolve_access(path, cwd) = entries.filter(path.starts_with(entry.path)).max_by_key((components_count, access)).map(.access).unwrap_or(None)",
+        "gwt": {
+          "given": "policy = restricted([(Special::CWD, Write), (Path docs, Read), (Path docs/private, None), (Path docs/private/public, Write)])",
+          "when": "resolve_access_with_cwd на cwd, docs, docs/private, docs/private/public",
+          "then": "cwd→Write; docs→Read; docs/private→None; docs/private/public→Write (наиболее специфичная запись побеждает)"
+        }
+      }
+    },
+    {
+      "id": "SRC-0002/rule/restricted-implicit-deny",
+      "src": "SRC-0002",
+      "composition": "rule",
+      "terms": {
+        "condition": "В Restricted-политике чтение вне явных allow-корней уже запрещено (resolve_access возвращает None). Поэтому root-уровневая deny-запись (Special::Root, None) НЕ материализуется как unreadable root в get_unreadable_roots_with_cwd — иначе downstream sandbox затёр бы narrower readable carveouts.",
+        "numbers": null,
+        "formula": "get_unreadable_roots_with_cwd: фильтр (entry.access==None) && !can_read_path_with_cwd(entry.path) && entry.path != absolute_root_path_for_cwd(cwd)",
+        "gwt": {
+          "given": "policy = restricted([(Special::Root, None), (Path docs, Read)])",
+          "when": "get_unreadable_roots_with_cwd(cwd)",
+          "then": "пустой Vec — root deny не материализуется (он подразумевается имплицитно), а docs остаётся читаемым через resolve_access"
+        }
+      }
+    },
+    {
+      "id": "SRC-0002/rule/can-read-path-derived",
+      "src": "SRC-0002",
+      "composition": "rule",
+      "terms": {
+        "condition": "can_read_path_with_cwd(path, cwd) = resolve_access_with_cwd(path, cwd).can_read(); can_write_path_with_cwd(path, cwd) = resolve_access_with_cwd(path, cwd).can_write(). Это derived predicates над общим resolve.",
+        "numbers": null,
+        "formula": "can_read_path = resolve_access(path,cwd).can_read(); can_write_path = resolve_access(path,cwd).can_write()",
+        "gwt": {
+          "given": "policy с CWD=Write, docs=Read, docs/private=None",
+          "when": "can_read_path и can_write_path для docs/private",
+          "then": "can_read_path=false, can_write_path=false (resolve_access вернёт None, у None.can_read=false, None.can_write=false)"
+        }
+      }
+    },
+    {
+      "id": "SRC-0002/rule/with-additional-readable-roots-skip-existing",
+      "src": "SRC-0002",
+      "composition": "rule",
+      "terms": {
+        "condition": "with_additional_readable_roots не добавляет дубликаты: если has_full_disk_read_access — возвращает self без изменений; иначе для каждого пути пропускает уже эффективно доступные на чтение (can_read_path_with_cwd=true).",
+        "numbers": null,
+        "formula": "with_additional_readable_roots(self, cwd, paths) = if has_full_disk_read_access {self} else {for p in paths: if !can_read_path_with_cwd(p,cwd) push (Path{p}, Read)}",
+        "gwt": {
+          "given": "policy = restricted([(Special::CWD, Read)]); cwd_root = Path{cwd}",
+          "when": "with_additional_readable_roots(cwd, [cwd_root])",
+          "then": "policy не меняется (cwd уже доступен на чтение через Special::CWD)"
+        }
+      }
+    },
+    {
+      "id": "SRC-0002/rule/with-additional-writable-roots-skip-existing",
+      "src": "SRC-0002",
+      "composition": "rule",
+      "terms": {
+        "condition": "with_additional_writable_roots не добавляет дубликаты: для каждого пути пропускает уже эффективно доступные на запись (can_write_path_with_cwd=true). Новые пути добавляются как (Path{path}, Write).",
+        "numbers": null,
+        "formula": "with_additional_writable_roots(self, cwd, paths) = for p in paths: if !can_write_path_with_cwd(p,cwd) push (Path{p}, Write)",
+        "gwt": {
+          "given": "policy = restricted([(Special::CWD, Write)]); extra = AbsolutePathBuf(temp/extra) вне cwd",
+          "when": "with_additional_writable_roots(cwd, [extra])",
+          "then": "entries = [(Special::CWD, Write), (Path{extra}, Write)]"
+        }
+      }
+    },
+    {
+      "id": "SRC-0002/rule/legacy-projection-strips-redundant-readable-under-writable",
+      "src": "SRC-0002",
+      "composition": "rule",
+      "terms": {
+        "condition": "При from_legacy_sandbox_policy для WorkspaceWrite: Path-Read записи, чей путь уже покрыт каким-либо writable_root (is_path_writable), удаляются — они были redundant в legacy и не должны становиться read-only carveouts.",
+        "numbers": null,
+        "formula": "for entry in entries: keep if access != Read || (path is Special) || !legacy_writable_roots.any(root.is_path_writable(path))",
+        "gwt": {
+          "given": "WorkspaceWrite{writable_roots: [/repo], read_only_access: Restricted{readable_roots: [/repo/docs], include_platform_defaults: false}}",
+          "when": "FileSystemSandboxPolicy::from_legacy_sandbox_policy(policy, /tmp)",
+          "then": "Path-Read запись /repo/docs удаляется (уже покрыта /repo writable); остаётся writable /repo + дефолтные защиты .git/.codex/.agents"
+        }
+      }
+    },
+    {
+      "id": "SRC-0002/rule/legacy-projection-protects-cwd-dot-codex-eagerly",
+      "src": "SRC-0002",
+      "composition": "rule",
+      "terms": {
+        "condition": "При from_legacy_sandbox_policy для WorkspaceWrite cwd-корень получает защитные read-only carveouts с protect_missing_dot_codex=TRUE (.codex защищается даже до создания, чтобы первое создание прошло через protected-path approval flow). Каждый writable_root получает carveouts с protect_missing_dot_codex=FALSE (.codex защищается только если уже существует).",
+        "numbers": null,
+        "formula": "default_read_only_subpaths_for_writable_root(cwd_root, true); default_read_only_subpaths_for_writable_root(writable_root, false) для каждого writable_root",
+        "gwt": {
+          "given": "WorkspaceWrite{writable_roots:[], readable: Restricted{include_platform_defaults:false, readable_roots:[]}, exclude_tmpdir_env_var:true, exclude_slash_tmp:true}; cwd = TempDir без .codex",
+          "when": "from_legacy_sandbox_policy(policy, cwd) и затем can_write_path_with_cwd(.codex/config.toml, cwd)",
+          "then": "false — .codex защищён даже без существующего каталога; legacy_workspace_write_projection_blocks_missing_dot_codex_writes"
+        }
+      }
+    },
+    {
+      "id": "SRC-0002/rule/legacy-projection-supports-relative-cwd",
+      "src": "SRC-0002",
+      "composition": "rule",
+      "terms": {
+        "condition": "from_legacy_sandbox_policy принимает относительный cwd: AbsolutePathBuf резолвится через current_dir().join(relative_cwd) и .codex carveout материализуется по абсолютному пути; can_write_path_with_cwd для .codex/config.toml с тем же относительным cwd возвращает false.",
+        "numbers": null,
+        "formula": "cwd_absolute = AbsolutePathBuf::from_absolute_path(current_dir().join(relative_cwd))",
+        "gwt": {
+          "given": "WorkspaceWrite (пустые writable_roots/readable, exclude tmpdir/slash_tmp); relative_cwd = Path::new(\"workspace\")",
+          "when": "from_legacy_sandbox_policy(policy, relative_cwd)",
+          "then": "policy = restricted([(Special::CWD, Write), (Path current_dir/workspace/.codex, Read)]); can_write_path_with_cwd(\".codex/config.toml\", relative_cwd) = false"
+        }
+      }
+    },
+    {
+      "id": "SRC-0002/rule/to-legacy-rejects-writes-outside-workspace-root",
+      "src": "SRC-0002",
+      "composition": "rule",
+      "terms": {
+        "condition": "to_legacy_sandbox_policy возвращает io::Error InvalidInput, если запрошен write вне workspace_root (workspace_root_writable=false и есть writable_roots/tmpdir_writable/slash_tmp_writable). Сообщение: \"permissions profile requests filesystem writes outside the workspace root, which is not supported until the runtime enforces FileSystemSandboxPolicy directly\".",
+        "numbers": null,
+        "formula": "if !workspace_root_writable && (!writable_roots.is_empty() || tmpdir_writable || slash_tmp_writable) → Err(InvalidInput, message)",
+        "gwt": {
+          "given": "FileSystemSandboxPolicy::restricted с записями [(Path /external, Write)] (без CWD-Write и без Special::Root-Write)",
+          "when": "to_legacy_sandbox_policy(NetworkSandboxPolicy::Restricted, cwd)",
+          "then": "Err(io::Error InvalidInput, \"permissions profile requests filesystem writes outside the workspace root, which is not supported until the runtime enforces FileSystemSandboxPolicy directly\")"
+        }
+      }
+    },
+    {
+      "id": "SRC-0002/rule/to-legacy-full-disk-write-collapses",
+      "src": "SRC-0002",
+      "composition": "rule",
+      "terms": {
+        "condition": "Если has_full_disk_write_access после агрегации записей: при network Enabled → DangerFullAccess; при network Restricted → ExternalSandbox{network_access: Restricted}.",
+        "numbers": null,
+        "formula": "if has_full_disk_write_access { if network.is_enabled() { DangerFullAccess } else { ExternalSandbox{network_access: Restricted} } }",
+        "gwt": {
+          "given": "policy = restricted([(Special::Root, Write)]); network = Enabled",
+          "when": "to_legacy_sandbox_policy(network, cwd)",
+          "then": "Ok(SandboxPolicy::DangerFullAccess)"
+        }
+      }
+    },
+    {
+      "id": "SRC-0002/rule/to-legacy-unknown-special-path-ignored",
+      "src": "SRC-0002",
+      "composition": "rule",
+      "terms": {
+        "condition": "FileSystemSpecialPath::Unknown {path, subpath} в entries игнорируется при to_legacy_sandbox_policy (forward compatibility — старые рантаймы должны warn-and-ignore вместо отказа загрузить config от более нового Codex). Codex 0.112.0 нарушал это — отказывал на неизвестных значениях.",
+        "numbers": null,
+        "formula": "match value { ... FileSystemSpecialPath::Unknown { .. } => {} }",
+        "gwt": {
+          "given": "policy = restricted([(Special::Unknown{path: \":future_special_path\", subpath: None}, Write)])",
+          "when": "to_legacy_sandbox_policy(NetworkSandboxPolicy::Restricted, /tmp/workspace)",
+          "then": "Ok(SandboxPolicy::ReadOnly{access: Restricted{include_platform_defaults: false, readable_roots: []}, network_access: false}) — Unknown проигнорирован"
+        }
+      }
+    },
+    {
+      "id": "SRC-0002/rule/needs-direct-runtime-enforcement-criterion",
+      "src": "SRC-0002",
+      "composition": "rule",
+      "terms": {
+        "condition": "needs_direct_runtime_enforcement = true если: kind=Restricted И (to_legacy_sandbox_policy провалился ИЛИ semantic_signature(self) != semantic_signature(from_legacy_sandbox_policy(legacy))). Не-Restricted → false. Сравнение по signature {has_full_disk_read, has_full_disk_write, include_platform_defaults, readable_roots, writable_roots, unreadable_roots}.",
+        "numbers": null,
+        "formula": "needs_direct = match kind { !Restricted => false, _ => to_legacy_sandbox_policy().is_err() || semantic_signature(self) != semantic_signature(from_legacy(to_legacy())) }",
+        "gwt": {
+          "given": "policy A = restricted([(Special::CWD, Write), (Path docs, Read)]); policy B = from_legacy(WorkspaceWrite default)",
+          "when": "needs_direct_runtime_enforcement на A и B",
+          "then": "A: true (split-only nested carveout — signature не совпадает после roundtrip); B: false (legacy roundtrip сохраняет семантику)"
+        }
+      }
+    },
+    {
+      "id": "SRC-0002/rule/default-readonly-subpaths-set",
+      "src": "SRC-0002",
+      "composition": "rule",
+      "terms": {
+        "condition": "default_read_only_subpaths_for_writable_root возвращает carveouts: .git (если dir или file), gitdir-from-pointer (если .git — git pointer file и resolve_gitdir вернул Some), .agents (если dir), .codex (если protect_missing_dot_codex=true ИЛИ каталог уже существует). Поддерживает типичные repo, worktrees/submodules (.git как pointer), bare repos.",
+        "numbers": null,
+        "formula": "subpaths = []; if .git is_dir||is_file { if is_file && is_git_pointer_file && Some(gitdir)=resolve_gitdir_from_file → push gitdir; push .git }; if .agents is_dir → push; if protect_missing_dot_codex || .codex is_dir → push .codex; dedup без normalize",
+        "gwt": {
+          "given": "writable_root = TempDir с .codex как dir; protect_missing_dot_codex=true",
+          "when": "default_read_only_subpaths_for_writable_root(root, true)",
+          "then": "содержит .codex (writable_roots_proactively_protect_missing_dot_codex)"
+        }
+      }
+    },
+    {
+      "id": "SRC-0002/rule/explicit-rule-wins-over-default-codex-carveout",
+      "src": "SRC-0002",
+      "composition": "rule",
+      "terms": {
+        "condition": "Если для пути уже есть explicit resolved entry (например, явно прописано (Path{.codex}, Write)) — default read-only carveout для этого пути НЕ применяется. has_explicit_resolved_path_entry проверяет точное совпадение пути.",
+        "numbers": null,
+        "formula": "filter default_read_only_subpaths through has_explicit_resolved_path_entry(resolved_entries, path)",
+        "gwt": {
+          "given": "policy = restricted([(Special::CWD, Write), (Path{cwd/.codex}, Write)])",
+          "when": "get_writable_roots_with_cwd(cwd)",
+          "then": ".codex НЕ добавляется в read_only_subpaths workspace root (explicit Write override побеждает над default carveout); can_write_path_with_cwd(.codex/config.toml, cwd) = true"
+        }
+      }
+    },
+    {
+      "id": "SRC-0002/rule/preserve-symlinked-protected-subpaths",
+      "src": "SRC-0002",
+      "composition": "rule",
+      "terms": {
+        "condition": "В get_writable_roots_with_cwd литеральные in-root symlinked carveouts сохраняются для downstream sandbox masking: для symlinked .codex/.git и явных deny-записей под root — preserved literal path, чтобы bwrap маскировал inode симлинка, а не только резолвленную цель. Случаи: symlink на decoy под root, symlink наружу root, symlink на сам root.",
+        "numbers": null,
+        "formula": "if preserve_raw_carveout_paths = (root has parent) && (entry.path starts_with root || decoy under raw_writable_root) → keep raw_carveout_path; else if effective_path starts_with root → keep effective_path; else skip",
+        "gwt": {
+          "given": "<root>/.codex -> <root>/decoy-codex (symlink); policy = restricted([(Path{root}, Write)])",
+          "when": "get_writable_roots_with_cwd(cwd)",
+          "then": "writable_roots[0].read_only_subpaths = [<canonical_root>/.codex] (литеральный .codex сохранён, decoy НЕ добавлен — writable_roots_preserve_symlinked_protected_subpaths)"
+        }
+      }
+    },
+    {
+      "id": "SRC-0002/rule/has-write-narrowing-special-rules",
+      "src": "SRC-0002",
+      "composition": "rule",
+      "terms": {
+        "condition": "has_write_narrowing_entries специально обрабатывает Special-paths: (Special::Root, None) — narrowing всегда; Special::Minimal или Special::Unknown — никогда не narrowing; для Path и прочих Special — narrowing только если нет equally-specific write override. has_same_target_write_override проверяет перекрытие через file_system_paths_share_target и access > entry.access.",
+        "numbers": null,
+        "formula": "for entry: skip if can_write; for Path → !has_same_target_write_override(entry); for Special::Root → (access == None); for Special::Minimal | Unknown → false; for прочих Special → !has_same_target_write_override(entry)",
+        "gwt": {
+          "given": "policy = restricted([(Special::Unknown{:future_path}, Write)])",
+          "when": "has_write_narrowing_entries и to_legacy_sandbox_policy",
+          "then": "has_write_narrowing_entries=false (Unknown не narrowing); to_legacy игнорирует Unknown → ReadOnly{readable_roots:[], include_platform_defaults:false} (нет CWD-Write и нет Path-Write)"
+        }
+      }
+    },
+    {
+      "id": "SRC-0002/rule/special-paths-share-target-rules",
+      "src": "SRC-0002",
+      "composition": "rule",
+      "terms": {
+        "condition": "special_paths_share_target = true для: одинаковых tokens (Root/Root, Minimal/Minimal, CWD/CWD, Tmpdir/Tmpdir, SlashTmp/SlashTmp); CWD ↔ ProjectRoots{subpath: None} (одна и та же цель); ProjectRoots с одинаковым subpath; Unknown с одинаковыми (path, subpath); иначе false. Это узкое сравнение для проверки equally-specific shadowing.",
+        "numbers": null,
+        "formula": "match (left, right) { (Root,Root) | (Minimal,Minimal) | (CWD,CWD) | (Tmpdir,Tmpdir) | (SlashTmp,SlashTmp) => true; (CWD, ProjectRoots{None}) | (ProjectRoots{None}, CWD) => true; (ProjectRoots{l}, ProjectRoots{r}) => l==r; (Unknown{lp,ls}, Unknown{rp,rs}) => lp==rp && ls==rs; _ => false }",
+        "gwt": {
+          "given": "Special::CurrentWorkingDirectory и Special::ProjectRoots{subpath: None}",
+          "when": "special_paths_share_target",
+          "then": "true (CWD ↔ ProjectRoots без subpath = одна цель)"
+        }
+      }
+    },
+    {
+      "id": "SRC-0002/rule/special-path-cwd-independent-folding",
+      "src": "SRC-0002",
+      "composition": "rule",
+      "terms": {
+        "condition": "special_path_matches_absolute_path сворачивает Special-path в абсолютный Path только для cwd-независимых случаев: Special::Root ↔ путь без parent (корень FS); Special::SlashTmp ↔ /tmp; для всех остальных (Minimal, CWD, ProjectRoots, Tmpdir, Unknown) → false.",
+        "numbers": null,
+        "formula": "match value { Root => path.parent().is_none(); SlashTmp => path == \"/tmp\"; _ => false }",
+        "gwt": {
+          "given": "value = Special::SlashTmp; path = AbsolutePathBuf(\"/tmp\")",
+          "when": "special_path_matches_absolute_path(value, path)",
+          "then": "true (SlashTmp матчит /tmp без cwd)"
+        }
+      }
+    },
+    {
+      "id": "SRC-0002/rule/resolve-special-path-tmpdir-from-env",
+      "src": "SRC-0002",
+      "composition": "rule",
+      "terms": {
+        "condition": "resolve_file_system_special_path для Tmpdir читает env var TMPDIR через std::env::var_os; пустое значение → None; иначе AbsolutePathBuf::from_absolute_path(PathBuf::from(tmpdir)). Для SlashTmp: возвращает /tmp только если is_dir=true. Root/Minimal/Unknown → None (cwd-независимы и не имеют конкретного резолва). CWD/ProjectRoots требуют переданный cwd.",
+        "numbers": null,
+        "formula": "Tmpdir → env_var(\"TMPDIR\").filter(!empty).and_then(AbsolutePathBuf::from_absolute_path); SlashTmp → if /tmp.is_dir() Some(\"/tmp\") else None; Root | Minimal | Unknown → None; CWD → cwd?.clone(); ProjectRoots{subpath} → if subpath: AbsolutePathBuf::resolve_path_against_base(subpath, cwd) else cwd?.clone()",
+        "gwt": {
+          "given": "TMPDIR не задан или пустой",
+          "when": "resolve_file_system_special_path(Tmpdir, cwd)",
+          "then": "None"
+        }
+      }
+    },
+    {
+      "id": "SRC-0002/rule/resolve-entry-path-root-from-cwd",
+      "src": "SRC-0002",
+      "composition": "rule",
+      "terms": {
+        "condition": "resolve_entry_path для Special::Root возвращает absolute_root_path_for_cwd(cwd) — корень файловой системы относительно cwd. absolute_root_path_for_cwd(cwd) = cwd.ancestors().last() (panic если у cwd нет filesystem root, если результат не абсолютный).",
+        "numbers": null,
+        "formula": "resolve_entry_path: match path { Special{Root} => cwd.map(absolute_root_path_for_cwd); _ => resolve_file_system_path(path, cwd) }; absolute_root_path_for_cwd(cwd) = AbsolutePathBuf::from_absolute_path(cwd.ancestors().last())",
+        "gwt": {
+          "given": "Special::Root + cwd = /tmp/workspace",
+          "when": "resolve_entry_path(Special::Root, Some(/tmp/workspace))",
+          "then": "Some(AbsolutePathBuf(\"/\"))"
+        }
+      }
+    },
+    {
+      "id": "SRC-0002/rule/dedup-absolute-paths-modes",
+      "src": "SRC-0002",
+      "composition": "rule",
+      "terms": {
+        "condition": "dedup_absolute_paths имеет два режима: normalize_effective_paths=true — пути нормализуются через canonicalize_preserving_symlinks по самому глубокому существующему ancestor + suffix перед сравнением (свёртка root-aliases /var → /private/var); normalize_effective_paths=false — литеральные пути сохраняются (для downstream symlink masking). Дедупликация через HashSet на pathbuf после потенциальной нормализации.",
+        "numbers": null,
+        "formula": "for path in paths: dedup_path = if normalize { normalize_effective_absolute_path(path) } else { path }; if seen.insert(pathbuf) { push }",
+        "gwt": {
+          "given": "paths с дубликатами после нормализации (например /var/x и /private/var/x резолвятся в одно)",
+          "when": "dedup_absolute_paths(paths, true)",
+          "then": "оставляется только первый эффективно уникальный путь"
+        }
+      }
+    },
+    {
+      "id": "SRC-0002/rule/normalize-falls-back-to-input",
+      "src": "SRC-0002",
+      "composition": "rule",
+      "terms": {
+        "condition": "normalize_effective_absolute_path итерирует по ancestors path; пропускает ancestor без symlink_metadata; пропускает ancestor, для которого canonicalize_preserving_symlinks провалился; пропускает если strip_prefix провалился; возвращает AbsolutePathBuf{normalized_ancestor.join(suffix)} как только удалось. Если ни один ancestor не сработал — вернуть исходный path без изменений.",
+        "numbers": null,
+        "formula": "for ancestor in path.ancestors(): if symlink_metadata(ancestor).is_err() continue; if canonicalize_preserving_symlinks(ancestor).is_err() continue; let suffix=path.strip_prefix(ancestor)?; return AbsolutePathBuf::from_absolute_path(normalized.join(suffix)); fallback: return path",
+        "gwt": null
+      }
+    },
+    {
+      "id": "SRC-0002/rule/git-pointer-file-detection",
+      "src": "SRC-0002",
+      "composition": "rule",
+      "terms": {
+        "condition": "is_git_pointer_file = true только если: path является файлом (is_file) И его file_name == \".git\". Это применяется для распознавания worktrees, submodules и других случаев, где .git — файл-указатель на реальный gitdir.",
+        "numbers": null,
+        "formula": "is_git_pointer_file(path) = path.is_file() && path.file_name() == Some(OsStr::new(\".git\"))",
+        "gwt": null
+      }
+    },
+    {
+      "id": "SRC-0002/rule/resolve-gitdir-from-pointer-error-cases",
+      "src": "SRC-0002",
+      "composition": "rule",
+      "terms": {
+        "condition": "resolve_gitdir_from_file возвращает Some(path) только если: чтение файла успешно; содержимое после trim содержит ':'; gitdir-часть после ':' не пустая после trim; у .git есть parent; резолвленный путь существует на диске. На любой проблеме — tracing::error и возврат None.",
+        "numbers": null,
+        "formula": "read_to_string(.git)?.trim().split_once(':')?.1.trim() != \"\"; .git.parent()?; gitdir_path = AbsolutePathBuf::resolve_path_against_base(gitdir_raw, base); if !gitdir_path.exists() return None",
+        "gwt": null
+      }
+    },
+    {
+      "id": "SRC-0002/rule/exec-policy-amendment-prefix-rule-semantics",
+      "src": "SRC-0002",
+      "composition": "rule",
+      "terms": {
+        "condition": "ExecPolicyAmendment.command содержит токены префикса; при принятии становится execpolicy prefix_rule(..., decision=\"allow\"), позволяя агенту запускать команды, начинающиеся с этого token sequence, без аппрува. Сериализация: serde transparent (как Array<string> в TS).",
+        "numbers": null,
+        "formula": "execpolicy: prefix_rule(command_tokens, decision=\"allow\")",
+        "gwt": null
+      }
+    },
+    {
+      "id": "SRC-0002/rule/network-approval-protocol-https-aliases",
+      "src": "SRC-0002",
+      "composition": "rule",
+      "terms": {
+        "condition": "NetworkApprovalProtocol::Https в wire-формате принимает (через serde alias) дополнительно токены \"https_connect\" и \"http-connect\" — для совместимости с разными источниками данных. Стандартное представление: snake_case (\"https\").",
+        "numbers": null,
+        "formula": "deserialize Https from any of: \"https\", \"https_connect\", \"http-connect\"",
+        "gwt": null
+      }
+    },
+    {
+      "id": "SRC-0002/rule/effective-approval-id-fallback",
+      "src": "SRC-0002",
+      "composition": "rule",
+      "terms": {
+        "condition": "effective_approval_id() = approval_id.clone().unwrap_or_else(|| call_id.clone()) — при отсутствии approval_id используется call_id (аппрув для command item, не subcommand). approval_id присутствует только для subcommand-аппрувов через execve intercept.",
+        "numbers": null,
+        "formula": "effective_approval_id = approval_id ?? call_id",
+        "gwt": {
+          "given": "ExecApprovalRequestEvent { call_id: \"cmd-1\", approval_id: None }",
+          "when": "effective_approval_id()",
+          "then": "\"cmd-1\""
+        }
+      }
+    },
+    {
+      "id": "SRC-0002/rule/effective-available-decisions-legacy-fallback",
+      "src": "SRC-0002",
+      "composition": "rule",
+      "terms": {
+        "condition": "effective_available_decisions: при наличии available_decisions вернуть его клон; при отсутствии — fallback на default_available_decisions(network_approval_context, proposed_execpolicy_amendment, proposed_network_policy_amendments, additional_permissions). available_decisions — новое поле, может не быть заполнено старыми отправителями.",
+        "numbers": null,
+        "formula": "effective_available_decisions = match available_decisions { Some(d) => d.clone(), None => Self::default_available_decisions(...) }",
+        "gwt": null
+      }
+    },
+    {
+      "id": "SRC-0002/rule/default-available-decisions-network-branch",
+      "src": "SRC-0002",
+      "composition": "rule",
+      "terms": {
+        "condition": "При network_approval_context.is_some() default_available_decisions возвращает [Approved, ApprovedForSession, (NetworkPolicyAmendment{amendment.clone()} если есть amendment с action==Allow), Abort]. Network-ветка имеет приоритет: ветки additional_permissions и proposed_execpolicy_amendment не выполняются (early return).",
+        "numbers": null,
+        "formula": "if network_approval_context.is_some() { decisions=[Approved, ApprovedForSession]; if let Some(amend) = net_amends.find(action==Allow) { push NetworkPolicyAmendment{amend.clone()} }; push Abort; return decisions }",
+        "gwt": {
+          "given": "network_approval_context = Some(ctx); proposed_network_policy_amendments = Some([{host:\"x.com\", action:Allow}])",
+          "when": "default_available_decisions(...)",
+          "then": "[Approved, ApprovedForSession, NetworkPolicyAmendment{host:\"x.com\", action:Allow}, Abort]"
+        }
+      }
+    },
+    {
+      "id": "SRC-0002/rule/default-available-decisions-additional-permissions-branch",
+      "src": "SRC-0002",
+      "composition": "rule",
+      "terms": {
+        "condition": "Если network_approval_context отсутствует и additional_permissions.is_some() → default_available_decisions возвращает [Approved, Abort]. Безусловный набор без NetworkPolicyAmendment/ApprovedExecpolicyAmendment.",
+        "numbers": null,
+        "formula": "if additional_permissions.is_some() { return [Approved, Abort] }",
+        "gwt": {
+          "given": "network_approval_context=None; additional_permissions=Some(profile)",
+          "when": "default_available_decisions(...)",
+          "then": "[Approved, Abort]"
+        }
+      }
+    },
+    {
+      "id": "SRC-0002/rule/default-available-decisions-default-branch",
+      "src": "SRC-0002",
+      "composition": "rule",
+      "terms": {
+        "condition": "По умолчанию (нет network_approval_context, нет additional_permissions): decisions = [Approved] + (ApprovedExecpolicyAmendment{prefix.clone()} если proposed_execpolicy_amendment Some) + [Abort].",
+        "numbers": null,
+        "formula": "decisions=[Approved]; if let Some(prefix)=proposed_execpolicy_amendment { push ApprovedExecpolicyAmendment{prefix.clone()} }; push Abort",
+        "gwt": {
+          "given": "network_approval_context=None; additional_permissions=None; proposed_execpolicy_amendment=Some(amend)",
+          "when": "default_available_decisions(...)",
+          "then": "[Approved, ApprovedExecpolicyAmendment{amend.clone()}, Abort]"
+        }
+      }
+    },
+    {
+      "id": "SRC-0002/rule/guardian-event-omits-fields-while-in-progress",
+      "src": "SRC-0002",
+      "composition": "rule",
+      "terms": {
+        "condition": "В GuardianAssessmentEvent поля risk_level, user_authorization, rationale, decision_source — Optional; omitted (skip_serializing_if Option::is_none) пока assessment в InProgress. Coarse risk label и rationale выставляются только по завершении. turn_id/target_item_id используют serde(default) для обратной совместимости.",
+        "numbers": null,
+        "formula": "while status == InProgress: risk_level=None, rationale=None, decision_source=None (выставляются по завершении)",
+        "gwt": null
+      }
+    },
+    {
+      "id": "SRC-0002/rule/is-ask-from-decider-conjunction",
+      "src": "SRC-0002",
+      "composition": "rule",
+      "terms": {
+        "condition": "NetworkPolicyDecisionPayload::is_ask_from_decider() = true только если ОБА условия выполнены одновременно: decision == NetworkPolicyDecision::Ask И source == NetworkDecisionSource::Decider.",
+        "numbers": null,
+        "formula": "is_ask_from_decider = (decision == Ask) && (source == Decider)",
+        "gwt": {
+          "given": "payload = { decision: Ask, source: Decider, ... }",
+          "when": "is_ask_from_decider()",
+          "then": "true"
+        }
+      }
+    },
+    {
+      "id": "SRC-0002/rule/serde-tag-conventions",
+      "src": "SRC-0002",
+      "composition": "rule",
+      "terms": {
+        "condition": "Wire-форматы перечислений в SRC-0002: snake_case по умолчанию (NetworkApprovalProtocol, NetworkPolicyRuleAction, GuardianAssessmentStatus, GuardianAssessmentDecisionSource, GuardianCommandSource, GuardianAssessmentAction.type, FileSystemSpecialPath.kind, FileSystemPath.type, ElicitationRequest.mode); lowercase (GuardianRiskLevel, GuardianUserAuthorization, ElicitationAction); kebab-case (NetworkSandboxPolicy, FileSystemSandboxKind, FileSystemAccessMode); camelCase (NetworkPolicyDecisionPayload). Сложные enum — serde(tag = \"<field>\").",
+        "numbers": null,
+        "formula": "rename_all = snake_case | lowercase | kebab-case | camelCase; tagged unions: serde(tag=\"type\"|\"mode\"|\"kind\")",
+        "gwt": null
+      }
+    }
+  ]
+}

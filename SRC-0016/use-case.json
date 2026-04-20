@@ -1,0 +1,750 @@
+{
+  "src": "SRC-0016",
+  "schema_version": "2.0",
+  "lens": "use_case",
+  "compositions": [
+    {
+      "id": "SRC-0016/uc.sub/apply-patch-to-files",
+      "src": "SRC-0016",
+      "composition": "use_case",
+      "level": "sub",
+      "strategic_domain": null,
+      "terms": {
+        "actor": "ApplyPatchHandler",
+        "goal": "Применить patch к файлам с учётом песочницы файловой системы",
+        "steps": [
+          "1. ApplyPatchHandler извлекает patch_input из ToolPayload::Function (ApplyPatchToolArgs.input) или ToolPayload::Custom.input",
+          "2. ApplyPatchHandler получает ExecutorFileSystem из turn.environment и строит file_system_sandbox_context для remote",
+          "3. ApplyPatchHandler вызывает codex_apply_patch::maybe_parse_apply_patch_verified(command, cwd, fs, sandbox) для проверки patch",
+          "4. ApplyPatchHandler вычисляет file_paths_for_action(action) — собирает цели + move_path для Update",
+          "5. ApplyPatchHandler собирает effective_additional_permissions (merge session + turn grants, intersect для preapproved)",
+          "6. ApplyPatchHandler вычисляет write_permissions_for_paths через effective_file_system_sandbox_policy (только пути, недоступные для записи)",
+          "7. ApplyPatchHandler вызывает apply_patch::apply_patch(turn, file_system_sandbox_policy, changes) →triggers SRC-0016/uc.sub/execute-patch-changes",
+          "8. При InternalApplyPatchInvocation::Output — ApplyPatchHandler возвращает ApplyPatchToolOutput::from_text(content)",
+          "9. При InternalApplyPatchInvocation::DelegateToRuntime — ApplyPatchHandler эмитит ToolEmitter::apply_patch.begin, запускает ToolOrchestrator.run(ApplyPatchRuntime, ApplyPatchRequest), затем ToolEmitter.finish и возвращает текст"
+        ],
+        "extensions (Cockburn)": [
+          {"step": 1, "condition": "payload не Function и не Custom", "action": "RespondToModel: 'apply_patch handler received unsupported payload'"},
+          {"step": 2, "condition": "turn.environment отсутствует", "action": "RespondToModel: 'apply_patch is unavailable in this session'"},
+          {"step": 3, "condition": "MaybeApplyPatchVerified::CorrectnessError(parse_error)", "action": "RespondToModel: 'apply_patch verification failed: {parse_error}'"},
+          {"step": 3, "condition": "MaybeApplyPatchVerified::ShellParseError", "action": "trace log + RespondToModel: 'apply_patch handler received invalid patch input'"},
+          {"step": 3, "condition": "MaybeApplyPatchVerified::NotApplyPatch", "action": "RespondToModel: 'apply_patch handler received non-apply_patch input'"}
+        ],
+        "edge_cases": [
+          {"condition": "write_permissions_for_paths: ни один путь не требует дополнительных прав", "action": "возвращается None — apply_patch выполняется на дефолтных правах"},
+          {"condition": "normalize_additional_permissions не смог нормализовать пути", "action": "возвращается None (ok()? glosses error)"}
+        ],
+        "lifecycle": null,
+        "ux": null,
+        "result": "Файлы изменены согласно patch; вызывающему возвращён текстовый результат с описанием изменений и флагом auto_approved"
+      }
+    },
+    {
+      "id": "SRC-0016/uc.sub/intercept-apply-patch-from-exec",
+      "src": "SRC-0016",
+      "composition": "use_case",
+      "level": "sub",
+      "strategic_domain": null,
+      "terms": {
+        "actor": "intercept_apply_patch (ShellHandler/UnifiedExecHandler gateway)",
+        "goal": "Перехватить apply_patch, вызванный через shell/exec_command, и делегировать его в apply_patch pipeline",
+        "steps": [
+          "1. intercept_apply_patch получает command, cwd, fs и, для remote-среды, file_system_sandbox_context",
+          "2. intercept_apply_patch вызывает codex_apply_patch::maybe_parse_apply_patch_verified",
+          "3. При MaybeApplyPatchVerified::Body(changes) — intercept_apply_patch записывает session.record_model_warning: 'apply_patch was requested via {tool_name}. Use the apply_patch tool instead of exec_command.'",
+          "4. intercept_apply_patch вычисляет effective_patch_permissions",
+          "5. intercept_apply_patch вызывает apply_patch::apply_patch →triggers SRC-0016/uc.sub/execute-patch-changes",
+          "6. При Output — возвращает FunctionToolOutput::from_text(content, Some(true))",
+          "7. При DelegateToRuntime — эмитит ToolEmitter::apply_patch и запускает ToolOrchestrator.run(ApplyPatchRuntime)",
+          "8. При ShellParseError или NotApplyPatch — возвращает Ok(None), позволяя shell-flow продолжиться"
+        ],
+        "extensions (Cockburn)": [
+          {"step": 2, "condition": "MaybeApplyPatchVerified::CorrectnessError(parse_error)", "action": "Err: RespondToModel 'apply_patch verification failed: {parse_error}'"},
+          {"step": 2, "condition": "MaybeApplyPatchVerified::ShellParseError", "action": "trace log + Ok(None) — shell-flow продолжается"},
+          {"step": 2, "condition": "MaybeApplyPatchVerified::NotApplyPatch", "action": "Ok(None) — shell-flow продолжается"}
+        ],
+        "edge_cases": [],
+        "lifecycle": null,
+        "ux": null,
+        "result": "Если команда — apply_patch: она выполнена через apply_patch pipeline и пользователю выдано предупреждение о правильном инструменте. Иначе shell-flow продолжается штатно."
+      }
+    },
+    {
+      "id": "SRC-0016/uc.sub/handle-dynamic-tool-call",
+      "src": "SRC-0016",
+      "composition": "use_case",
+      "level": "sub",
+      "strategic_domain": null,
+      "terms": {
+        "actor": "DynamicToolHandler",
+        "goal": "Делегировать выполнение инструмента клиенту и дождаться ответа",
+        "steps": [
+          "1. DynamicToolHandler извлекает arguments из ToolPayload::Function и парсит в serde_json::Value",
+          "2. DynamicToolHandler вызывает request_dynamic_tool(session, turn, call_id, tool_name, arguments)",
+          "3. request_dynamic_tool регистрирует pending entry с oneshot::Sender в active_turn.turn_state (insert_pending_dynamic_tool)",
+          "4. request_dynamic_tool отправляет EventMsg::DynamicToolCallRequest клиенту",
+          "5. request_dynamic_tool ждёт ответ по rx_response (oneshot channel)",
+          "6. request_dynamic_tool отправляет EventMsg::DynamicToolCallResponse с content_items, success, duration (или error='cancelled before response')",
+          "7. DynamicToolHandler мапит content_items в FunctionCallOutputContentItem и возвращает FunctionToolOutput::from_content"
+        ],
+        "extensions (Cockburn)": [
+          {"step": 1, "condition": "payload не Function", "action": "RespondToModel: 'dynamic tool handler received unsupported payload'"},
+          {"step": 3, "condition": "уже есть pending entry для того же call_id", "action": "warn!: 'Overwriting existing pending dynamic tool call for call_id: {event_id}' — старый Sender перезаписывается"},
+          {"step": 3, "condition": "active_turn отсутствует", "action": "prev_entry = None (pending не регистрируется)"},
+          {"step": 5, "condition": "ответ не получен (channel closed/cancelled)", "action": "RespondToModel: 'dynamic tool call was cancelled before receiving a response' + отправка response event с error и success=false"}
+        ],
+        "edge_cases": [
+          {"condition": "duration = Instant::elapsed с момента регистрации pending", "action": "включается в DynamicToolCallResponseEvent для наблюдаемости"}
+        ],
+        "lifecycle": {
+          "entity": "SRC-0016/entity/dynamic-tool-call",
+          "states": ["pending (в turn_state)", "completed (response received)", "cancelled (channel closed)"],
+          "transition": {
+            "from": "pending",
+            "to": "completed | cancelled",
+            "guard": "rx_response.await — Some(response) vs None",
+            "side_effect": "отправка DynamicToolCallResponse event"
+          }
+        },
+        "ux": null,
+        "result": "Клиент получил DynamicToolCallRequest, вернул DynamicToolResponse, обе стороны получили события, модель получила content_items с флагом success"
+      }
+    },
+    {
+      "id": "SRC-0016/uc.sub/execute-js-repl",
+      "src": "SRC-0016",
+      "composition": "use_case",
+      "level": "sub",
+      "strategic_domain": null,
+      "terms": {
+        "actor": "JsReplHandler",
+        "goal": "Выполнить JavaScript-код в kernel REPL и вернуть результат с событиями начала/конца",
+        "steps": [
+          "1. JsReplHandler проверяет, что Feature::JsRepl включён в session.features()",
+          "2. JsReplHandler получает JsReplArgs: для Function — parse_arguments(JSON), для Custom — parse_freeform_args (pragma '// codex-js-repl: timeout_ms=N' + JS)",
+          "3. JsReplHandler получает manager через turn.js_repl.manager().await",
+          "4. JsReplHandler эмитит ToolEventStage::Begin через ToolEmitter::shell(['js_repl'], cwd, ExecCommandSource::Agent, freeform=false)",
+          "5. JsReplHandler вызывает manager.execute(session, turn, tracker, args) — замеряет Instant::now до/после",
+          "6. JsReplHandler собирает items: content (если не пусто) как InputText + result.content_items",
+          "7. JsReplHandler эмитит ToolEventStage::Success с ExecToolCallOutput (exit_code=0, timed_out=false, duration)",
+          "8. JsReplHandler возвращает FunctionToolOutput::from_text или from_content, success=Some(true)"
+        ],
+        "extensions (Cockburn)": [
+          {"step": 1, "condition": "Feature::JsRepl выключен", "action": "RespondToModel: 'js_repl is disabled by feature flag'"},
+          {"step": 2, "condition": "Custom.input пустой/whitespace", "action": "RespondToModel: 'js_repl expects raw JavaScript tool input (non-empty). Provide JS source text, optionally with first-line `// codex-js-repl: ...`.'"},
+          {"step": 2, "condition": "input начинается с ``` markdown fence", "action": "RespondToModel: 'js_repl expects raw JavaScript source, not markdown code fences. Resend plain JS only (optional first line `// codex-js-repl: ...`).'"},
+          {"step": 2, "condition": "input парсится как JSON object или JSON string", "action": "RespondToModel: 'js_repl is a freeform tool and expects raw JavaScript source. ... do not send JSON, quoted code, or markdown fences.'"},
+          {"step": 2, "condition": "pragma содержит token без '=' или неизвестный ключ", "action": "RespondToModel: 'js_repl pragma expects space-separated key=value pairs (supported keys: timeout_ms); got `{token}`' | 'js_repl pragma only supports timeout_ms; got `{key}`'"},
+          {"step": 2, "condition": "pragma задаёт timeout_ms несколько раз", "action": "RespondToModel: 'js_repl pragma specifies timeout_ms more than once'"},
+          {"step": 2, "condition": "timeout_ms не парсится как u64", "action": "RespondToModel: 'js_repl pragma timeout_ms must be an integer; got `{value}`'"},
+          {"step": 2, "condition": "после pragma нет JS-кода", "action": "RespondToModel: 'js_repl pragma must be followed by JavaScript source on subsequent lines'"},
+          {"step": 2, "condition": "payload не Function и не Custom", "action": "RespondToModel: 'js_repl expects custom or function payload'"},
+          {"step": 5, "condition": "manager.execute возвращает ошибку", "action": "эмитит ToolEventStage::Failure с ExecToolCallOutput(exit_code=1, stderr=error_message, duration=elapsed) и пробрасывает ошибку"}
+        ],
+        "edge_cases": [
+          {"condition": "stdout и stderr оба не пусты", "action": "aggregated_output = '{stdout}\\n{stderr}'"},
+          {"condition": "result.output пустой и content_items пустой", "action": "возвращается FunctionToolOutput::from_text('') вместо from_content([])"}
+        ],
+        "lifecycle": null,
+        "ux": null,
+        "result": "Код выполнен, events начала/конца эмитированы; клиенту возвращён текст (или рич content_items) с флагом успеха. При ошибке — error выделен в stderr, exit_code=1"
+      }
+    },
+    {
+      "id": "SRC-0016/uc.sub/reset-js-repl-kernel",
+      "src": "SRC-0016",
+      "composition": "use_case",
+      "level": "sub",
+      "strategic_domain": null,
+      "terms": {
+        "actor": "JsReplResetHandler",
+        "goal": "Сбросить состояние JS REPL kernel",
+        "steps": [
+          "1. JsReplResetHandler проверяет, что Feature::JsRepl включён",
+          "2. JsReplResetHandler получает manager через invocation.turn.js_repl.manager()",
+          "3. JsReplResetHandler вызывает manager.reset().await",
+          "4. JsReplResetHandler возвращает FunctionToolOutput::from_text('js_repl kernel reset', Some(true))"
+        ],
+        "extensions (Cockburn)": [
+          {"step": 1, "condition": "Feature::JsRepl выключен", "action": "RespondToModel: 'js_repl is disabled by feature flag'"}
+        ],
+        "edge_cases": [],
+        "lifecycle": null,
+        "ux": null,
+        "result": "Kernel JS REPL сброшен; модель получила подтверждение 'js_repl kernel reset'"
+      }
+    },
+    {
+      "id": "SRC-0016/uc.sub/list-directory",
+      "src": "SRC-0016",
+      "composition": "use_case",
+      "level": "sub",
+      "strategic_domain": null,
+      "terms": {
+        "actor": "ListDirHandler",
+        "goal": "Вернуть постраничный список содержимого директории с ограничением глубины",
+        "steps": [
+          "1. ListDirHandler парсит ListDirArgs из ToolPayload::Function.arguments (defaults: offset=1, limit=25, depth=2)",
+          "2. ListDirHandler валидирует offset>=1, limit>=1, depth>=1, dir_path — абсолютный путь",
+          "3. ListDirHandler вызывает list_dir_slice(path, offset, limit, depth)",
+          "4. collect_entries BFS обходит каталог до глубины depth, собирая DirEntry (name, display_name, depth, kind из FileType)",
+          "5. collect_entries сортирует записи каждого каталога по sort_key перед добавлением",
+          "6. list_dir_slice сортирует все entries по name и берёт slice [offset-1..offset-1+min(limit, remaining)]",
+          "7. list_dir_slice форматирует каждую запись через format_entry_line (indent = depth*2 пробелов, суффикс: Directory='/' Symlink='@' Other='?' File='')",
+          "8. ListDirHandler склеивает 'Absolute path: {path}' и форматированные строки через '\\n', возвращает FunctionToolOutput::from_text, success=Some(true)"
+        ],
+        "extensions (Cockburn)": [
+          {"step": 1, "condition": "payload не Function", "action": "RespondToModel: 'list_dir handler received unsupported payload'"},
+          {"step": 2, "condition": "offset == 0", "action": "RespondToModel: 'offset must be a 1-indexed entry number'"},
+          {"step": 2, "condition": "limit == 0", "action": "RespondToModel: 'limit must be greater than zero'"},
+          {"step": 2, "condition": "depth == 0", "action": "RespondToModel: 'depth must be greater than zero'"},
+          {"step": 2, "condition": "dir_path не абсолютный", "action": "RespondToModel: 'dir_path must be an absolute path'"},
+          {"step": 4, "condition": "tokio::fs::read_dir/next_entry/file_type ошибка IO", "action": "RespondToModel: 'failed to read directory: {err}' | 'failed to inspect entry: {err}'"},
+          {"step": 6, "condition": "entries пуст", "action": "возвращается пустой Vec (без ошибки)"},
+          {"step": 6, "condition": "offset-1 >= entries.len()", "action": "RespondToModel: 'offset exceeds directory entry count'"},
+          {"step": 7, "condition": "end_index < entries.len()", "action": "добавить строку 'More than {capped_limit} entries found' в хвост"}
+        ],
+        "edge_cases": [
+          {"condition": "имя файла длиннее MAX_ENTRY_LENGTH=500 байт", "action": "обрезается через take_bytes_at_char_boundary (учёт UTF-8 boundary)"},
+          {"condition": "в пути есть Windows-разделители '\\'", "action": "format_entry_name нормализует их в '/' перед отображением"}
+        ],
+        "lifecycle": null,
+        "ux": null,
+        "result": "Клиент получил текстовый листинг в формате 'Absolute path: ...' + отсортированные строки с отступами и суффиксами по типу, опционально завершённый 'More than N entries found'"
+      }
+    },
+    {
+      "id": "SRC-0016/uc.sub/invoke-mcp-tool",
+      "src": "SRC-0016",
+      "composition": "use_case",
+      "level": "sub",
+      "strategic_domain": null,
+      "terms": {
+        "actor": "McpHandler",
+        "goal": "Делегировать вызов MCP-инструмента в mcp_tool_call::handle_mcp_tool_call и вернуть результат с wall_time",
+        "steps": [
+          "1. McpHandler извлекает (server, tool, raw_arguments) из ToolPayload::Mcp",
+          "2. McpHandler фиксирует Instant::now как started",
+          "3. McpHandler вызывает handle_mcp_tool_call(session, turn, call_id, server, tool, raw_arguments)",
+          "4. McpHandler вычисляет wall_time = started.elapsed и original_image_detail_supported = can_request_original_image_detail(turn.model_info)",
+          "5. McpHandler возвращает McpToolOutput { result, wall_time, original_image_detail_supported }"
+        ],
+        "extensions (Cockburn)": [
+          {"step": 1, "condition": "payload не Mcp", "action": "RespondToModel: 'mcp handler received unsupported payload'"}
+        ],
+        "edge_cases": [],
+        "lifecycle": null,
+        "ux": null,
+        "result": "Клиенту возвращён McpToolOutput с результатом вызова, замеренным wall_time и флагом поддержки original image detail"
+      }
+    },
+    {
+      "id": "SRC-0016/uc.sub/list-mcp-resources",
+      "src": "SRC-0016",
+      "composition": "use_case",
+      "level": "sub",
+      "strategic_domain": null,
+      "terms": {
+        "actor": "McpResourceHandler (list_mcp_resources)",
+        "goal": "Вернуть resources одного MCP-сервера или всех серверов (с привязкой к server)",
+        "steps": [
+          "1. McpResourceHandler парсит arguments: Option<Value> через parse_arguments (null/empty -> None)",
+          "2. McpResourceHandler диспатчит по tool_name='list_mcp_resources' → handle_list_resources",
+          "3. handle_list_resources парсит ListResourcesArgs через parse_args_with_default (Default при None)",
+          "4. handle_list_resources нормализует server и cursor через normalize_optional_string (trim; empty->None)",
+          "5. handle_list_resources эмитит emit_tool_call_begin c McpInvocation { server: server.unwrap_or('codex'), tool: 'list_mcp_resources', arguments }",
+          "6. Если server задан — вызывает session.list_resources(server, PaginatedRequestParams{cursor}) и оборачивает в from_single_server",
+          "7. Если server не задан — вызывает mcp_connection_manager.list_all_resources (HashMap), сортирует по имени server, и оборачивает в from_all_servers",
+          "8. handle_list_resources сериализует payload через serialize_function_output в FunctionToolOutput::from_text, success=Some(true)",
+          "9. handle_list_resources эмитит emit_tool_call_end с CallToolResult (text content, is_error=!success) и duration"
+        ],
+        "extensions (Cockburn)": [
+          {"step": 2, "condition": "payload не Function", "action": "RespondToModel: 'mcp_resource handler received unsupported payload'"},
+          {"step": 2, "condition": "tool_name не из списка {list_mcp_resources, list_mcp_resource_templates, read_mcp_resource}", "action": "RespondToModel: 'unsupported MCP resource tool: {other}'"},
+          {"step": 4, "condition": "server is None и cursor is Some", "action": "RespondToModel: 'cursor can only be used when a server is specified'"},
+          {"step": 6, "condition": "session.list_resources возвращает ошибку", "action": "RespondToModel: 'resources/list failed: {err:#}' + emit_tool_call_end с Err(message)"},
+          {"step": 8, "condition": "serde_json::to_string payload не сериализуется", "action": "RespondToModel: 'failed to serialize MCP resource response: {err}' + emit_tool_call_end с Err(message)"}
+        ],
+        "edge_cases": [
+          {"condition": "list_all возвращает пустой HashMap", "action": "payload с пустым resources[] и next_cursor=None"},
+          {"condition": "next_cursor None при single-server", "action": "поле отсутствует в JSON (skip_serializing_if)"}
+        ],
+        "lifecycle": null,
+        "ux": null,
+        "result": "Клиент получил JSON со списком resources (каждый с server) + next_cursor для пагинации; события McpToolCallBegin/McpToolCallEnd эмитированы"
+      }
+    },
+    {
+      "id": "SRC-0016/uc.sub/list-mcp-resource-templates",
+      "src": "SRC-0016",
+      "composition": "use_case",
+      "level": "sub",
+      "strategic_domain": null,
+      "terms": {
+        "actor": "McpResourceHandler (list_mcp_resource_templates)",
+        "goal": "Вернуть resource_templates одного MCP-сервера или всех серверов",
+        "steps": [
+          "1. McpResourceHandler диспатчит по tool_name='list_mcp_resource_templates' → handle_list_resource_templates",
+          "2. handle_list_resource_templates парсит ListResourceTemplatesArgs (server, cursor — оба Option<String>)",
+          "3. handle_list_resource_templates нормализует server и cursor",
+          "4. handle_list_resource_templates эмитит emit_tool_call_begin",
+          "5. Если server задан — вызывает session.list_resource_templates(server, params), оборачивает в from_single_server",
+          "6. Если server не задан — вызывает mcp_connection_manager.list_all_resource_templates, сортирует и оборачивает в from_all_servers",
+          "7. handle_list_resource_templates сериализует и эмитит emit_tool_call_end"
+        ],
+        "extensions (Cockburn)": [
+          {"step": 3, "condition": "server is None и cursor is Some", "action": "RespondToModel: 'cursor can only be used when a server is specified'"},
+          {"step": 5, "condition": "session.list_resource_templates ошибка", "action": "RespondToModel: 'resources/templates/list failed: {err:#}'"}
+        ],
+        "edge_cases": [],
+        "lifecycle": null,
+        "ux": null,
+        "result": "Клиент получил JSON со списком resource_templates (каждый с server) + next_cursor; события эмитированы"
+      }
+    },
+    {
+      "id": "SRC-0016/uc.sub/read-mcp-resource",
+      "src": "SRC-0016",
+      "composition": "use_case",
+      "level": "sub",
+      "strategic_domain": null,
+      "terms": {
+        "actor": "McpResourceHandler (read_mcp_resource)",
+        "goal": "Прочитать содержимое MCP resource по (server, uri) и вернуть содержимое",
+        "steps": [
+          "1. McpResourceHandler диспатчит по tool_name='read_mcp_resource' → handle_read_resource",
+          "2. handle_read_resource парсит ReadResourceArgs через parse_args (требуется value; иначе ошибка)",
+          "3. handle_read_resource нормализует server и uri через normalize_required_string (error если empty)",
+          "4. handle_read_resource эмитит emit_tool_call_begin с invocation={server, tool='read_mcp_resource', arguments}",
+          "5. handle_read_resource вызывает session.read_resource(server, ReadResourceRequestParams{uri})",
+          "6. handle_read_resource оборачивает в ReadResourcePayload { server, uri, ...result }",
+          "7. handle_read_resource сериализует и эмитит emit_tool_call_end"
+        ],
+        "extensions (Cockburn)": [
+          {"step": 2, "condition": "arguments is None", "action": "RespondToModel: 'failed to parse function arguments: expected value'"},
+          {"step": 3, "condition": "server пустой", "action": "RespondToModel: 'server must be provided'"},
+          {"step": 3, "condition": "uri пустой", "action": "RespondToModel: 'uri must be provided'"},
+          {"step": 5, "condition": "session.read_resource ошибка", "action": "RespondToModel: 'resources/read failed: {err:#}'"}
+        ],
+        "edge_cases": [],
+        "lifecycle": null,
+        "ux": null,
+        "result": "Клиент получил JSON с содержимым resource (server, uri, плюс полезная нагрузка ReadResourceResult); события начала/конца эмитированы"
+      }
+    },
+    {
+      "id": "SRC-0016/uc.sub/update-plan",
+      "src": "SRC-0016",
+      "composition": "use_case",
+      "level": "sub",
+      "strategic_domain": null,
+      "terms": {
+        "actor": "PlanHandler",
+        "goal": "Зарегистрировать обновление плана модели и уведомить клиента о PlanUpdate",
+        "steps": [
+          "1. PlanHandler извлекает arguments из ToolPayload::Function",
+          "2. PlanHandler вызывает handle_update_plan(session, turn, arguments, call_id)",
+          "3. handle_update_plan проверяет turn_context.collaboration_mode.mode != ModeKind::Plan",
+          "4. handle_update_plan парсит UpdatePlanArgs через serde_json",
+          "5. handle_update_plan отправляет session.send_event(EventMsg::PlanUpdate(args))",
+          "6. PlanHandler возвращает PlanToolOutput (to_response_item = 'Plan updated', success=true)"
+        ],
+        "extensions (Cockburn)": [
+          {"step": 1, "condition": "payload не Function", "action": "RespondToModel: 'update_plan handler received unsupported payload'"},
+          {"step": 3, "condition": "collaboration_mode.mode == ModeKind::Plan", "action": "RespondToModel: 'update_plan is a TODO/checklist tool and is not allowed in Plan mode'"},
+          {"step": 4, "condition": "UpdatePlanArgs не парсятся", "action": "RespondToModel: 'failed to parse function arguments: {e}'"}
+        ],
+        "edge_cases": [
+          {"condition": "PlanToolOutput.code_mode_result", "action": "возвращается пустой JSON-объект {} — plan tool не имеет полезного output"}
+        ],
+        "lifecycle": null,
+        "ux": null,
+        "result": "Клиент получил EventMsg::PlanUpdate, модель получила ответ 'Plan updated' с success=true (ценны только _входы_ инструмента)"
+      }
+    },
+    {
+      "id": "SRC-0016/uc.sub/request-permissions",
+      "src": "SRC-0016",
+      "composition": "use_case",
+      "level": "sub",
+      "strategic_domain": null,
+      "terms": {
+        "actor": "RequestPermissionsHandler",
+        "goal": "Запросить у пользователя дополнительные права (network/file_system) и вернуть его ответ модели",
+        "steps": [
+          "1. RequestPermissionsHandler извлекает arguments из ToolPayload::Function",
+          "2. RequestPermissionsHandler парсит RequestPermissionsArgs через parse_arguments_with_base_path(turn.cwd) (пути резолвятся относительно cwd)",
+          "3. RequestPermissionsHandler нормализует args.permissions через normalize_additional_permissions → RequestPermissionProfile",
+          "4. RequestPermissionsHandler проверяет, что args.permissions не пусты",
+          "5. RequestPermissionsHandler вызывает session.request_permissions(turn, call_id, args)",
+          "6. RequestPermissionsHandler сериализует response через serde_json и возвращает FunctionToolOutput::from_text(content, Some(true))"
+        ],
+        "extensions (Cockburn)": [
+          {"step": 1, "condition": "payload не Function", "action": "RespondToModel: 'request_permissions handler received unsupported payload'"},
+          {"step": 3, "condition": "normalize_additional_permissions ошибка", "action": "RespondToModel с текстом ошибки нормализации"},
+          {"step": 4, "condition": "permissions пусты после нормализации", "action": "RespondToModel: 'request_permissions requires at least one permission'"},
+          {"step": 5, "condition": "запрос отменён до получения ответа", "action": "RespondToModel: 'request_permissions was cancelled before receiving a response'"},
+          {"step": 6, "condition": "serde_json::to_string не сериализует", "action": "Fatal: 'failed to serialize request_permissions response: {err}'"}
+        ],
+        "edge_cases": [],
+        "lifecycle": null,
+        "ux": null,
+        "result": "Модель получила сериализованный response от пользователя о предоставлении/отказе в запрошенных правах"
+      }
+    },
+    {
+      "id": "SRC-0016/uc.sub/request-user-input",
+      "src": "SRC-0016",
+      "composition": "use_case",
+      "level": "sub",
+      "strategic_domain": null,
+      "terms": {
+        "actor": "RequestUserInputHandler",
+        "goal": "Задать уточняющий вопрос пользователю с корневого треда и вернуть его ответ модели",
+        "steps": [
+          "1. RequestUserInputHandler извлекает arguments из ToolPayload::Function",
+          "2. RequestUserInputHandler проверяет, что turn.session_source не SubAgent (только root thread)",
+          "3. RequestUserInputHandler получает collaboration_mode и вызывает request_user_input_unavailable_message(mode, default_mode_request_user_input)",
+          "4. RequestUserInputHandler парсит RequestUserInputArgs и нормализует через normalize_request_user_input_args",
+          "5. RequestUserInputHandler вызывает session.request_user_input(turn, call_id, args)",
+          "6. RequestUserInputHandler сериализует response и возвращает FunctionToolOutput::from_text(content, Some(true))"
+        ],
+        "extensions (Cockburn)": [
+          {"step": 1, "condition": "payload не Function", "action": "RespondToModel: '{REQUEST_USER_INPUT_TOOL_NAME} handler received unsupported payload'"},
+          {"step": 2, "condition": "session_source = SubAgent", "action": "RespondToModel: 'request_user_input can only be used by the root thread'"},
+          {"step": 3, "condition": "режим не позволяет задавать вопрос (unavailable_message вернул Some)", "action": "RespondToModel с этим сообщением"},
+          {"step": 4, "condition": "normalize_request_user_input_args ошибка", "action": "RespondToModel с текстом ошибки"},
+          {"step": 5, "condition": "запрос отменён до получения ответа", "action": "RespondToModel: '{REQUEST_USER_INPUT_TOOL_NAME} was cancelled before receiving a response'"},
+          {"step": 6, "condition": "serde_json::to_string не сериализует", "action": "Fatal: 'failed to serialize {REQUEST_USER_INPUT_TOOL_NAME} response: {err}'"}
+        ],
+        "edge_cases": [],
+        "lifecycle": null,
+        "ux": null,
+        "result": "Модель получила сериализованный ответ пользователя на заданный вопрос"
+      }
+    },
+    {
+      "id": "SRC-0016/uc.sub/execute-shell-command",
+      "src": "SRC-0016",
+      "composition": "use_case",
+      "level": "sub",
+      "strategic_domain": null,
+      "terms": {
+        "actor": "ShellHandler / ShellCommandHandler",
+        "goal": "Выполнить shell-команду с учётом песочницы, дополнительных прав, apply_patch interception и одобрения",
+        "steps": [
+          "1. ShellHandler резолвит cwd через resolve_workdir_base_path(arguments, turn.cwd)",
+          "2. ShellHandler парсит ShellToolCallParams (или для LocalShell/ShellCommand — соответствующие Params) с base_path=cwd",
+          "3. ShellHandler строит ExecParams через to_exec_params (или ShellCommandHandler.to_exec_params с login shell resolution: resolve_use_login_shell + shell.derive_exec_args)",
+          "4. run_exec_like: маже dependency_env в env и собирает explicit_env_overrides (union of turn.set and keys from dependency_env)",
+          "5. run_exec_like вычисляет effective_additional_permissions через apply_granted_turn_permissions",
+          "6. run_exec_like определяет additional_permissions_allowed = Feature::ExecPermissionApprovals || (Feature::RequestPermissionsTool && preapproved)",
+          "7. run_exec_like либо использует implicit_granted_permissions (сессионный sticky grant), либо вызывает normalize_and_validate_additional_permissions",
+          "8. run_exec_like проверяет approval policy guard: если requests_sandbox_override && !preapproved && approval_policy != OnRequest — отклонить",
+          "9. run_exec_like вызывает intercept_apply_patch — если это apply_patch, делегировать и вернуть результат →triggers SRC-0016/uc.sub/intercept-apply-patch-from-exec",
+          "10. run_exec_like эмитит ToolEmitter::shell(command, cwd, Agent, freeform).begin",
+          "11. run_exec_like вычисляет exec_approval_requirement через exec_policy.create_exec_approval_requirement_for_command (sandbox_permissions=UseDefault если preapproved)",
+          "12. run_exec_like собирает ShellRequest и запускает ToolOrchestrator.run(ShellRuntime[backend], ShellRequest)",
+          "13. run_exec_like форматирует post_tool_use_response через format_exec_output_str(output, turn.truncation_policy)",
+          "14. run_exec_like эмитит emitter.finish и возвращает FunctionToolOutput { body: [InputText{text: content}], success: Some(true), post_tool_use_response }"
+        ],
+        "extensions (Cockburn)": [
+          {"step": 2, "condition": "payload для ShellHandler не Function/LocalShell или для ShellCommandHandler не Function", "action": "RespondToModel: 'unsupported payload for shell handler: {tool}' | 'unsupported payload for shell_command handler: {tool}'"},
+          {"step": 3, "condition": "ShellCommandHandler: login=Some(true) && !allow_login_shell", "action": "RespondToModel: 'login shell is disabled by config; omit `login` or set it to false.'"},
+          {"step": 4, "condition": "turn.environment отсутствует", "action": "RespondToModel: 'shell is unavailable in this session'"},
+          {"step": 7, "condition": "normalize_and_validate_additional_permissions ошибка", "action": "RespondToModel с текстом ошибки"},
+          {"step": 8, "condition": "sandbox override запрошен вне OnRequest режима", "action": "RespondToModel: 'approval policy is {policy}; reject command — you should not ask for escalated permissions if the approval policy is {policy}'"},
+          {"step": 9, "condition": "intercept_apply_patch вернул Some(output)", "action": "вернуть этот output без выполнения shell-flow"}
+        ],
+        "edge_cases": [
+          {"condition": "ShellHandler.is_mutating: команда не парсится в ShellToolCallParams", "action": "считать мутирующей (true) по умолчанию"},
+          {"condition": "ShellHandler.is_mutating: команда парсится и is_known_safe_command=true", "action": "is_mutating=false"},
+          {"condition": "ShellCommandHandler.is_mutating: login shell resolution ошибка", "action": "считать мутирующей"},
+          {"condition": "maybe_emit_implicit_skill_invocation (только ShellCommandHandler)", "action": "эмитится implicit skill invocation event для команды и workdir"}
+        ],
+        "lifecycle": null,
+        "ux": null,
+        "result": "Команда выполнена (или отклонена по policy); клиенту возвращён текст вывода, эмитированы события shell start/finish, при apply_patch — делегировано в apply_patch pipeline"
+      }
+    },
+    {
+      "id": "SRC-0016/uc.sub/wait-on-test-sync-barrier",
+      "src": "SRC-0016",
+      "composition": "use_case",
+      "level": "sub",
+      "strategic_domain": null,
+      "terms": {
+        "actor": "TestSyncHandler",
+        "goal": "Синхронизировать параллельные тестовые turn-ы через именованный барьер с опциональными задержками",
+        "steps": [
+          "1. TestSyncHandler парсит TestSyncArgs { sleep_before_ms?, sleep_after_ms?, barrier? }",
+          "2. Если sleep_before_ms задан и > 0 — TestSyncHandler ждёт tokio::time::sleep(sleep_before_ms)",
+          "3. Если barrier задан — TestSyncHandler вызывает wait_on_barrier(BarrierArgs{id, participants, timeout_ms=1000 по умолчанию})",
+          "4. wait_on_barrier валидирует participants > 0 и timeout_ms > 0",
+          "5. wait_on_barrier находит или создаёт Barrier в глобальной OnceLock HashMap по id; при Occupied — переиспользует, при Vacant — создаёт Barrier::new(participants)",
+          "6. wait_on_barrier вызывает tokio::time::timeout(timeout, barrier.wait())",
+          "7. wait_on_barrier: если is_leader — удаляет entry из барьерной карты (если Arc::ptr_eq совпадает)",
+          "8. Если sleep_after_ms задан и > 0 — TestSyncHandler ждёт tokio::time::sleep(sleep_after_ms)",
+          "9. TestSyncHandler возвращает FunctionToolOutput::from_text('ok', Some(true))"
+        ],
+        "extensions (Cockburn)": [
+          {"step": 1, "condition": "payload не Function", "action": "RespondToModel: 'test_sync_tool handler received unsupported payload'"},
+          {"step": 4, "condition": "participants == 0", "action": "RespondToModel: 'barrier participants must be greater than zero'"},
+          {"step": 4, "condition": "timeout_ms == 0", "action": "RespondToModel: 'barrier timeout must be greater than zero'"},
+          {"step": 5, "condition": "в карте уже есть barrier с другим participants", "action": "RespondToModel: 'barrier {id} already registered with {existing} participants'"},
+          {"step": 6, "condition": "timeout истёк до достижения Barrier", "action": "RespondToModel: 'test_sync_tool barrier wait timed out'"}
+        ],
+        "edge_cases": [
+          {"condition": "sleep_before_ms или sleep_after_ms = 0 или None", "action": "задержка пропускается"},
+          {"condition": "is_leader и запись уже заменена (Arc::ptr_eq != )", "action": "удаление не происходит"}
+        ],
+        "lifecycle": {
+          "entity": "SRC-0016/entity/test-sync-barrier",
+          "states": ["vacant (no entry)", "registered (entry present)", "removed (after leader exit)"],
+          "transition": {
+            "from": "vacant -> registered (Vacant.insert) -> removed (leader)",
+            "to": "vacant",
+            "guard": "is_leader && Arc::ptr_eq(state.barrier, own_barrier)",
+            "side_effect": "map.remove(&barrier_id)"
+          }
+        },
+        "ux": null,
+        "result": "Участники достигли барьера (или один получил timeout); инструмент вернул 'ok'"
+      }
+    },
+    {
+      "id": "SRC-0016/uc.sub/search-available-tools",
+      "src": "SRC-0016",
+      "composition": "use_case",
+      "level": "sub",
+      "strategic_domain": null,
+      "terms": {
+        "actor": "ToolSearchHandler",
+        "goal": "Вернуть релевантные инструменты по BM25-запросу с учётом per-server лимитов",
+        "steps": [
+          "1. ToolSearchHandler извлекает ToolSearchArgs из ToolPayload::ToolSearch",
+          "2. ToolSearchHandler триммит query и валидирует, что он не пуст",
+          "3. ToolSearchHandler использует limit = args.limit.unwrap_or(TOOL_SEARCH_DEFAULT_LIMIT)",
+          "4. ToolSearchHandler валидирует limit > 0",
+          "5. Если entries пусты — ToolSearchHandler возвращает ToolSearchOutput с пустым tools",
+          "6. ToolSearchHandler вызывает search_result_entries(query, limit, use_default_limit)",
+          "7. search_result_entries выполняет BM25 search с указанным limit",
+          "8. Если use_default_limit=true и среди результатов есть computer-use — search_result_entries повторяет поиск с limit=COMPUTER_USE_TOOL_SEARCH_LIMIT=20",
+          "9. search_result_entries применяет limit_results_per_server: ограничивает computer-use до 20 результатов, остальные серверы — до TOOL_SEARCH_DEFAULT_LIMIT",
+          "10. ToolSearchHandler передаёт результаты в collect_tool_search_output_tools(ToolSearchResultSource{...}), возвращает ToolSearchOutput"
+        ],
+        "extensions (Cockburn)": [
+          {"step": 1, "condition": "payload не ToolSearch", "action": "Fatal: '{TOOL_SEARCH_TOOL_NAME} handler received unsupported payload'"},
+          {"step": 2, "condition": "query пустой после trim", "action": "RespondToModel: 'query must not be empty'"},
+          {"step": 4, "condition": "limit == 0", "action": "RespondToModel: 'limit must be greater than zero'"},
+          {"step": 10, "condition": "collect_tool_search_output_tools ошибка", "action": "Fatal: 'failed to encode {TOOL_SEARCH_TOOL_NAME} output: {err}'"}
+        ],
+        "edge_cases": [
+          {"condition": "пользователь явно передал limit (use_default_limit=false)", "action": "расширение до COMPUTER_USE_TOOL_SEARCH_LIMIT и per-server лимиты НЕ применяются — возвращается сырой результат BM25"},
+          {"condition": "build_search_text: отсутствующий/пустой title/description/connector_*", "action": "поле пропускается, не добавляется в BM25 документ"}
+        ],
+        "lifecycle": null,
+        "ux": null,
+        "result": "Клиент получил отсортированный по BM25-релевантности список инструментов, ограниченный per-server лимитами (computer-use=20, others=default)"
+      }
+    },
+    {
+      "id": "SRC-0016/uc.sub/suggest-tool-install",
+      "src": "SRC-0016",
+      "composition": "use_case",
+      "level": "sub",
+      "strategic_domain": null,
+      "terms": {
+        "actor": "ToolSuggestHandler",
+        "goal": "Предложить пользователю установить коннектор или плагин и проверить, что установка завершена",
+        "steps": [
+          "1. ToolSuggestHandler парсит ToolSuggestArgs { suggest_reason, action_type, tool_type, tool_id }",
+          "2. ToolSuggestHandler триммит suggest_reason и валидирует, что он не пуст",
+          "3. ToolSuggestHandler валидирует action_type == Install",
+          "4. ToolSuggestHandler валидирует, что tool_type != Plugin ИЛИ client_name != 'codex-tui'",
+          "5. ToolSuggestHandler получает accessible_connectors_from_mcp_tools и применяет with_app_enabled_state",
+          "6. ToolSuggestHandler вычисляет discoverable_tools (с auth и фильтрацией per-client)",
+          "7. ToolSuggestHandler находит tool по (tool_type, tool_id)",
+          "8. ToolSuggestHandler строит RequestId='tool_suggestion_{call_id}' и params через build_tool_suggestion_elicitation_request",
+          "9. ToolSuggestHandler вызывает session.request_mcp_server_elicitation и определяет user_confirmed = response.action == Accept",
+          "10. Если user_confirmed — ToolSuggestHandler вызывает verify_tool_suggestion_completed (для Connector: refresh + verified_connector_suggestion_completed; для Plugin: reload_user_config_layer + verified_plugin_suggestion_completed через PluginsManager) →triggers SRC-0016/uc.sub/verify-tool-suggestion-completion",
+          "11. Если completed и это Connector — ToolSuggestHandler вызывает session.merge_connector_selection(HashSet{connector.id})",
+          "12. ToolSuggestHandler сериализует ToolSuggestResult { completed, user_confirmed, tool_type, action_type, tool_id, tool_name, suggest_reason } и возвращает FunctionToolOutput"
+        ],
+        "extensions (Cockburn)": [
+          {"step": 1, "condition": "payload не Function", "action": "Fatal: '{TOOL_SUGGEST_TOOL_NAME} handler received unsupported payload'"},
+          {"step": 2, "condition": "suggest_reason пуст после trim", "action": "RespondToModel: 'suggest_reason must not be empty'"},
+          {"step": 3, "condition": "action_type != Install", "action": "RespondToModel: 'tool suggestions currently support only action_type=\"install\"'"},
+          {"step": 4, "condition": "tool_type=Plugin && client='codex-tui'", "action": "RespondToModel: 'plugin tool suggestions are not available in codex-tui yet'"},
+          {"step": 6, "condition": "list_tool_suggest_discoverable_tools_with_auth ошибка", "action": "RespondToModel: 'tool suggestions are unavailable right now: {err}'"},
+          {"step": 7, "condition": "tool не найден среди discoverable_tools", "action": "RespondToModel: 'tool_id must match one of the discoverable tools exposed by {TOOL_SUGGEST_TOOL_NAME}'"},
+          {"step": 9, "condition": "response is None или action != Accept", "action": "user_confirmed=false, completed=false (без verify)"},
+          {"step": 12, "condition": "serde_json::to_string ошибка", "action": "Fatal: 'failed to serialize {TOOL_SUGGEST_TOOL_NAME} response: {err}'"}
+        ],
+        "edge_cases": [
+          {"condition": "completed=true но tool — Plugin (не Connector)", "action": "merge_connector_selection НЕ вызывается"}
+        ],
+        "lifecycle": null,
+        "ux": null,
+        "result": "Клиенту отправлен elicitation request на установку; после подтверждения проверено состояние установки; если connector установлен — он добавлен в session connector selection. Модели возвращён ToolSuggestResult с флагами completed/user_confirmed"
+      }
+    },
+    {
+      "id": "SRC-0016/uc.sub/verify-tool-suggestion-completion",
+      "src": "SRC-0016",
+      "composition": "use_case",
+      "level": "sub",
+      "strategic_domain": null,
+      "terms": {
+        "actor": "verify_tool_suggestion_completed",
+        "goal": "Подтвердить, что пользователь действительно установил предложенный tool",
+        "steps": [
+          "1. Для Connector: вызвать refresh_missing_suggested_connectors(session, turn, auth, [connector.id], connector.id)",
+          "2. refresh_missing_suggested_connectors: если expected_connector_ids пусты — вернуть Vec::new",
+          "3. refresh_missing_suggested_connectors: получить mcp_tools через manager.list_all_tools и accessible_connectors",
+          "4. refresh_missing_suggested_connectors: если all_suggested_connectors_picked_up — вернуть accessible_connectors (cache hit)",
+          "5. refresh_missing_suggested_connectors: иначе вызвать manager.hard_refresh_codex_apps_tools_cache; при успехе — пересчитать accessible_connectors + refresh_accessible_connectors_cache_from_mcp_tools",
+          "6. Для Connector: проверить verified_connector_suggestion_completed(connector.id, accessible_connectors)",
+          "7. Для Plugin: session.reload_user_config_layer + get_config; проверить verified_plugin_suggestion_completed (plugin installed=true в marketplaces через PluginsManager.list_marketplaces_for_config); параллельно refresh_missing_suggested_connectors для app_connector_ids плагина"
+        ],
+        "extensions (Cockburn)": [
+          {"step": 5, "condition": "hard_refresh ошибка", "action": "warn!: 'failed to refresh codex apps tools cache after tool suggestion for {tool_id}: {err:#}' + вернуть None"}
+        ],
+        "edge_cases": [
+          {"condition": "Plugin.app_connector_ids пусты", "action": "refresh_missing_suggested_connectors возвращает Vec::new"}
+        ],
+        "lifecycle": null,
+        "ux": null,
+        "result": "Вернётся bool completed: true если установка подтверждена (через refresh + верификатор), иначе false"
+      }
+    },
+    {
+      "id": "SRC-0016/uc.sub/respond-unavailable-tool",
+      "src": "SRC-0016",
+      "composition": "use_case",
+      "level": "sub",
+      "strategic_domain": null,
+      "terms": {
+        "actor": "UnavailableToolHandler",
+        "goal": "Вернуть описание того, что инструмент был доступен ранее, но сейчас недоступен, с подсказкой следующего шага",
+        "steps": [
+          "1. UnavailableToolHandler извлекает tool_name и payload из ToolInvocation",
+          "2. Для ToolPayload::Function: UnavailableToolHandler формирует сообщение через unavailable_tool_message(tool_name, 'Retry after the tool becomes available or ask the user to re-enable it.') и возвращает FunctionToolOutput::from_text(..., success=Some(false))"
+        ],
+        "extensions (Cockburn)": [
+          {"step": 2, "condition": "payload не Function", "action": "RespondToModel: 'unavailable tool handler received unsupported payload'"}
+        ],
+        "edge_cases": [],
+        "lifecycle": null,
+        "ux": null,
+        "result": "Модель получила текст 'Tool `{tool_name}` is not currently available. ... Retry after the tool becomes available or ask the user to re-enable it.' с флагом success=false"
+      }
+    },
+    {
+      "id": "SRC-0016/uc.sub/execute-unified-exec-command",
+      "src": "SRC-0016",
+      "composition": "use_case",
+      "level": "sub",
+      "strategic_domain": null,
+      "terms": {
+        "actor": "UnifiedExecHandler (exec_command)",
+        "goal": "Запустить команду в persistent exec-процессе с контролем shell mode, tty, permissions и apply_patch interception",
+        "steps": [
+          "1. UnifiedExecHandler получает fs из turn.environment и UnifiedExecContext{session, turn, call_id}",
+          "2. UnifiedExecHandler резолвит cwd через resolve_workdir_base_path(arguments, turn.cwd)",
+          "3. UnifiedExecHandler парсит ExecCommandArgs с base_path=cwd",
+          "4. UnifiedExecHandler эмитит maybe_emit_implicit_skill_invocation для workdir",
+          "5. UnifiedExecHandler выделяет process_id через manager.allocate_process_id",
+          "6. UnifiedExecHandler строит command через get_command (Direct: session_shell или model_shell.derive_exec_args с use_login_shell; ZshFork: [zsh, -lc|-c, cmd])",
+          "7. UnifiedExecHandler вычисляет effective_additional_permissions через apply_granted_turn_permissions",
+          "8. UnifiedExecHandler проверяет approval policy guard (sandbox override вне OnRequest)",
+          "9. UnifiedExecHandler вызывает implicit_granted_permissions (sticky) или normalize_and_validate_additional_permissions",
+          "10. UnifiedExecHandler вызывает intercept_apply_patch — если это apply_patch, release_process_id и вернуть ExecCommandToolOutput с raw_output=text, wall_time=0 →triggers SRC-0016/uc.sub/intercept-apply-patch-from-exec",
+          "11. UnifiedExecHandler эмитит OTEL-метрику TOOL_CALL_UNIFIED_EXEC_METRIC с тегом tty",
+          "12. UnifiedExecHandler вызывает manager.exec_command(ExecCommandRequest, context)"
+        ],
+        "extensions (Cockburn)": [
+          {"step": 3, "condition": "payload не Function", "action": "RespondToModel: 'unified_exec handler received unsupported payload'"},
+          {"step": 1, "condition": "turn.environment отсутствует", "action": "RespondToModel: 'unified exec is unavailable in this session'"},
+          {"step": 6, "condition": "login=Some(true) && !allow_login_shell", "action": "RespondToModel: 'login shell is disabled by config; omit `login` or set it to false.' + release_process_id"},
+          {"step": 8, "condition": "sandbox override вне OnRequest без preapproved", "action": "release_process_id + RespondToModel: 'approval policy is {policy}; reject command — you cannot ask for escalated permissions if the approval policy is {policy}'"},
+          {"step": 9, "condition": "normalize_and_validate_additional_permissions ошибка", "action": "release_process_id + RespondToModel с текстом ошибки"},
+          {"step": 12, "condition": "manager.exec_command ошибка", "action": "RespondToModel: 'exec_command failed for `{command_for_display}`: {err:?}'"}
+        ],
+        "edge_cases": [
+          {"condition": "args.workdir пустой string", "action": "filter отбрасывает его (None)"},
+          {"condition": "intercept_apply_patch возвращает Some(output)", "action": "process_id освобождается, ExecCommandToolOutput заполняется дефолтами (event_call_id='', wall_time=0, exit_code=None, process_id=None)"}
+        ],
+        "lifecycle": null,
+        "ux": null,
+        "result": "Команда выполнена в persistent процессе; клиенту возвращён ExecCommandToolOutput с raw_output, exit_code, process_id, session_command; OTEL-метрика записана"
+      }
+    },
+    {
+      "id": "SRC-0016/uc.sub/write-to-exec-process-stdin",
+      "src": "SRC-0016",
+      "composition": "use_case",
+      "level": "sub",
+      "strategic_domain": null,
+      "terms": {
+        "actor": "UnifiedExecHandler (write_stdin)",
+        "goal": "Отправить stdin-ввод в работающий exec-процесс и зафиксировать terminal interaction",
+        "steps": [
+          "1. UnifiedExecHandler парсит WriteStdinArgs { session_id: i32, chars, yield_time_ms=250 по умолчанию, max_output_tokens? }",
+          "2. UnifiedExecHandler вызывает manager.write_stdin(WriteStdinRequest{process_id=session_id, input=&chars, yield_time_ms, max_output_tokens})",
+          "3. UnifiedExecHandler эмитит session.send_event(EventMsg::TerminalInteraction(TerminalInteractionEvent{call_id=response.event_call_id, process_id=session_id.to_string(), stdin=chars}))",
+          "4. UnifiedExecHandler возвращает response (ExecCommandToolOutput)"
+        ],
+        "extensions (Cockburn)": [
+          {"step": 1, "condition": "tool_name не 'exec_command' и не 'write_stdin'", "action": "RespondToModel: 'unsupported unified exec function {other}'"},
+          {"step": 2, "condition": "manager.write_stdin ошибка", "action": "RespondToModel: 'write_stdin failed: {err}'"}
+        ],
+        "edge_cases": [],
+        "lifecycle": null,
+        "ux": null,
+        "result": "stdin передан процессу; клиент получил TerminalInteraction событие и обновлённый ExecCommandToolOutput"
+      }
+    },
+    {
+      "id": "SRC-0016/uc.sub/view-image-file",
+      "src": "SRC-0016",
+      "composition": "use_case",
+      "level": "sub",
+      "strategic_domain": null,
+      "terms": {
+        "actor": "ViewImageHandler",
+        "goal": "Загрузить изображение из файловой системы и вернуть data URL модели с поддержкой original detail",
+        "steps": [
+          "1. ViewImageHandler проверяет, что turn.model_info.input_modalities содержит Image",
+          "2. ViewImageHandler парсит ViewImageArgs { path, detail }",
+          "3. ViewImageHandler валидирует detail: None | Some('original') (любое другое — ошибка)",
+          "4. ViewImageHandler резолвит abs_path через turn.resolve_path(Some(path))",
+          "5. ViewImageHandler получает fs и строит file_system_sandbox_context только для remote environment",
+          "6. ViewImageHandler получает metadata и проверяет, что abs_path — файл",
+          "7. ViewImageHandler читает file_bytes через fs.read_file(abs_path, sandbox)",
+          "8. ViewImageHandler определяет can_request_original_detail(turn.model_info) и use_original_detail",
+          "9. ViewImageHandler выбирает image_mode: Original если use_original_detail, иначе ResizeToFit",
+          "10. ViewImageHandler вызывает load_for_prompt_bytes(abs_path, file_bytes, image_mode) и получает image.into_data_url",
+          "11. ViewImageHandler эмитит session.send_event(EventMsg::ViewImageToolCall(ViewImageToolCallEvent{call_id, path}))",
+          "12. ViewImageHandler возвращает ViewImageOutput { image_url, image_detail }"
+        ],
+        "extensions (Cockburn)": [
+          {"step": 1, "condition": "model не поддерживает Image modality", "action": "RespondToModel: 'view_image is not allowed because you do not support image inputs'"},
+          {"step": 2, "condition": "payload не Function", "action": "RespondToModel: 'view_image handler received unsupported payload'"},
+          {"step": 3, "condition": "detail = Some(other)", "action": "RespondToModel: 'view_image.detail only supports `original`; omit `detail` for default resized behavior, got `{detail}`'"},
+          {"step": 5, "condition": "turn.environment отсутствует", "action": "RespondToModel: 'view_image is unavailable in this session'"},
+          {"step": 6, "condition": "get_metadata ошибка", "action": "RespondToModel: 'unable to locate image at `{path}`: {error}'"},
+          {"step": 6, "condition": "metadata.is_file == false", "action": "RespondToModel: 'image path `{path}` is not a file'"},
+          {"step": 7, "condition": "read_file ошибка", "action": "RespondToModel: 'unable to read image at `{path}`: {error}'"},
+          {"step": 10, "condition": "load_for_prompt_bytes ошибка", "action": "RespondToModel: 'unable to process image at `{path}`: {error}'"}
+        ],
+        "edge_cases": [
+          {"condition": "detail=Original запрошен но can_request_original_detail=false", "action": "use_original_detail=false; image_mode=ResizeToFit; image_detail=None"}
+        ],
+        "lifecycle": null,
+        "ux": null,
+        "result": "Клиент получил ViewImageToolCall event с path; модели вернулся InputImage с data-url и detail (Some(Original) или None)"
+      }
+    }
+  ]
+}

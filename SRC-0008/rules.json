@@ -1,0 +1,634 @@
+{
+  "src": "SRC-0008",
+  "schema_version": "2.0",
+  "lens": "rule",
+  "compositions": [
+    {
+      "id": "SRC-0008/rule/agent-max-threads-limit",
+      "src": "SRC-0008",
+      "composition": "rule",
+      "terms": {
+        "condition": "Если config.agent_max_threads задан (Some(max_threads)): количество одновременно spawned sub-agents (AgentRegistry.total_count) не может превысить max_threads. При попытке резерва сверх лимита — CodexErr::AgentLimitReached{max_threads}, reservation не выдаётся, spawn не происходит. Если agent_max_threads = None — лимит не применяется, total_count инкрементится без проверки",
+        "numbers": [
+          {"value": "config.agent_max_threads", "kind": "threshold (Option<usize>, читается caller'ом при каждом reserve_spawn_slot)"}
+        ],
+        "formula": "try_increment_spawned: current = total_count.load(Acquire); while current < max_threads: CAS total_count (current → current+1, AcqRel/Acquire); return true. Если current >= max_threads → return false → AgentLimitReached",
+        "gwt": {
+          "given": "agent_max_threads=Some(max_threads), total_count=current",
+          "when": "reserve_spawn_slot вызван",
+          "then": "если current < max_threads → CAS инкремент и выдача SpawnReservation; иначе CodexErr::AgentLimitReached{max_threads}. Root thread при release_spawned_thread НЕ декрементит total_count (см. rule/root-thread-not-counted)"
+        }
+      }
+    },
+    {
+      "id": "SRC-0008/rule/root-thread-not-counted",
+      "src": "SRC-0008",
+      "composition": "rule",
+      "terms": {
+        "condition": "При release_spawned_thread(thread_id): удаление из agent_tree + декремент total_count выполняются только если у удаляемой metadata agent_path НЕ является root (!agent_path.as_ref().is_some_and(AgentPath::is_root)). Root thread присутствует в реестре (register_root_thread), но не занимает слот в agent_max_threads",
+        "numbers": [
+          {"value": 1, "kind": "количество декрементируемых единиц total_count при release (если не root)"}
+        ],
+        "formula": "removed_counted_agent = (metadata removed из agent_tree).is_some_and(|m| !m.agent_path.as_ref().is_some_and(AgentPath::is_root)); if removed_counted_agent: total_count.fetch_sub(1, AcqRel)",
+        "gwt": {
+          "given": "agent_tree содержит root metadata (agent_path=root) с thread_id=T_root и sub-agent metadata (agent_path=/root/worker) с thread_id=T_worker, total_count=1",
+          "when": "release_spawned_thread(T_root)",
+          "then": "agent_tree remove — True, но agent_path.is_root=True → removed_counted_agent=false → total_count остаётся 1. При release_spawned_thread(T_worker) → is_root=false → total_count=0"
+        }
+      }
+    },
+    {
+      "id": "SRC-0008/rule/agent-max-depth-disables-spawn-features",
+      "src": "SRC-0008",
+      "composition": "rule",
+      "terms": {
+        "condition": "При resume_single_agent_from_rollout: если session_source=ThreadSpawn{depth} и depth >= config.agent_max_depth, то у возобновлённого агента features.disable(SpawnCsv) и features.disable(Collab) — возобновлённый агент теряет возможность порождать дальнейшие sub-agents",
+        "numbers": [
+          {"value": "config.agent_max_depth", "kind": "threshold (i32, сравнение >= )"}
+        ],
+        "formula": "if let SessionSource::SubAgent(SubAgentSource::ThreadSpawn { depth, .. }) = &session_source && *depth >= config.agent_max_depth: config.features.disable(Feature::SpawnCsv); config.features.disable(Feature::Collab)",
+        "gwt": {
+          "given": "agent_max_depth=3, session_source=ThreadSpawn{depth=3, ...}",
+          "when": "resume_single_agent_from_rollout",
+          "then": "depth (3) >= agent_max_depth (3) → disable SpawnCsv и Collab; возобновлённый config теряет возможность spawn дальше. При depth=2, agent_max_depth=3 → disable не применяется"
+        }
+      }
+    },
+    {
+      "id": "SRC-0008/rule/thread-spawn-depth-increment",
+      "src": "SRC-0008",
+      "composition": "rule",
+      "terms": {
+        "condition": "next_thread_spawn_depth(session_source): следующая глубина в дереве = session_depth(session_source).saturating_add(1). session_depth = depth если session_source=ThreadSpawn{depth}, иначе 0 (включая SubAgent других типов и не-SubAgent)",
+        "numbers": [
+          {"value": 0, "kind": "базовая depth для root и не-ThreadSpawn source"},
+          {"value": 1, "kind": "приращение при каждом spawn"}
+        ],
+        "formula": "next_thread_spawn_depth(source) = session_depth(source).saturating_add(1); session_depth(ThreadSpawn{depth}) = depth; session_depth(_) = 0",
+        "gwt": {
+          "given": "session_source = SubAgent(ThreadSpawn{depth=2, ...})",
+          "when": "next_thread_spawn_depth вызван",
+          "then": "возвращает 3. Для root (не SubAgent::ThreadSpawn) → session_depth=0 → next=1. Saturating защищает от overflow i32::MAX"
+        }
+      }
+    },
+    {
+      "id": "SRC-0008/rule/exceeds-thread-spawn-depth-limit",
+      "src": "SRC-0008",
+      "composition": "rule",
+      "terms": {
+        "condition": "exceeds_thread_spawn_depth_limit(depth, max_depth) = depth > max_depth — простая строгая проверка превышения. Используется вне этого SRC (pub(crate) fn в registry.rs), в этом SRC видим только определение",
+        "numbers": [
+          {"value": "max_depth (параметр)", "kind": "threshold (i32)"}
+        ],
+        "formula": "exceeds_thread_spawn_depth_limit(depth, max_depth) = depth > max_depth",
+        "gwt": {
+          "given": "depth=4, max_depth=3",
+          "when": "exceeds_thread_spawn_depth_limit(4, 3)",
+          "then": "true (4 > 3). Для depth=3, max_depth=3 → false (не строгое превышение)"
+        }
+      }
+    },
+    {
+      "id": "SRC-0008/rule/nickname-ordinal-suffix",
+      "src": "SRC-0008",
+      "composition": "rule",
+      "terms": {
+        "condition": "format_agent_nickname(name, nickname_reset_count): при nickname_reset_count=0 возвращает name без изменений; при reset_count>0 → value=reset_count+1, суффикс по правилу ordinal: (value%100) in 11..=13 → 'th'; иначе (value%10): 1→'st', 2→'nd', 3→'rd', иначе 'th'. Результат = 'name the {value}{suffix}'",
+        "numbers": [
+          {"value": 0, "kind": "базовое значение reset_count — суффикс не добавляется"},
+          {"value": [11, 12, 13], "kind": "особый диапазон (value%100) всегда 'th'"},
+          {"value": 1, "kind": "value%10=1 → 'st'"},
+          {"value": 2, "kind": "value%10=2 → 'nd'"},
+          {"value": 3, "kind": "value%10=3 → 'rd'"}
+        ],
+        "formula": "suffix = match value%100 { 11..=13 => 'th', _ => match value%10 { 1=>'st', 2=>'nd', 3=>'rd', _=>'th' } }; result = format!('{name} the {value}{suffix}')",
+        "gwt": {
+          "given": "name='Nova', reset_count=1 → value=2",
+          "when": "format_agent_nickname('Nova', 1)",
+          "then": "2%100=2, 2%10=2 → 'nd' → 'Nova the 2nd'. При reset_count=0 → просто 'Nova'. При reset_count=10 → value=11 → 11%100=11 in 11..=13 → 'th' → 'Nova the 11th'. При reset_count=20 → value=21 → 21%100=21 not in range → 21%10=1 → 'st' → 'Nova the 21st'"
+        }
+      }
+    },
+    {
+      "id": "SRC-0008/rule/nickname-pool-reset",
+      "src": "SRC-0008",
+      "composition": "rule",
+      "terms": {
+        "condition": "В reserve_agent_nickname без preferred: available_names формируется как format_agent_nickname(name, reset_count) для каждого name, отфильтровано вычитанием used_agent_nicknames. Если available_names не пуст — random choose. Если пуст — used_agent_nicknames.clear(), nickname_reset_count+=1, инкремент метрики codex.multi_agent.nickname_pool_reset в codex_otel, затем random choose из names с новым reset_count",
+        "numbers": [
+          {"value": 1, "kind": "инкремент nickname_reset_count при исчерпании пула"},
+          {"value": 1, "kind": "инкремент метрики codex.multi_agent.nickname_pool_reset"}
+        ],
+        "formula": "available = names.filter(|n| !used.contains(format_agent_nickname(n, reset_count))); if available.is_empty(): used.clear(); reset_count += 1; metrics.counter('codex.multi_agent.nickname_pool_reset', 1); choose random from names with new reset_count; else: choose random from available",
+        "gwt": {
+          "given": "names=['Nova','Zephyr'], used={'Nova','Zephyr'}, reset_count=0",
+          "when": "reserve_agent_nickname(names, None)",
+          "then": "available пуст → used.clear, reset_count=1, метрика +1, выбор random из ['Nova the 2nd', 'Zephyr the 2nd']"
+        }
+      }
+    },
+    {
+      "id": "SRC-0008/rule/agent-path-uniqueness",
+      "src": "SRC-0008",
+      "composition": "rule",
+      "terms": {
+        "condition": "reserve_agent_path(agent_path): в active_agents.agent_tree.entry(agent_path.to_string()) — если Occupied (запись уже есть, placeholder или реальный agent) → CodexErr::UnsupportedOperation 'agent path `{path}` already exists'; если Vacant → вставить AgentMetadata{agent_path=Some, остальные=Default} как placeholder. Дубликаты путей запрещены",
+        "numbers": null,
+        "formula": null,
+        "gwt": {
+          "given": "agent_tree уже содержит запись по ключу '/root/worker' (любой источник — предыдущий reserve или commit)",
+          "when": "reserve_agent_path('/root/worker')",
+          "then": "CodexErr::UnsupportedOperation 'agent path `/root/worker` already exists'"
+        }
+      }
+    },
+    {
+      "id": "SRC-0008/rule/release-reserved-agent-path-only-if-placeholder",
+      "src": "SRC-0008",
+      "composition": "rule",
+      "terms": {
+        "condition": "release_reserved_agent_path(agent_path): удаление из agent_tree происходит только если запись существует И metadata.agent_id is None (т.е. это ещё placeholder, агент не был commited). Если agent_id уже проставлен — метаданные не трогаются",
+        "numbers": null,
+        "formula": "if active_agents.agent_tree.get(agent_path).is_some_and(|m| m.agent_id.is_none()): agent_tree.remove(agent_path)",
+        "gwt": {
+          "given": "agent_tree['/root/worker'] = AgentMetadata{agent_id=None, agent_path=Some('/root/worker'), ...} (placeholder)",
+          "when": "release_reserved_agent_path('/root/worker') (из Drop::drop на активной reservation)",
+          "then": "запись удаляется. Если agent_id=Some(T123) (уже committed после spawn) — запись НЕ удаляется, SpawnReservation.drop не трогает committed state"
+        }
+      }
+    },
+    {
+      "id": "SRC-0008/rule/register-root-lazy-at-depth-1",
+      "src": "SRC-0008",
+      "composition": "rule",
+      "terms": {
+        "condition": "В prepare_thread_spawn: если depth==1 — state.register_root_thread(parent_thread_id) вызывается перед spawn'ом ребёнка. register_root_thread использует agent_tree.entry(AgentPath::ROOT).or_insert_with — root регистрируется лениво при первом spawn sub-agent'а глубиной 1",
+        "numbers": [
+          {"value": 1, "kind": "пороговое значение depth, при котором выполняется lazy root registration"}
+        ],
+        "formula": "if depth == 1: state.register_root_thread(parent_thread_id); register_root_thread: active_agents.agent_tree.entry(AgentPath::ROOT.to_string()).or_insert_with(|| AgentMetadata{agent_id=Some(parent_thread_id), agent_path=Some(root()), ...})",
+        "gwt": {
+          "given": "depth=1, parent_thread_id=T_root, agent_tree без root записи",
+          "when": "prepare_thread_spawn(reservation, config, T_root, depth=1, ...)",
+          "then": "register_root_thread(T_root) вставляет root metadata. При depth=2 (internal spawn) — root не регистрируется здесь (должен быть уже зарегистрирован или зарегистрируется через register_session_root из agent_resolver)"
+        }
+      }
+    },
+    {
+      "id": "SRC-0008/rule/register-session-root-only-for-root",
+      "src": "SRC-0008",
+      "composition": "rule",
+      "terms": {
+        "condition": "AgentControl.register_session_root(thread_id, session_source): регистрация root_thread в AgentRegistry происходит только если thread_spawn_parent_thread_id(session_source) is None (т.е. текущая сессия — root, не sub-agent). Для sub-agent session_source = ThreadSpawn{parent_thread_id} — регистрация пропускается (root уже принадлежит другому контексту)",
+        "numbers": null,
+        "formula": "if thread_spawn_parent_thread_id(current_session_source).is_none(): self.state.register_root_thread(current_thread_id)",
+        "gwt": {
+          "given": "session_source = не SubAgent::ThreadSpawn (например, прямая root-сессия)",
+          "when": "AgentControl.register_session_root(T_root, &session_source)",
+          "then": "register_root_thread(T_root) вызывается → root добавляется в agent_tree. При session_source=ThreadSpawn{parent=T_root,...} → thread_spawn_parent_thread_id=Some(T_root) → регистрация не выполняется"
+        }
+      }
+    },
+    {
+      "id": "SRC-0008/rule/fork-retain-filter",
+      "src": "SRC-0008",
+      "composition": "rule",
+      "terms": {
+        "condition": "keep_forked_rollout_item(item): при форке rollout'а сохраняются только (а) Message items с role in {'system','developer','user'} — всегда; (б) role='assistant' — только если phase == Some(MessagePhase::FinalAnswer); (в) все non-ResponseItem (Compacted, EventMsg, SessionMeta, TurnContext) — всегда. Исключаются: Reasoning, LocalShellCall, FunctionCall, ToolSearchCall, FunctionCallOutput, CustomToolCall, CustomToolCallOutput, ToolSearchOutput, WebSearchCall, ImageGenerationCall, GhostSnapshot, Compaction, Other и assistant messages не-FinalAnswer phase",
+        "numbers": null,
+        "formula": "keep(item) = match item { RolloutItem::ResponseItem(Message{role, phase, ..}): match role { 'system'|'developer'|'user' => true, 'assistant' => phase == Some(FinalAnswer), _ => false }, ResponseItem::(Reasoning|LocalShellCall|FunctionCall|ToolSearchCall|FunctionCallOutput|CustomToolCall|CustomToolCallOutput|ToolSearchOutput|WebSearchCall|ImageGenerationCall|GhostSnapshot|Compaction|Other) => false, Compacted|EventMsg|SessionMeta|TurnContext => true }",
+        "gwt": {
+          "given": "rollout = [Message{role=user, ...}, FunctionCall{...}, Message{role=assistant, phase=None}, Message{role=assistant, phase=Some(FinalAnswer)}, EventMsg(...)]",
+          "when": "items.retain(keep_forked_rollout_item)",
+          "then": "остаётся [Message{role=user}, Message{role=assistant, phase=FinalAnswer}, EventMsg(...)] — intermediate assistant phases и FunctionCall отфильтрованы"
+        }
+      }
+    },
+    {
+      "id": "SRC-0008/rule/fork-requires-parent-call-id",
+      "src": "SRC-0008",
+      "composition": "rule",
+      "terms": {
+        "condition": "spawn_forked_thread валидирует три обязательных условия перед форком: (1) options.fork_parent_spawn_call_id.is_some() иначе CodexErr::Fatal 'spawn_agent fork requires a parent spawn call id'; (2) options.fork_mode.is_some() иначе CodexErr::Fatal 'spawn_agent fork requires a fork mode'; (3) session_source — SubAgent::ThreadSpawn иначе CodexErr::Fatal 'spawn_agent fork requires a thread-spawn session source'. Все три — fatal-level ошибки (не recoverable)",
+        "numbers": null,
+        "formula": null,
+        "gwt": {
+          "given": "options = SpawnAgentOptions{fork_parent_spawn_call_id=None, fork_mode=Some(FullHistory)}, session_source = ThreadSpawn{...}",
+          "when": "spawn_forked_thread вызван (только когда fork_mode уже Some в spawn_agent_internal)",
+          "then": "CodexErr::Fatal 'spawn_agent fork requires a parent spawn call id'"
+        }
+      }
+    },
+    {
+      "id": "SRC-0008/rule/fork-last-n-turns-truncation",
+      "src": "SRC-0008",
+      "composition": "rule",
+      "terms": {
+        "condition": "При fork_mode=LastNTurns(n): forked_rollout_items обрезается через truncate_rollout_to_last_n_fork_turns(items, n) ДО применения keep_forked_rollout_item фильтра. При fork_mode=FullHistory — truncate не вызывается. Значение n — параметр fork_mode, в SRC не ограничено",
+        "numbers": [
+          {"value": "n (параметр LastNTurns(usize))", "kind": "threshold — количество последних turn'ов, попадающих в fork"}
+        ],
+        "formula": "if let SpawnAgentForkMode::LastNTurns(last_n_turns) = fork_mode: forked_rollout_items = truncate_rollout_to_last_n_fork_turns(&forked_rollout_items, *last_n_turns); forked_rollout_items.retain(keep_forked_rollout_item)",
+        "gwt": {
+          "given": "fork_mode=LastNTurns(3), rollout с 5 turn'ами",
+          "when": "spawn_forked_thread подготавливает items",
+          "then": "сначала truncate_rollout_to_last_n_fork_turns урезает до последних 3 turn'ов, затем retain keep_forked_rollout_item фильтрует reasoning/tool calls внутри. При FullHistory — truncate пропускается, весь rollout фильтруется"
+        }
+      }
+    },
+    {
+      "id": "SRC-0008/rule/is-final-non-final-statuses",
+      "src": "SRC-0008",
+      "composition": "rule",
+      "terms": {
+        "condition": "is_final(status) возвращает !matches(status, PendingInit | Running | Interrupted). Нефинальные = PendingInit, Running, Interrupted. Все остальные (Completed, Errored, Shutdown, NotFound) — финальные. Interrupted считается НЕ финальным — агент может быть продолжен",
+        "numbers": null,
+        "formula": "is_final(status) = !matches!(status, AgentStatus::PendingInit | AgentStatus::Running | AgentStatus::Interrupted)",
+        "gwt": {
+          "given": "status=Interrupted",
+          "when": "is_final(Interrupted)",
+          "then": "false (не финальный). Для Completed, Errored, Shutdown, NotFound → true. Completion watcher в maybe_start_completion_watcher ждёт is_final=true"
+        }
+      }
+    },
+    {
+      "id": "SRC-0008/rule/agent-status-from-event-mapping",
+      "src": "SRC-0008",
+      "composition": "rule",
+      "terms": {
+        "condition": "agent_status_from_event(msg): TurnStarted → Some(Running); TurnComplete(ev) → Some(Completed(ev.last_agent_message)); TurnAborted(ev) с reason=Interrupted → Some(Interrupted); TurnAborted(ev) с другим reason → Some(Errored(format!('{:?}', ev.reason))); Error(ev) → Some(Errored(ev.message)); ShutdownComplete → Some(Shutdown); иные → None (статус не меняется)",
+        "numbers": null,
+        "formula": "match msg { TurnStarted(_) => Some(Running), TurnComplete(ev) => Some(Completed(ev.last_agent_message.clone())), TurnAborted(ev) => match ev.reason { Interrupted => Some(Interrupted), _ => Some(Errored(format!('{:?}', ev.reason))) }, Error(ev) => Some(Errored(ev.message.clone())), ShutdownComplete => Some(Shutdown), _ => None }",
+        "gwt": {
+          "given": "EventMsg::TurnAborted(ev с reason=TimeLimit)",
+          "when": "agent_status_from_event(msg)",
+          "then": "Some(Errored('TimeLimit')) — debug-формат (не форматированный как message). Для TurnAborted с reason=Interrupted → Some(Interrupted). Для EventMsg другого типа (не в match) → None"
+        }
+      }
+    },
+    {
+      "id": "SRC-0008/rule/role-preservation-policy",
+      "src": "SRC-0008",
+      "composition": "rule",
+      "terms": {
+        "condition": "preservation_policy(config, role_layer_toml): preserve_current_profile = !role_selects_provider && !role_selects_profile. preserve_current_provider = preserve_current_profile && !role_updates_active_profile_provider. Где: role_selects_provider = role_layer_toml.get('model_provider').is_some(); role_selects_profile = role_layer_toml.get('profile').is_some(); role_updates_active_profile_provider = role_layer_toml.get('profiles').as_table.get(active_profile).as_table.contains_key('model_provider').unwrap_or(false)",
+        "numbers": null,
+        "formula": "preserve_current_profile = !role_selects_provider AND !role_selects_profile; preserve_current_provider = preserve_current_profile AND !role_updates_active_profile_provider",
+        "gwt": {
+          "given": "role_layer_toml без 'model_provider' и 'profile' на верхнем уровне; config.active_profile='prod'; role_layer_toml.profiles.prod содержит 'model_provider'",
+          "when": "preservation_policy(config, role_layer_toml)",
+          "then": "role_selects_provider=false, role_selects_profile=false → preserve_current_profile=true; role_updates_active_profile_provider=true → preserve_current_provider=false. Результат: (true, false) — активный профайл оставляем, но провайдер переопределяется ролью"
+        }
+      }
+    },
+    {
+      "id": "SRC-0008/rule/role-layer-insert-order",
+      "src": "SRC-0008",
+      "composition": "rule",
+      "terms": {
+        "condition": "Вставка role_layer и optional resolved_profile_layer в ConfigLayerStack: insert_layer использует layers.partition_point(|existing| existing.name <= layer.name) и вставляет по возвращённому индексу. Оба слоя получают source=ConfigLayerSource::SessionFlags (высокий precedence, перекрывает persisted config). Порядок вставки: сначала resolved_profile_layer (если есть), потом role_layer",
+        "numbers": null,
+        "formula": "insertion_index = layers.partition_point(|existing| existing.name <= layer.name); layers.insert(insertion_index, layer). role_layer = ConfigLayerEntry::new(ConfigLayerSource::SessionFlags, role_layer_toml)",
+        "gwt": {
+          "given": "layers отсортированы по name; вставляется role_layer с name='X'",
+          "when": "insert_layer(layers, role_layer)",
+          "then": "role_layer помещается после всех existing с name <= 'X' и перед первым с name > 'X' — отсортированный порядок сохраняется. source=SessionFlags обеспечивает override над persisted config"
+        }
+      }
+    },
+    {
+      "id": "SRC-0008/rule/role-empty-toml-no-op",
+      "src": "SRC-0008",
+      "composition": "rule",
+      "terms": {
+        "condition": "apply_role_to_config_inner: если role.config_file is None — return Ok(()) без изменений (роль без слоя, напр. default). Если role_layer_toml.as_table().is_some_and(is_empty) — return Ok(()) без rebuild config. Эти два условия освобождают от дорогостоящего rebuild когда роль не добавляет полезных данных",
+        "numbers": null,
+        "formula": null,
+        "gwt": {
+          "given": "role = AgentRoleConfig{config_file=None, ...} (как default) ИЛИ role.config_file содержит TOML с пустой таблицей",
+          "when": "apply_role_to_config_inner вызван",
+          "then": "Ok(()) без вызова reload::build_next_config — config не пересобирается"
+        }
+      }
+    },
+    {
+      "id": "SRC-0008/rule/role-error-returns-generic-message",
+      "src": "SRC-0008",
+      "composition": "rule",
+      "terms": {
+        "condition": "apply_role_to_config: при неудаче apply_role_to_config_inner — tracing::warn с подробной ошибкой + возврат caller'у AGENT_TYPE_UNAVAILABLE_ERROR ('agent type is currently not available'). Подробности в warn-логе, caller видит только generic message. При 'unknown agent_type' (role не найден в user-defined и built-in) — caller получает 'unknown agent_type '{role_name}''",
+        "numbers": null,
+        "formula": "apply_role_to_config_inner(...).await.map_err(|err| { warn!('failed to apply role to config: {err}'); AGENT_TYPE_UNAVAILABLE_ERROR.to_string() })",
+        "gwt": {
+          "given": "role.config_file='custom.toml' не существует на диске (tokio::fs::read_to_string упал)",
+          "when": "apply_role_to_config(config, Some('custom'))",
+          "then": "внутренняя anyhow ошибка логируется через warn, caller получает Err('agent type is currently not available'). Для unknown role_name='foo' — Err('unknown agent_type 'foo'') сразу без warn"
+        }
+      }
+    },
+    {
+      "id": "SRC-0008/rule/resolve-role-config-user-precedence",
+      "src": "SRC-0008",
+      "composition": "rule",
+      "terms": {
+        "condition": "resolve_role_config(config, role_name): сначала ищется в config.agent_roles (user-defined), затем в built_in::configs() (default/explorer/worker). User-defined роли перекрывают built-in при совпадении имени",
+        "numbers": null,
+        "formula": "config.agent_roles.get(role_name).or_else(|| built_in::configs().get(role_name))",
+        "gwt": {
+          "given": "config.agent_roles = {'explorer': user_custom_explorer}; role_name='explorer'",
+          "when": "resolve_role_config(config, 'explorer')",
+          "then": "возвращает user_custom_explorer (user-defined перекрывает built-in). Для role_name='worker' (нет в user-defined) → built_in::configs()['worker']. Для role_name='unknown' (нет нигде) → None"
+        }
+      }
+    },
+    {
+      "id": "SRC-0008/rule/spawn-tool-role-dedup",
+      "src": "SRC-0008",
+      "composition": "rule",
+      "terms": {
+        "condition": "build_from_configs(built_in_roles, user_defined_roles) объединяет роли: сначала user_defined в BTreeSet seen, потом built_in (BTreeMap итерируется в отсортированном порядке). При совпадении имени выводится только user_defined (seen.insert вернёт false для дубликата built-in)",
+        "numbers": null,
+        "formula": "let mut seen = BTreeSet::new(); for (name, declaration) in user_defined_roles: if seen.insert(name) { formatted.push(format_role(name, declaration)) }; for (name, declaration) in built_in_roles: if seen.insert(name) { formatted.push(format_role(name, declaration)) }",
+        "gwt": {
+          "given": "user_defined = {'worker': user_worker}, built_in = {'default': ..., 'explorer': ..., 'worker': built_in_worker}",
+          "when": "build_from_configs",
+          "then": "выводится сначала user_defined worker; при попытке вставить built_in worker — seen уже содержит 'worker', пропуск. Итог: user_worker, default, explorer (в таком порядке)"
+        }
+      }
+    },
+    {
+      "id": "SRC-0008/rule/role-tool-locked-settings-note",
+      "src": "SRC-0008",
+      "composition": "rule",
+      "terms": {
+        "condition": "format_role в spawn_tool_spec::build при наличии description и доступного content config_file'а парсит его как TOML и извлекает 'model' и 'model_reasoning_effort'. Добавляет locked_settings_note по 4 вариантам: оба set → 'This role's model is set to `{model}` and its reasoning effort is set to `{reasoning_effort}`. These settings cannot be changed.'; только model → 'This role's model is set to `{model}` and cannot be changed.'; только reasoning_effort → 'This role's reasoning effort is set to `{reasoning_effort}` and cannot be changed.'; ни то ни другое → пустая строка. Если config_file_contents недоступен (built-in path не матчится И file read упал) → пустая строка",
+        "numbers": null,
+        "formula": "match (model, reasoning_effort) { (Some(m), Some(r)) => 'model set to `{m}`, reasoning effort set to `{r}`'; (Some(m), None) => 'model set to `{m}`'; (None, Some(r)) => 'reasoning effort set to `{r}`'; (None, None) => '' }",
+        "gwt": {
+          "given": "explorer.toml содержит 'model = \"o1\"' и 'model_reasoning_effort = \"high\"'",
+          "when": "format_role('explorer', declaration)",
+          "then": "к description добавляется 'This role's model is set to `o1` and its reasoning effort is set to `high`. These settings cannot be changed.'"
+        }
+      }
+    },
+    {
+      "id": "SRC-0008/rule/mailbox-monotonic-sequence",
+      "src": "SRC-0008",
+      "composition": "rule",
+      "terms": {
+        "condition": "Mailbox.send присваивает каждому сообщению монотонно возрастающий sequence-номер. Первый send возвращает 1, второй — 2, и т.д. Реализовано через AtomicU64::fetch_add(1, Ordering::Relaxed) + 1. После отправки в mpsc канал — seq_tx.send_replace(seq) публикует текущее значение подписчикам watch-канала",
+        "numbers": [
+          {"value": 0, "kind": "начальное значение next_seq (AtomicU64::new(0)) и watch seq (watch::channel(0))"},
+          {"value": 1, "kind": "приращение на каждый send (fetch_add(1, Relaxed) + 1)"}
+        ],
+        "formula": "seq = next_seq.fetch_add(1, Ordering::Relaxed) + 1; let _ = tx.send(communication); seq_tx.send_replace(seq); return seq",
+        "gwt": {
+          "given": "свежий Mailbox (next_seq=0)",
+          "when": "mailbox.send(mail_A); mailbox.send(mail_B)",
+          "then": "первый send возвращает 1 (fetch_add вернул 0, +1), второй — 2. watch подписчик увидит 1, затем 2. Тест mailbox_assigns_monotonic_sequence_numbers подтверждает: seq_a=1, seq_b=2, последнее значение в seq_rx = seq_b"
+        }
+      }
+    },
+    {
+      "id": "SRC-0008/rule/mailbox-fifo-delivery",
+      "src": "SRC-0008",
+      "composition": "rule",
+      "terms": {
+        "condition": "MailboxReceiver.drain возвращает pending_mails в порядке доставки (FIFO). sync_pending_mails выгребает из mpsc через try_recv и push_back в VecDeque; drain забирает через drain(..).collect. После drain — pending_mails пуст, has_pending=false",
+        "numbers": null,
+        "formula": "sync_pending_mails: while let Ok(mail) = rx.try_recv(): pending_mails.push_back(mail); drain: sync_pending_mails(); pending_mails.drain(..).collect()",
+        "gwt": {
+          "given": "send mail_one, затем mail_two",
+          "when": "receiver.drain()",
+          "then": "vec![mail_one, mail_two] (порядок отправки сохранён). has_pending()=false. Тест mailbox_drains_in_delivery_order подтверждает"
+        }
+      }
+    },
+    {
+      "id": "SRC-0008/rule/mailbox-trigger-turn-detection",
+      "src": "SRC-0008",
+      "composition": "rule",
+      "terms": {
+        "condition": "has_pending_trigger_turn() возвращает true если в pending_mails есть хотя бы одно сообщение с trigger_turn=true. Используется для пробуждения агента, когда в очереди есть сообщения, требующие выполнения нового turn",
+        "numbers": null,
+        "formula": "sync_pending_mails(); pending_mails.iter().any(|mail| mail.trigger_turn)",
+        "gwt": {
+          "given": "в mailbox отправлено сообщение с trigger_turn=false",
+          "when": "has_pending_trigger_turn()",
+          "then": "false. После send сообщения с trigger_turn=true → true. Тест mailbox_tracks_pending_trigger_turn_mail подтверждает"
+        }
+      }
+    },
+    {
+      "id": "SRC-0008/rule/agent-reference-resolution",
+      "src": "SRC-0008",
+      "composition": "rule",
+      "terms": {
+        "condition": "resolve_agent_reference(current_thread_id, current_session_source, agent_reference): current_agent_path = session_source.get_agent_path().unwrap_or(root()); abs_path = current_agent_path.resolve(agent_reference) (может вернуть ошибку → UnsupportedOperation). Lookup: state.agent_id_for_path(&abs_path) — если Some → Ok(thread_id); если None → UnsupportedOperation 'live agent path `{path}` not found'",
+        "numbers": null,
+        "formula": "abs_path = current_session_source.get_agent_path().unwrap_or(AgentPath::root()).resolve(agent_reference)?; match self.state.agent_id_for_path(&abs_path) { Some(id) => Ok(id), None => Err(UnsupportedOperation('live agent path `{path}` not found')) }",
+        "gwt": {
+          "given": "agent_tree содержит /root/worker → T_worker; current_agent_path=/root; agent_reference='worker'",
+          "when": "resolve_agent_reference(conv_id, session_source, 'worker')",
+          "then": "resolve('worker') = /root/worker → agent_id_for_path → Some(T_worker) → Ok(T_worker). Для agent_reference='missing' (нет в tree) → Err(UnsupportedOperation('live agent path `/root/missing` not found'))"
+        }
+      }
+    },
+    {
+      "id": "SRC-0008/rule/agent-matches-prefix",
+      "src": "SRC-0008",
+      "composition": "rule",
+      "terms": {
+        "condition": "agent_matches_prefix(agent_path, prefix): если prefix.is_root() — return true (root-prefix матчит всех). Иначе: agent_path.is_some AND (agent_path == prefix ИЛИ agent_path.as_str().strip_prefix(prefix.as_str()).is_some_and(|suffix| suffix.starts_with('/'))). То есть агент принадлежит поддереву prefix если его путь равен prefix или начинается с prefix/",
+        "numbers": null,
+        "formula": "if prefix.is_root() return true; agent_path.is_some_and(|ap| ap == prefix || ap.as_str().strip_prefix(prefix.as_str()).is_some_and(|suffix| suffix.starts_with('/')))",
+        "gwt": {
+          "given": "prefix='/root/team', agent_path='/root/team/worker'",
+          "when": "agent_matches_prefix(Some(&agent_path), &prefix)",
+          "then": "strip_prefix → '/worker', starts_with('/')=true → true. Для agent_path='/root/teamspirit' → strip_prefix='spirit', starts_with('/')=false → false (префикс-строгая проверка границы компонента). Для agent_path=prefix → ap==prefix → true. Для None agent_path → false"
+        }
+      }
+    },
+    {
+      "id": "SRC-0008/rule/list-agents-sort-order",
+      "src": "SRC-0008",
+      "composition": "rule",
+      "terms": {
+        "condition": "list_agents сортирует live_agents сначала по agent_path (строковое сравнение, None/отсутствие пути трактуется как empty string через as_deref.unwrap_or_default), потом при равенстве — по agent_id.to_string() (None → empty string). Root thread (если включён фильтром) вставляется первым элементом (до отсортированного списка)",
+        "numbers": null,
+        "formula": "live_agents.sort_by(|l,r| l.agent_path.as_deref().unwrap_or_default().cmp(r.agent_path.as_deref().unwrap_or_default()).then_with(|| l.agent_id.map(to_string).unwrap_or_default().cmp(&r.agent_id.map(to_string).unwrap_or_default())))",
+        "gwt": {
+          "given": "live_agents = [{path=/root/c, id=T3}, {path=/root/a, id=T1}, {path=/root/a, id=T2}]",
+          "when": "sort_by как выше",
+          "then": "порядок: {path=/root/a, id=T1}, {path=/root/a, id=T2}, {path=/root/c, id=T3} (сначала лексикографически по path, при равенстве — по string-представлению thread_id)"
+        }
+      }
+    },
+    {
+      "id": "SRC-0008/rule/handle-internal-agent-died-cleanup",
+      "src": "SRC-0008",
+      "composition": "rule",
+      "terms": {
+        "condition": "handle_thread_request_result: если переданный result — Err(CodexErr::InternalAgentDied), выполняется автоматическая очистка: state.remove_thread(&agent_id) + self.state.release_spawned_thread(agent_id). Для любых других результатов — просто возврат result без изменений",
+        "numbers": null,
+        "formula": "if matches!(result, Err(CodexErr::InternalAgentDied)): let _ = state.remove_thread(&agent_id).await; self.state.release_spawned_thread(agent_id); return result",
+        "gwt": {
+          "given": "send_input(T_worker, op) → ThreadManagerState.send_op вернул Err(InternalAgentDied)",
+          "when": "handle_thread_request_result обрабатывает результат",
+          "then": "remove_thread(T_worker) + release_spawned_thread(T_worker) → AgentRegistry автоматически очищен, total_count декрементится (если не root), результат Err(InternalAgentDied) возвращается caller'у без изменений"
+        }
+      }
+    },
+    {
+      "id": "SRC-0008/rule/shutdown-live-agent-idempotent-on-shutdown-status",
+      "src": "SRC-0008",
+      "composition": "rule",
+      "terms": {
+        "condition": "shutdown_live_agent: если thread в ThreadManagerState найден и его agent_status уже Shutdown — возвращается Ok(String::new()) без отправки Op::Shutdown. Иначе — flush_rollout + send Op::Shutdown. В обоих случаях финально: state.remove_thread + release_spawned_thread",
+        "numbers": null,
+        "formula": "if let Ok(thread) = state.get_thread(agent_id).await: { ensure_rollout_materialized; flush_rollout; if matches!(thread.agent_status().await, AgentStatus::Shutdown) { Ok('') } else { state.send_op(agent_id, Op::Shutdown{}).await } } else { state.send_op(agent_id, Op::Shutdown{}).await }; state.remove_thread; release_spawned_thread",
+        "gwt": {
+          "given": "thread T_worker есть в state, agent_status=Shutdown",
+          "when": "shutdown_live_agent(T_worker)",
+          "then": "flush_rollout выполняется, но Op::Shutdown НЕ шлётся, Ok(''). Затем remove_thread и release_spawned_thread всё равно вызываются. Для thread не в state — Op::Shutdown шлётся напрямую через send_op (без flush)"
+        }
+      }
+    },
+    {
+      "id": "SRC-0008/rule/shutdown-agent-tree-descendant-error-policy",
+      "src": "SRC-0008",
+      "composition": "rule",
+      "terms": {
+        "condition": "shutdown_agent_tree: после shutdown корня (result сохраняется) для каждого descendant_id — shutdown_live_agent. Ошибки ThreadNotFound и InternalAgentDied игнорируются (агент уже мёртв/отсутствует — это норма при обходе). Любая другая ошибка — пробрасывается (return Err), прерывая оставшийся обход",
+        "numbers": null,
+        "formula": "for descendant_id in descendants: match shutdown_live_agent(descendant_id).await { Ok(_) | Err(ThreadNotFound(_)) | Err(InternalAgentDied) => {}, Err(err) => return Err(err) }; return result (от корня)",
+        "gwt": {
+          "given": "корень T_root успешно shutdown, descendants [T_a, T_b, T_c]. shutdown T_a вернул Ok; T_b вернул ThreadNotFound",
+          "when": "shutdown_agent_tree продолжает",
+          "then": "T_a OK игнорируется, T_b ThreadNotFound игнорируется, T_c пытается shutdown. Если T_c вернул UnsupportedOperation → return Err(UnsupportedOperation), T_c не догружается, функция возвращает эту ошибку (а не result корня)"
+        }
+      }
+    },
+    {
+      "id": "SRC-0008/rule/inherited-exec-policy-condition",
+      "src": "SRC-0008",
+      "composition": "rule",
+      "terms": {
+        "condition": "inherited_exec_policy_for_source возвращает Some(Arc<ExecPolicyManager>) только если: (1) session_source = SubAgent::ThreadSpawn; (2) parent_thread найден в state; (3) crate::exec_policy::child_uses_parent_exec_policy(&parent_config, child_config) == true. Иначе None — child использует свою собственную exec policy",
+        "numbers": null,
+        "formula": "let Some(ThreadSpawn{parent_thread_id, ..}) = session_source else return None; let parent_thread = state.get_thread(*parent_thread_id).await.ok()?; let parent_config = parent_thread.codex.session.get_config().await; if !child_uses_parent_exec_policy(&parent_config, child_config): return None; Some(Arc::clone(&parent_thread.codex.session.services.exec_policy))",
+        "gwt": {
+          "given": "session_source=ThreadSpawn, parent thread в state, child_uses_parent_exec_policy(parent, child)=true",
+          "when": "inherited_exec_policy_for_source(state, Some(&session_source), &child_config)",
+          "then": "Some(Arc<ExecPolicyManager> parent'а) — child наследует. При любом из условий = false → None"
+        }
+      }
+    },
+    {
+      "id": "SRC-0008/rule/inherited-shell-snapshot-condition",
+      "src": "SRC-0008",
+      "composition": "rule",
+      "terms": {
+        "condition": "inherited_shell_snapshot_for_source возвращает shell_snapshot родителя только если session_source=SubAgent::ThreadSpawn и parent thread доступен в state. Для root spawn (session_source=None или не ThreadSpawn) — None. Наследование берётся из parent_thread.codex.session.user_shell().shell_snapshot()",
+        "numbers": null,
+        "formula": "let Some(ThreadSpawn{parent_thread_id, ..}) = session_source else return None; let parent_thread = state.get_thread(*parent_thread_id).await.ok()?; parent_thread.codex.session.user_shell().shell_snapshot()",
+        "gwt": {
+          "given": "session_source=ThreadSpawn{parent=T_root,...}, parent thread существует, user_shell().shell_snapshot() вернул Some(snap)",
+          "when": "inherited_shell_snapshot_for_source",
+          "then": "Some(Arc::clone(snap)) — child spawned thread получит родительский shell snapshot. Для session_source=None → None сразу"
+        }
+      }
+    },
+    {
+      "id": "SRC-0008/rule/subagent-analytics-only-with-feature",
+      "src": "SRC-0008",
+      "composition": "rule",
+      "terms": {
+        "condition": "emit_subagent_session_started вызывается в spawn_agent_internal только если: (1) notification_source = SubAgent::ThreadSpawn (т.е. создаётся именно sub-agent); (2) new_thread.thread.enabled(Feature::GeneralAnalytics) == true. Если parent_thread metadata не удалось загрузить — продолжить с пустым AppServerClientMetadata (client_name=None, client_version=None) и warn-логом",
+        "numbers": null,
+        "formula": "if let Some(SubAgent(ThreadSpawn{parent_thread_id, ..} @ subagent_source)) = notification_source.as_ref() && new_thread.thread.enabled(Feature::GeneralAnalytics): { client_metadata = match state.get_thread(*parent_thread_id).await { Ok(parent) => parent.codex.session.app_server_client_metadata().await, Err(err) => { warn!(...); AppServerClientMetadata{ client_name: None, client_version: None } } }; emit_subagent_session_started(...)}",
+        "gwt": {
+          "given": "session_source=ThreadSpawn, Feature::GeneralAnalytics включен, parent thread недоступен (state.get_thread упал)",
+          "when": "spawn_agent_internal после создания thread",
+          "then": "warn 'skipping subagent thread analytics: failed to load parent thread metadata', client_metadata = пустая, emit_subagent_session_started всё равно вызывается. При Feature::GeneralAnalytics выключен — emit пропускается целиком"
+        }
+      }
+    },
+    {
+      "id": "SRC-0008/rule/completion-watcher-feature-gated",
+      "src": "SRC-0008",
+      "composition": "rule",
+      "terms": {
+        "condition": "maybe_start_completion_watcher запускается в spawn_agent_internal и resume_single_agent_from_rollout только если new_thread.thread.enabled(Feature::MultiAgentV2) == false. При MultiAgentV2 включён — watcher не запускается (v2 flow не требует legacy inject_user_message_without_turn механизм). Внутри watcher'а также есть ветвление: если MultiAgentV2 включён у child thread И child_agent_path задан — использовать send_inter_agent_communication; иначе legacy inject_user_message_without_turn",
+        "numbers": null,
+        "formula": "// в spawn_agent_internal: if !new_thread.thread.enabled(Feature::MultiAgentV2): maybe_start_completion_watcher(...) // в watcher'е: if child_agent_path.is_some() && child_thread.map(|t| t.enabled(MultiAgentV2)).unwrap_or(true): send_inter_agent_communication; else: parent_thread.inject_user_message_without_turn(message)",
+        "gwt": {
+          "given": "spawn thread с Feature::MultiAgentV2 выключен",
+          "when": "spawn_agent_internal после commit и persist edge",
+          "then": "maybe_start_completion_watcher стартует tokio::spawn; в watcher'е когда child достигает final status: если child_thread.enabled(MultiAgentV2) или None → send_inter_agent_communication; иначе → inject_user_message_without_turn в parent thread. При Feature::MultiAgentV2 включен на spawn → watcher не запускается вовсе"
+        }
+      }
+    },
+    {
+      "id": "SRC-0008/rule/completion-watcher-notify-parent-path",
+      "src": "SRC-0008",
+      "composition": "rule",
+      "terms": {
+        "condition": "Внутри maybe_start_completion_watcher: parent_agent_path вычисляется как rsplit_once('/') от child_agent_path.as_str() → AgentPath::try_from(parent). Если rsplit_once вернул None или try_from упал — return без уведомления. Сформированный InterAgentCommunication имеет trigger_turn=false (уведомление не будит parent для немедленного turn'а)",
+        "numbers": null,
+        "formula": "let Some(parent_agent_path) = child_agent_path.as_str().rsplit_once('/').and_then(|(parent, _)| AgentPath::try_from(parent).ok()) else return; let communication = InterAgentCommunication::new(child_agent_path, parent_agent_path, Vec::new(), message, /*trigger_turn*/ false)",
+        "gwt": {
+          "given": "child_agent_path='/root/team/worker', final status=Completed('done')",
+          "when": "watcher формирует communication",
+          "then": "rsplit_once('/')=('/root/team', 'worker'), AgentPath::try_from('/root/team')=Ok → parent='/root/team', InterAgentCommunication{author=/root/team/worker, recipient=/root/team, trigger_turn=false}. Для child_agent_path='/root' (нет '/' для split) — rsplit_once=Some(('',root)), AgentPath::try_from('')=возможно Err → return. Для child_agent_path без '/' (не root-based) — None → return"
+        }
+      }
+    },
+    {
+      "id": "SRC-0008/rule/render-input-preview-format",
+      "src": "SRC-0008",
+      "composition": "rule",
+      "terms": {
+        "condition": "render_input_preview(Op): (a) UserInput{items} — для каждого item: Text{text}→text.clone(); Image→'[image]'; LocalImage{path}→'[local_image:{path}]'; Skill{name,path}→'[skill:${name}]({path})'; Mention{name,path}→'[mention:${name}]({path})'; прочие UserInput варианты→'[input]'; все items объединяются через '\\n'. (b) InterAgentCommunication{communication}→communication.content.clone(). (c) любая другая Op→''",
+        "numbers": null,
+        "formula": "match op { UserInput{items,..} => items.iter().map(item_preview).collect::<Vec<_>>().join('\\n'), InterAgentCommunication{communication} => communication.content.clone(), _ => String::new() }",
+        "gwt": {
+          "given": "Op::UserInput{items=[Text{text='hello'}, Image{...}, Skill{name='review', path='/skills/review.md'}]}",
+          "when": "render_input_preview",
+          "then": "'hello\\n[image]\\n[skill:$review](/skills/review.md)'. Для Op::Interrupt → '' (пустая строка). Для Op::InterAgentCommunication{communication.content='hi'} → 'hi'"
+        }
+      }
+    },
+    {
+      "id": "SRC-0008/rule/default-role-name-fallback",
+      "src": "SRC-0008",
+      "composition": "rule",
+      "terms": {
+        "condition": "apply_role_to_config и agent_nickname_candidates: если role_name=None (caller не указал agent_type) — используется DEFAULT_ROLE_NAME = 'default'. Сообщение в spawn_tool_spec::build: 'Optional type name for the new agent. If omitted, `default` is used.'",
+        "numbers": null,
+        "formula": "let role_name = role_name.unwrap_or(DEFAULT_ROLE_NAME); // DEFAULT_ROLE_NAME = 'default'",
+        "gwt": {
+          "given": "role_name=None",
+          "when": "apply_role_to_config(config, None)",
+          "then": "используется 'default' как role_name → resolve_role_config('default') → built-in default AgentRoleConfig{description='Default agent.', config_file=None, nickname_candidates=None} → config_file=None → Ok(()) без изменений config"
+        }
+      }
+    },
+    {
+      "id": "SRC-0008/rule/register-spawned-thread-key",
+      "src": "SRC-0008",
+      "composition": "rule",
+      "terms": {
+        "condition": "register_spawned_thread: ключ в agent_tree = agent_metadata.agent_path.to_string() если задан, иначе 'thread:{thread_id}'. Если agent_metadata.agent_id is None — регистрация пропускается (return). Если agent_nickname задан — инсертится в used_agent_nicknames",
+        "numbers": null,
+        "formula": "let Some(thread_id) = agent_metadata.agent_id else return; let key = agent_metadata.agent_path.as_ref().map(ToString::to_string).unwrap_or_else(|| format!('thread:{thread_id}')); if let Some(nn) = agent_metadata.agent_nickname.clone(): used_agent_nicknames.insert(nn); agent_tree.insert(key, agent_metadata)",
+        "gwt": {
+          "given": "agent_metadata={agent_id=Some(T1), agent_path=None, agent_nickname=Some('Nova'), ...}",
+          "when": "register_spawned_thread",
+          "then": "key='thread:T1', agent_tree['thread:T1']=metadata, used_agent_nicknames += 'Nova'. При agent_path=Some('/root/worker') → key='/root/worker'. При agent_id=None — регистрация не происходит"
+        }
+      }
+    }
+  ]
+}

@@ -1,0 +1,662 @@
+{
+  "src": "SRC-0007",
+  "schema_version": "2.0",
+  "lens": "rule",
+  "compositions": [
+    {
+      "id": "SRC-0007/rule/rollout-filename-format",
+      "src": "SRC-0007",
+      "composition": "rule",
+      "terms": {
+        "condition": "Rollout-файл всегда именуется как 'rollout-YYYY-MM-DDThh-mm-ss-<uuid>.jsonl': префикс ROLLOUT_PREFIX='rollout-', суффикс ROLLOUT_SUFFIX='.jsonl', timestamp формата '[year]-[month]-[day]T[hour]-[minute]-[second]' (дефисы вместо двоеточий для совместимости с файловыми системами, не допускающими ':' в именах), UUID последним сегментом. Парсинг (parse_timestamp_uuid_from_filename) сканирует разделители '-' справа налево, пока суффикс не распознаётся как UUID",
+        "numbers": [
+          {"value": "rollout-", "kind": "filename prefix (ROLLOUT_PREFIX)"},
+          {"value": ".jsonl", "kind": "filename suffix (ROLLOUT_SUFFIX)"},
+          {"value": "[year]-[month]-[day]T[hour]-[minute]-[second]", "kind": "timestamp format (time::macros::format_description)"}
+        ],
+        "formula": "filename = 'rollout-' + strftime('%Y-%m-%dT%H-%M-%S', now_local()) + '-' + conversation_id + '.jsonl'",
+        "gwt": {
+          "given": "conversation_id = '5973b6c0-94b8-487b-a530-2aeb6098ae0e'; now_local() = 2025-05-07T17:24:21 local",
+          "when": "precompute_log_file_info форматирует timestamp и собирает filename",
+          "then": "filename = 'rollout-2025-05-07T17-24-21-5973b6c0-94b8-487b-a530-2aeb6098ae0e.jsonl'"
+        }
+      }
+    },
+    {
+      "id": "SRC-0007/rule/rollout-directory-layout",
+      "src": "SRC-0007",
+      "composition": "rule",
+      "terms": {
+        "condition": "При NestedByDate layout путь rollout-файла строится как <codex_home>/sessions/YYYY/MM/DD/<filename>, где YYYY — год (u16), MM — месяц zero-padded двузначный (u8), DD — день zero-padded двузначный (u8). Archived rollouts хранятся flat в <codex_home>/archived_sessions/. SESSIONS_SUBDIR='sessions', ARCHIVED_SESSIONS_SUBDIR='archived_sessions'",
+        "numbers": [
+          {"value": "sessions", "kind": "SESSIONS_SUBDIR const"},
+          {"value": "archived_sessions", "kind": "ARCHIVED_SESSIONS_SUBDIR const"},
+          {"value": "{:02}", "kind": "month and day format (zero-padded 2 digits)"}
+        ],
+        "formula": "active_path = codex_home + '/sessions/' + format!('{}', year) + '/' + format!('{:02}', u8::from(month)) + '/' + format!('{:02}', day) + '/' + filename; archived_path = codex_home + '/archived_sessions/' + filename",
+        "gwt": {
+          "given": "codex_home=/home/user/.codex; timestamp.year()=2025, month()=January(1), day()=7; filename='rollout-2025-01-07T10-00-00-<uuid>.jsonl'",
+          "when": "precompute_log_file_info строит путь",
+          "then": "path = '/home/user/.codex/sessions/2025/01/07/rollout-2025-01-07T10-00-00-<uuid>.jsonl'"
+        }
+      }
+    },
+    {
+      "id": "SRC-0007/rule/thread-item-filter-must-have-meta-and-user",
+      "src": "SRC-0007",
+      "composition": "rule",
+      "terms": {
+        "condition": "Rollout-файл включается в ThreadsPage только если в его head найдены И SessionMeta (saw_session_meta=true), И хотя бы одно EventMsg::UserMessage (saw_user_event=true). Иначе build_thread_item возвращает None",
+        "numbers": [
+          {"value": 10, "kind": "HEAD_RECORD_LIMIT — лимит non-empty записей для обычного head scan"},
+          {"value": 200, "kind": "USER_EVENT_SCAN_LIMIT — дополнительный лимит записей, если SessionMeta найдена но UserMessage ещё не встречена"}
+        ],
+        "formula": "effective_scan_limit = if saw_session_meta && !saw_user_event then HEAD_RECORD_LIMIT + USER_EVENT_SCAN_LIMIT else HEAD_RECORD_LIMIT; include_in_page = saw_session_meta AND saw_user_event",
+        "gwt": {
+          "given": "rollout содержит SessionMeta на строке 1, затем 9 ResponseItem и UserMessage на строке 11",
+          "when": "read_head_summary сканирует",
+          "then": "после строки 10 lines_scanned=10 (>=HEAD_RECORD_LIMIT); но saw_session_meta && !saw_user_event → продолжить до lines_scanned < 10+200=210; UserMessage на строке 11 попадает в саммари → include_in_page=true"
+        }
+      }
+    },
+    {
+      "id": "SRC-0007/rule/listing-scan-cap",
+      "src": "SRC-0007",
+      "composition": "rule",
+      "terms": {
+        "condition": "Полное сканирование rollout-директории ограничено MAX_SCAN_FILES=10000 файлами на один запрос. При достижении reached_scan_cap=true; если items непусто — more_matches_available=true и возвращается next_cursor",
+        "numbers": [
+          {"value": 10000, "kind": "MAX_SCAN_FILES — hard cap сканирования"}
+        ],
+        "formula": "reached_scan_cap = scanned_files >= MAX_SCAN_FILES (10000); more_matches_available = reached_scan_cap && !items.is_empty() OR items.len() == page_size",
+        "gwt": {
+          "given": "В директории ~/.codex/sessions 50000 rollout-файлов; page_size=50",
+          "when": "get_threads сканирует в reverse chronological order",
+          "then": "после 10000 visited — walk_rollout_files прерывается (break 'outer); если page набрана раньше (50 items) — break раньше; reached_scan_cap=true; next_cursor строится для resume"
+        }
+      }
+    },
+    {
+      "id": "SRC-0007/rule/list-overfetch-multiplier",
+      "src": "SRC-0007",
+      "composition": "rule",
+      "terms": {
+        "condition": "При filesystem-first листинге в list_threads_with_db_fallback запрашивается удвоенный page_size (saturating), чтобы был запас для read_repair SQLite перед финальной SQLite-страницей",
+        "numbers": [
+          {"value": 2, "kind": "multiplier (page_size * 2)"}
+        ],
+        "formula": "fs_page_size = page_size.saturating_mul(2).max(page_size)",
+        "gwt": {
+          "given": "page_size=50",
+          "when": "filesystem-first ветвь активирована",
+          "then": "fs_page_size = max(50*2, 50) = 100 — получаем 100 rollout для warm DB, затем отвечаем на page_size=50 из SQLite"
+        }
+      }
+    },
+    {
+      "id": "SRC-0007/rule/anchor-cursor-skip",
+      "src": "SRC-0007",
+      "composition": "rule",
+      "terms": {
+        "condition": "AnchorState.should_skip: если !passed и (ts < self.ts OR (ts == self.ts AND id < self.id)) — установить passed=true и вернуть false (включить); если ts > self.ts или (ts == self.ts AND id >= self.id) — вернуть true (пропустить). Если anchor=None — passed=true сразу, ничего не пропускать. Упорядочение стабильно: (timestamp desc, uuid desc)",
+        "numbers": null,
+        "formula": "skip = passed ? false : (ts >= self.ts AND (ts > self.ts OR id >= self.id)); после первого (ts,id), которое меньше cursor — passed=true и все последующие включаются",
+        "gwt": {
+          "given": "cursor ts=2025-05-07T10:00:00, id=UUID-B; scan по убыванию встречает файлы (ts, id): (2025-05-07T11:00:00, UUID-C) → (2025-05-07T10:00:00, UUID-B) → (2025-05-07T10:00:00, UUID-A) → (2025-05-07T09:00:00, UUID-D)",
+          "when": "AnchorState.should_skip для каждого",
+          "then": "(11:00, C): passed=false, ts>cursor.ts → skip=true; (10:00, B): passed=false, ts==cursor.ts AND id==cursor.id → не <, skip=true; (10:00, A): passed=false, ts==cursor.ts AND id<cursor.id → passed=true, include; (09:00, D): passed=true, include"
+        }
+      }
+    },
+    {
+      "id": "SRC-0007/rule/parse-timestamp-uuid-from-filename",
+      "src": "SRC-0007",
+      "composition": "rule",
+      "terms": {
+        "condition": "Из имени 'rollout-<ts>-<uuid>.jsonl' timestamp извлекается сканированием разделителей '-' справа налево. Для каждого индекса '-' в core (после strip prefix/suffix) проверяется: парсится ли суффикс как UUID; первый успех даёт (ts_str, uuid). Затем ts_str парсится как PrimitiveDateTime с форматом '[year]-[month]-[day]T[hour]-[minute]-[second]' и assume_utc()",
+        "numbers": [
+          {"value": "rollout-", "kind": "strip_prefix"},
+          {"value": ".jsonl", "kind": "strip_suffix"},
+          {"value": "[year]-[month]-[day]T[hour]-[minute]-[second]", "kind": "PrimitiveDateTime format"}
+        ],
+        "formula": "core = name.strip_prefix('rollout-').strip_suffix('.jsonl'); (sep_idx, uuid) = first (i, uuid) from core.match_indices('-').rev() where Uuid::parse_str(core[i+1..]) is Ok; ts = PrimitiveDateTime::parse(core[..sep_idx], format).assume_utc()",
+        "gwt": {
+          "given": "name = 'rollout-2025-05-07T17-24-21-5973b6c0-94b8-487b-a530-2aeb6098ae0e.jsonl'",
+          "when": "parse_timestamp_uuid_from_filename",
+          "then": "core = '2025-05-07T17-24-21-5973b6c0-94b8-487b-a530-2aeb6098ae0e'; сканирование '-' справа находит позицию перед '5973b6c0...' → UUID парсится; ts_str='2025-05-07T17-24-21', ts = 2025-05-07T17:24:21Z"
+        }
+      }
+    },
+    {
+      "id": "SRC-0007/rule/rollout-date-parts-extraction",
+      "src": "SRC-0007",
+      "composition": "rule",
+      "terms": {
+        "condition": "rollout_date_parts(filename) извлекает (year, month, day) по фиксированным смещениям после strip_prefix('rollout-'): year=0..4, month=5..7, day=8..10. Даёт Option<(String, String, String)> для использования при unarchive (воссоздании nested sessions/YYYY/MM/DD)",
+        "numbers": [
+          {"value": "rollout-", "kind": "strip prefix"},
+          {"value": "0..4", "kind": "year slice indices"},
+          {"value": "5..7", "kind": "month slice indices (skip '-' на позиции 4)"},
+          {"value": "8..10", "kind": "day slice indices (skip '-' на позиции 7)"}
+        ],
+        "formula": "date = name.strip_prefix('rollout-')[..10]; year=date[..4]; month=date[5..7]; day=date[8..10]",
+        "gwt": {
+          "given": "file_name = 'rollout-2025-01-07T10-00-00-<uuid>.jsonl'",
+          "when": "rollout_date_parts(file_name)",
+          "then": "после strip_prefix core='2025-01-07T10-00-00-<uuid>.jsonl'; date='2025-01-07'; (year='2025', month='01', day='07')"
+        }
+      }
+    },
+    {
+      "id": "SRC-0007/rule/rollout-item-persistence-mode-gate",
+      "src": "SRC-0007",
+      "composition": "rule",
+      "terms": {
+        "condition": "is_persisted_response_item(item, mode) определяет, попадёт ли RolloutItem в файл. ResponseItem фильтруется через should_persist_response_item (белый список). EventMsg — через should_persist_event_msg(ev, mode) с двумя ветвями Limited/Extended. Compacted, TurnContext, SessionMeta — всегда persist (executive markers)",
+        "numbers": null,
+        "formula": "persist = match item { ResponseItem(r) => should_persist_response_item(r); EventMsg(e) => should_persist_event_msg(e, mode); Compacted|TurnContext|SessionMeta => true }",
+        "gwt": {
+          "given": "mode=Limited; items = [ResponseItem::Message, ResponseItem::Other, EventMsg::UserMessage, EventMsg::Warning, RolloutItem::TurnContext]",
+          "when": "filter через is_persisted_response_item для каждого",
+          "then": "persist: Message=true, Other=false (exclusion), UserMessage=true (Limited whitelist), Warning=false (never persisted), TurnContext=true (executive marker) → filtered = 3 из 5"
+        }
+      }
+    },
+    {
+      "id": "SRC-0007/rule/event-msg-persistence-matrix",
+      "src": "SRC-0007",
+      "composition": "rule",
+      "terms": {
+        "condition": "event_msg_persistence_mode(ev) возвращает минимальный mode при котором event persisted. Limited variant: UserMessage, AgentMessage, AgentReasoning, AgentReasoningRawContent, TokenCount, ThreadNameUpdated, ContextCompacted, EnteredReviewMode, ExitedReviewMode, ThreadRolledBack, UndoCompleted, TurnAborted, TurnStarted, TurnComplete, ImageGenerationEnd. ItemCompleted — только если item=TurnItem::Plan (Plan items derived from streaming tags, not in raw ResponseItem history, persist completion для replay). Extended variant: Error, GuardianAssessment, WebSearchEnd, ExecCommandEnd, PatchApplyEnd, McpToolCallEnd, ViewImageToolCall, CollabAgentSpawnEnd, CollabAgentInteractionEnd, CollabWaitingEnd, CollabCloseEnd, CollabResumeEnd, DynamicToolCallRequest, DynamicToolCallResponse. None (never): все остальные (Warning, delta events, Begin-half событий Begin/End пар, SessionConfigured, RealtimeConversation*, RawResponseItem, UI-ориентированные events и др.). should_persist_event_msg_limited: persistence_mode == Some(Limited). should_persist_event_msg_extended: persistence_mode == Some(Limited) OR Some(Extended)",
+        "numbers": null,
+        "formula": "limited = matches!(event_msg_persistence_mode(ev), Some(Limited)); extended = matches!(event_msg_persistence_mode(ev), Some(Limited) | Some(Extended))",
+        "gwt": {
+          "given": "ev = EventMsg::ExecCommandEnd",
+          "when": "should_persist_event_msg(ev, mode)",
+          "then": "event_msg_persistence_mode=Some(Extended); Limited: matches Some(Limited)→false (не пишется); Extended: matches Some(Limited)|Some(Extended)→true (пишется)"
+        }
+      }
+    },
+    {
+      "id": "SRC-0007/rule/item-completed-plan-only",
+      "src": "SRC-0007",
+      "composition": "rule",
+      "terms": {
+        "condition": "EventMsg::ItemCompleted persisted в Limited режиме ТОЛЬКО если event.item = TurnItem::Plan. Остальные item-варианты → None (never persisted). Причина (из кода): Plan items derived from streaming tags and are not part of the raw ResponseItem history, so we persist their completion to replay them on resume without bloating rollouts with every item lifecycle",
+        "numbers": null,
+        "formula": "mode = if matches!(event.item, TurnItem::Plan(_)) then Some(Limited) else None",
+        "gwt": {
+          "given": "event1.item = TurnItem::Plan(...); event2.item = TurnItem::Exec(...)",
+          "when": "event_msg_persistence_mode(EventMsg::ItemCompleted(event))",
+          "then": "event1 → Some(Limited) (persist); event2 → None (никогда не persist)"
+        }
+      }
+    },
+    {
+      "id": "SRC-0007/rule/response-item-rollout-whitelist",
+      "src": "SRC-0007",
+      "composition": "rule",
+      "terms": {
+        "condition": "should_persist_response_item (для rollout) persist=true для: Message, Reasoning, LocalShellCall, FunctionCall, ToolSearchCall, FunctionCallOutput, ToolSearchOutput, CustomToolCall, CustomToolCallOutput, WebSearchCall, ImageGenerationCall, GhostSnapshot, Compaction. persist=false для: Other",
+        "numbers": null,
+        "formula": "persist = item is one of {Message, Reasoning, LocalShellCall, FunctionCall, ToolSearchCall, FunctionCallOutput, ToolSearchOutput, CustomToolCall, CustomToolCallOutput, WebSearchCall, ImageGenerationCall, GhostSnapshot, Compaction}",
+        "gwt": {
+          "given": "items = [ResponseItem::Message, ResponseItem::Other, ResponseItem::WebSearchCall]",
+          "when": "map should_persist_response_item",
+          "then": "[true, false, true] — Other всегда исключается из rollout"
+        }
+      }
+    },
+    {
+      "id": "SRC-0007/rule/response-item-memories-filter",
+      "src": "SRC-0007",
+      "composition": "rule",
+      "terms": {
+        "condition": "should_persist_response_item_for_memories: Message persisted только если role != 'developer' (developer role исключается из memories). Persisted: Message(role!='developer'), LocalShellCall, FunctionCall, ToolSearchCall, FunctionCallOutput, ToolSearchOutput, CustomToolCall, CustomToolCallOutput, WebSearchCall. Excluded: Reasoning, ImageGenerationCall, GhostSnapshot, Compaction, Other",
+        "numbers": [
+          {"value": "developer", "kind": "excluded role literal"}
+        ],
+        "formula": "memories_persist = match item { Message{role,..} => role != 'developer'; {LocalShellCall|FunctionCall|ToolSearchCall|FunctionCallOutput|ToolSearchOutput|CustomToolCall|CustomToolCallOutput|WebSearchCall} => true; otherwise false }",
+        "gwt": {
+          "given": "items = [Message{role:'user'}, Message{role:'developer'}, Message{role:'assistant'}, Reasoning{..}, LocalShellCall{..}]",
+          "when": "map should_persist_response_item_for_memories",
+          "then": "[true, false, true, false, true] — developer message НЕ попадает в memories, Reasoning исключается из memories но попадает в rollout (inconsistency между memories и rollout = intentional)"
+        }
+      }
+    },
+    {
+      "id": "SRC-0007/rule/exec-aggregated-output-truncation",
+      "src": "SRC-0007",
+      "composition": "rule",
+      "terms": {
+        "condition": "В Extended режиме EventMsg::ExecCommandEnd санитизируется перед записью: aggregated_output обрезается до 10_000 байт через truncate_middle_chars (сохранение начала+конца, замена середины маркером), а stdout/stderr/formatted_output очищаются полностью (clear). В Limited режиме item возвращается без изменений (но в Limited этот event вообще не persisted — см. event-msg-persistence-matrix)",
+        "numbers": [
+          {"value": 10000, "kind": "PERSISTED_EXEC_AGGREGATED_OUTPUT_MAX_BYTES"}
+        ],
+        "formula": "if mode == Extended && item is EventMsg::ExecCommandEnd: event.aggregated_output = truncate_middle_chars(event.aggregated_output, 10_000); event.stdout.clear(); event.stderr.clear(); event.formatted_output.clear()",
+        "gwt": {
+          "given": "aggregated_output строка длиной 50_000 символов; stdout/stderr заполнены; mode=Extended",
+          "when": "sanitize_rollout_item_for_persistence",
+          "then": "aggregated_output усечён до <=10_000 байт с middle-marker; stdout=''; stderr=''; formatted_output=''"
+        }
+      }
+    },
+    {
+      "id": "SRC-0007/rule/rollout-channel-capacity",
+      "src": "SRC-0007",
+      "composition": "rule",
+      "terms": {
+        "condition": "MPSC-канал между RolloutRecorder и фоновой writer-task имеет capacity=256. При переполнении send-future yields (backpressure), но НЕ блокирует caller на blocking I/O. Это гарантирует, что вызывающий поток никогда не выполняет blocking file I/O — вся запись идёт в Tokio async driver",
+        "numbers": [
+          {"value": 256, "kind": "MPSC channel capacity (mpsc::channel::<RolloutCmd>(256))"}
+        ],
+        "formula": "(tx, rx) = tokio::sync::mpsc::channel::<RolloutCmd>(256)",
+        "gwt": {
+          "given": "caller быстро накидывает 1000 items через record_items; writer-task обрабатывает медленно",
+          "when": "tx.send выполняется в async цикле",
+          "then": "первые 256 команд буферизуются; 257-я команда заставит send-future yield (async wait); caller поток не блокируется на sync I/O"
+        }
+      }
+    },
+    {
+      "id": "SRC-0007/rule/writer-recovery-retry-once",
+      "src": "SRC-0007",
+      "composition": "rule",
+      "terms": {
+        "condition": "write_pending_with_recovery: при первой ошибке записи — enter_recovery_mode (writer=None, lost file handle, last_logged_error dedup) + warn 'failed to {op} rollout writer; reopening and retrying'; повторить write_pending_once ровно один раз. Если retry тоже fail — повторный enter_recovery_mode + warn с first+final error и вернуть финальную ошибку. Pending_items retained через весь процесс — только успешно записанные items drain'ятся из буфера",
+        "numbers": [
+          {"value": 1, "kind": "retry attempts (exactly one retry after first failure)"}
+        ],
+        "formula": "result = write_pending_once(); if Err(e1) then { enter_recovery_mode(e1); result2 = write_pending_once(); if Err(e2) then { enter_recovery_mode(e2); Err(e2) } else Ok } else Ok",
+        "gwt": {
+          "given": "pending_items = [item_A, item_B, item_C]; 1-я попытка: item_A записан, item_B ошибка EIO; retry: writer переоткрыт, item_B записан, item_C записан",
+          "when": "persist()",
+          "then": "1-й проход: written_count=1 (item_A drain, sync_thread_state с item_A); writer=None (recovery); retry: written_count=2 (item_B, item_C drain); Ok"
+        }
+      }
+    },
+    {
+      "id": "SRC-0007/rule/last-logged-error-dedup",
+      "src": "SRC-0007",
+      "composition": "rule",
+      "terms": {
+        "condition": "enter_recovery_mode логирует error только если err.to_string() отличается от last_logged_error — иначе тихо обновляет writer=None и last_logged_error. Это предотвращает спам одинаковых сообщений при повторяющихся I/O-ошибках (например, full disk)",
+        "numbers": null,
+        "formula": "message = err.to_string(); if last_logged_error != Some(&message) then error!(...); last_logged_error = Some(message); writer = None",
+        "gwt": {
+          "given": "Первая ошибка 'No space left on device'; следующая такая же ошибка в retry",
+          "when": "enter_recovery_mode вызван дважды с одинаковым err",
+          "then": "первый вызов: error!('rollout writer failed for {path}; buffered items will be retried: {err}'); второй вызов: last_logged_error совпадает, error! пропускается; writer=None; last_logged_error сохраняется"
+        }
+      }
+    },
+    {
+      "id": "SRC-0007/rule/memory-mode-on-session-start",
+      "src": "SRC-0007",
+      "composition": "rule",
+      "terms": {
+        "condition": "Значение SessionMeta.memory_mode определяется флагом config.generate_memories: если generate_memories=false → memory_mode = Some('disabled'); иначе None (читающие коды интерпретируют None/отсутствие как 'enabled'). В write_session_meta передаётся new_thread_memory_mode = (!generate_memories).then_some('disabled') в sync_thread_state_after_write",
+        "numbers": [
+          {"value": "disabled", "kind": "memory_mode literal when generate_memories=false"},
+          {"value": "enabled", "kind": "fallback literal — extract_metadata_from_rollout: outcome.memory_mode.unwrap_or_else(|| 'enabled')"}
+        ],
+        "formula": "memory_mode = if !config.generate_memories then Some('disabled') else None; при extraction outcome.memory_mode.unwrap_or('enabled')",
+        "gwt": {
+          "given": "config.generate_memories = false",
+          "when": "RolloutRecorder::new создаёт SessionMeta",
+          "then": "session_meta.memory_mode = Some('disabled'); sync_thread_state_after_write с new_thread_memory_mode=Some('disabled'); SQLite ctx.set_thread_memory_mode(id, 'disabled')"
+        }
+      }
+    },
+    {
+      "id": "SRC-0007/rule/interactive-session-sources",
+      "src": "SRC-0007",
+      "composition": "rule",
+      "terms": {
+        "condition": "INTERACTIVE_SESSION_SOURCES константа перечисляет полный список SessionSource-вариантов, считаемых интерактивными: Cli, VSCode, Custom('atlas'), Custom('chatgpt'). Используется как фильтр-whitelist для UI-листингов, где должны показываться только человеко-взаимодействующие сессии",
+        "numbers": [
+          {"value": "Cli", "kind": "SessionSource variant"},
+          {"value": "VSCode", "kind": "SessionSource variant"},
+          {"value": "atlas", "kind": "Custom subvariant (literal)"},
+          {"value": "chatgpt", "kind": "Custom subvariant (literal)"}
+        ],
+        "formula": null,
+        "gwt": null
+      }
+    },
+    {
+      "id": "SRC-0007/rule/thread-id-from-filename-tail",
+      "src": "SRC-0007",
+      "composition": "rule",
+      "terms": {
+        "condition": "thread_id_from_rollout_path (helpers.rs) извлекает ThreadId из filename только если: stem = filename.strip_suffix('.jsonl') и stem.len() >= 37 (36 для UUID + минимум 1 для разделителя '-') и stem на позиции (stem.len()-36-1) ends_with '-' (то есть перед UUID-суффиксом стоит '-'). Используется как fallback, если ThreadItem.thread_id=None",
+        "numbers": [
+          {"value": 37, "kind": "minimum stem length (36 UUID chars + separator '-')"},
+          {"value": 36, "kind": "UUID length in hyphenated form"},
+          {"value": ".jsonl", "kind": "suffix to strip"}
+        ],
+        "formula": "stem = file_name.strip_suffix('.jsonl'); if stem.len() < 37 then None; uuid_start = stem.len() - 36; if !stem[..uuid_start].ends_with('-') then None; ThreadId::from_string(stem[uuid_start..])",
+        "gwt": {
+          "given": "path = '/.../rollout-2025-01-07T10-00-00-5973b6c0-94b8-487b-a530-2aeb6098ae0e.jsonl'",
+          "when": "thread_id_from_rollout_path",
+          "then": "stem='rollout-2025-01-07T10-00-00-5973b6c0-94b8-487b-a530-2aeb6098ae0e'; stem.len()>=37; uuid_start = stem.len()-36; stem[..uuid_start] ends_with '-' → Ok; ThreadId парсится из последних 36 символов"
+        }
+      }
+    },
+    {
+      "id": "SRC-0007/rule/archive-path-scoping",
+      "src": "SRC-0007",
+      "composition": "rule",
+      "terms": {
+        "condition": "Перед архивированием/восстановлением thread проверяется: canonicalize(sessions_or_archived_root) И canonicalize(rollout_path); rollout_path.starts_with(root) обязательно — иначе InvalidRequest 'rollout path `{path}` must be in {root_name} directory'. Это защита от rename за пределы ожидаемой директории (path traversal / symlink escape)",
+        "numbers": null,
+        "formula": "scoped_ok = canonicalize(rollout_path).starts_with(canonicalize(root))",
+        "gwt": {
+          "given": "rollout_path — символическая ссылка, указывающая на /etc/passwd; root=codex_home/sessions",
+          "when": "scoped_rollout_path",
+          "then": "canonicalize resolves symlink → '/etc/passwd'; !starts_with(sessions/) → ThreadStoreError::InvalidRequest 'rollout path ... must be in sessions directory'"
+        }
+      }
+    },
+    {
+      "id": "SRC-0007/rule/filename-thread-id-match",
+      "src": "SRC-0007",
+      "composition": "rule",
+      "terms": {
+        "condition": "matching_rollout_file_name проверяет: filename должен end_with '{thread_id}.jsonl'. Иначе InvalidRequest 'rollout path `{path}` does not match thread id {thread_id}' — отказ от обработки файлов, где имя не содержит ожидаемый thread_id в суффиксе",
+        "numbers": [
+          {"value": "{thread_id}.jsonl", "kind": "required suffix format"}
+        ],
+        "formula": "required_suffix = format!('{thread_id}.jsonl'); file_name.to_string_lossy().ends_with(&required_suffix)",
+        "gwt": {
+          "given": "thread_id=UUID-X; filename='rollout-2025-01-07T10-00-00-UUID-Y.jsonl'",
+          "when": "matching_rollout_file_name",
+          "then": "ends_with('UUID-X.jsonl') → false; InvalidRequest 'rollout path ... does not match thread id UUID-X'"
+        }
+      }
+    },
+    {
+      "id": "SRC-0007/rule/backfill-lease",
+      "src": "SRC-0007",
+      "composition": "rule",
+      "terms": {
+        "condition": "backfill процесс захватывает lease на BACKFILL_LEASE_SECONDS=900 секунд (в тестах=1 секунда). try_claim_backfill — атомарный SQL-захват через runtime; если возвращает false → info 'backfill already running; skipping duplicate worker'. Это гарантирует одного активного worker'а даже при одновременном старте нескольких процессов Codex",
+        "numbers": [
+          {"value": 900, "kind": "BACKFILL_LEASE_SECONDS (production, #[cfg(not(test))])"},
+          {"value": 1, "kind": "BACKFILL_LEASE_SECONDS (test, #[cfg(test)])"}
+        ],
+        "formula": "claimed = runtime.try_claim_backfill(BACKFILL_LEASE_SECONDS); if !claimed then skip",
+        "gwt": {
+          "given": "Два процесса Codex стартуют одновременно при пустой state_db с backfill_state != Complete",
+          "when": "Оба вызывают state_db::init → spawn backfill_sessions → try_claim_backfill",
+          "then": "первый получает claimed=true и продолжает; второй получает claimed=false и ранний return с info 'backfill already running at {path}; skipping duplicate worker'"
+        }
+      }
+    },
+    {
+      "id": "SRC-0007/rule/backfill-batch-size",
+      "src": "SRC-0007",
+      "composition": "rule",
+      "terms": {
+        "condition": "Backfill обрабатывает rollout-файлы порциями (chunks) по BACKFILL_BATCH_SIZE=200. После каждого успешного batch — runtime.checkpoint_backfill(last_entry.watermark). Это позволяет resume backfill с точки прерывания при падении процесса",
+        "numbers": [
+          {"value": 200, "kind": "BACKFILL_BATCH_SIZE"}
+        ],
+        "formula": "for batch in rollout_paths.chunks(200): process batch; runtime.checkpoint_backfill(batch.last().watermark)",
+        "gwt": {
+          "given": "1050 rollout-файлов для backfill",
+          "when": "обработка в chunks(200)",
+          "then": "5 полных batch (200 each) + 1 hvost (50); checkpoint вызывается 6 раз; при crash после 3-го batch — last_watermark указывает на файл 600; restart возобновит retain(entry.watermark.as_str() > last_watermark.as_str())"
+        }
+      }
+    },
+    {
+      "id": "SRC-0007/rule/backfill-watermark-format",
+      "src": "SRC-0007",
+      "composition": "rule",
+      "terms": {
+        "condition": "backfill_watermark_for_path: watermark = relative_path от codex_home (через strip_prefix), конвертированный в String, с заменой '\\\\' на '/' (нормализация Windows path separator). Это обеспечивает лексикографическое сравнение watermark'ов независимо от OS",
+        "numbers": [
+          {"value": "\\\\", "kind": "Windows path separator (input)"},
+          {"value": "/", "kind": "normalized path separator (output)"}
+        ],
+        "formula": "watermark = path.strip_prefix(codex_home).unwrap_or(path).to_string_lossy().replace('\\\\', '/')",
+        "gwt": {
+          "given": "codex_home='C:\\\\Users\\\\u\\\\.codex'; path='C:\\\\Users\\\\u\\\\.codex\\\\sessions\\\\2025\\\\01\\\\07\\\\rollout-...jsonl'",
+          "when": "backfill_watermark_for_path",
+          "then": "strip_prefix → 'sessions\\\\2025\\\\01\\\\07\\\\rollout-...jsonl'; replace → 'sessions/2025/01/07/rollout-...jsonl'"
+        }
+      }
+    },
+    {
+      "id": "SRC-0007/rule/backfill-outcome-metric-status",
+      "src": "SRC-0007",
+      "composition": "rule",
+      "terms": {
+        "condition": "После завершения backfill status для DB_METRIC_BACKFILL_DURATION_MS timer выбирается: 'success' если stats.failed==0; 'failed' если stats.upserted==0; иначе 'partial_failure'. Отдельно counter DB_METRIC_BACKFILL пишется дважды с status=upserted (stats.upserted) и status=failed (stats.failed)",
+        "numbers": [
+          {"value": "success", "kind": "timer status when failed==0"},
+          {"value": "failed", "kind": "timer status when upserted==0"},
+          {"value": "partial_failure", "kind": "timer status иначе"}
+        ],
+        "formula": "status = if stats.failed == 0 then 'success' else if stats.upserted == 0 then 'failed' else 'partial_failure'",
+        "gwt": {
+          "given": "stats.scanned=100, stats.upserted=95, stats.failed=5",
+          "when": "backfill_sessions завершил цикл",
+          "then": "status = 'partial_failure'; timer.record(('status', 'partial_failure')); counter DB_METRIC_BACKFILL с ('status', 'upserted')=95 и ('status', 'failed')=5"
+        }
+      }
+    },
+    {
+      "id": "SRC-0007/rule/backfill-archived-at-fallback",
+      "src": "SRC-0007",
+      "composition": "rule",
+      "terms": {
+        "condition": "Во время backfill для archived rollout, если metadata.archived_at is None — устанавливается: fallback_archived_at = metadata.updated_at; затем archived_at = file_modified_time_utc(path).or(Some(fallback_archived_at)). То есть берётся file mtime, если недоступен — fallback на updated_at из metadata",
+        "numbers": null,
+        "formula": "if rollout.archived && metadata.archived_at.is_none(): fallback = metadata.updated_at; metadata.archived_at = file_modified_time_utc(&rollout.path).or(Some(fallback))",
+        "gwt": {
+          "given": "archived rollout, metadata.archived_at=None, metadata.updated_at=2025-01-07T10:00:00Z, file mtime=2025-03-01T12:00:00Z",
+          "when": "backfill_sessions обрабатывает rollout",
+          "then": "archived_at = Some(2025-03-01T12:00:00Z) (file mtime preferred); если file mtime unreadable — archived_at = Some(2025-01-07T10:00:00Z) (updated_at fallback)"
+        }
+      }
+    },
+    {
+      "id": "SRC-0007/rule/reconcile-archived-at-policy",
+      "src": "SRC-0007",
+      "composition": "rule",
+      "terms": {
+        "condition": "reconcile_rollout и read_repair_rollout_path обрабатывают archived_only параметр: Some(true) + archived_at.is_none() → archived_at = Some(updated_at); Some(false) → archived_at = None (thread явно unarchived); Some(true) || None → no-op. Это гарантирует синхронизацию SQLite archived_at с реальной директорией rollout",
+        "numbers": null,
+        "formula": "match archived_only { Some(true) if archived_at.is_none() => archived_at = Some(updated_at); Some(false) => archived_at = None; Some(true) | None => no-op }",
+        "gwt": {
+          "given": "Three сценария: (a) archive операция, archived_at=None → set to updated_at; (b) unarchive, archived_at=Some(ts) → set None; (c) read-repair active, archived_at=Some(ts) → no-op",
+          "when": "reconcile_rollout/read_repair_rollout_path с соответствующим archived_only",
+          "then": "SQLite archived_at корректно отражает текущее расположение rollout-файла"
+        }
+      }
+    },
+    {
+      "id": "SRC-0007/rule/cwd-normalization-for-state-db",
+      "src": "SRC-0007",
+      "composition": "rule",
+      "terms": {
+        "condition": "Перед записью cwd в state_db (SQLite) — путь нормализуется: normalize_cwd_for_state_db применяет normalize_for_path_comparison (из codex_utils_path), с fallback на исходный cwd.to_path_buf() при ошибке. Используется при upsert_thread в reconcile_rollout, read_repair_rollout_path, apply_rollout_items, backfill_sessions",
+        "numbers": null,
+        "formula": "normalized_cwd = normalize_for_path_comparison(cwd).unwrap_or_else(|_| cwd.to_path_buf())",
+        "gwt": {
+          "given": "cwd = Path('~/projects/../projects/myapp/./')",
+          "when": "normalize_cwd_for_state_db(cwd)",
+          "then": "normalized = '/home/user/projects/myapp' (стандартный абсолютный normalized path); при ошибке (unresolvable symlink) — fallback на оригинальный cwd"
+        }
+      }
+    },
+    {
+      "id": "SRC-0007/rule/cwd-match-resume",
+      "src": "SRC-0007",
+      "composition": "rule",
+      "terms": {
+        "condition": "resume_candidate_matches_cwd (приоритет cached → TurnContext → metadata): (1) если cached_cwd.is_some_and(cwd_matches), return true; (2) иначе load_rollout_items и найти latest TurnContext — cwd_matches; (3) fallback — extract_metadata_from_rollout.metadata.cwd — cwd_matches. cwd_matches делегирует path_utils::paths_match_after_normalization",
+        "numbers": null,
+        "formula": "match = cached_cwd.is_some_and(cwd_matches(_, cwd)) OR latest_turn_context_cwd.map(cwd_matches) OR extract_metadata.cwd matches",
+        "gwt": {
+          "given": "ThreadItem.cwd=Some('/old/path'); rollout содержит TurnContext с cwd='/new/path'; пользователь в cwd='/new/path'",
+          "when": "resume_candidate_matches_cwd",
+          "then": "cached_cwd='/old/path' не matches → (1) false; load rollout, latest TurnContext.cwd='/new/path' matches → true; rollout candidate включается как подходящий resume"
+        }
+      }
+    },
+    {
+      "id": "SRC-0007/rule/session-index-reverse-scan",
+      "src": "SRC-0007",
+      "composition": "rule",
+      "terms": {
+        "condition": "session_index.jsonl читается с конца блоками READ_CHUNK_SIZE=8192 байт; в каждом блоке итерируется reverse по байтам; при '\\n' вызывается parse_line_from_rev (reverse line_rev, try UTF-8, strip '\\r', try serde_json::from_str<SessionIndexEntry>, apply predicate). Первая matching entry возвращается. Файл append-only → самая свежая запись вверху (в конце)",
+        "numbers": [
+          {"value": 8192, "kind": "READ_CHUNK_SIZE (bytes per read chunk)"},
+          {"value": "session_index.jsonl", "kind": "SESSION_INDEX_FILE const"}
+        ],
+        "formula": "while remaining > 0: read_size = min(remaining, 8192); seek(remaining-read_size); read_exact; for byte in buf.rev(): if '\\n' then parse_line_from_rev(line_rev) else line_rev.push(byte)",
+        "gwt": {
+          "given": "session_index.jsonl размером 20_000 байт с 100 entries; searching id=X",
+          "when": "scan_index_from_end_by_id",
+          "then": "читается сначала последний chunk 8192 байт (offset 11808..20000), затем 8192 байт (offset 3616..11808), затем 3616 байт (offset 0..3616); reverse итерация останавливается при первом matching entry (самая свежая для id=X)"
+        }
+      }
+    },
+    {
+      "id": "SRC-0007/rule/session-index-latest-per-id",
+      "src": "SRC-0007",
+      "composition": "rule",
+      "terms": {
+        "condition": "stream_thread_ids_from_end_by_name: при reverse-scan session_index — HashSet `seen` фиксирует thread_id, для которых уже обработана самая свежая запись; только первый встреченный entry (последняя в file order → самая свежая) определяет текущий name. Это гарантирует: переименованный thread не будет возвращён по старому name — «историческое имя не может быть принято за текущее после переименования» (семантика из комментария в коде)",
+        "numbers": null,
+        "formula": "for entry (reverse order): if seen.insert(entry.id) AND entry.thread_name == name: tx.send(entry.id); for ids where seen already contains — skip",
+        "gwt": {
+          "given": "session_index содержит (хронологически): (id=A, name='chat-1'), (id=A, name='chat-2'), (id=B, name='chat-1'); поиск by name='chat-1'",
+          "when": "stream_thread_ids_from_end_by_name",
+          "then": "reverse scan: (B, 'chat-1') → seen.insert(B)=true, name matches → send B; (A, 'chat-2') → seen.insert(A)=true, name не matches → skip; (A, 'chat-1') → seen уже содержит A → skip (защита от старого имени); итог: отправлен только B"
+        }
+      }
+    },
+    {
+      "id": "SRC-0007/rule/fallback-thread-id-from-filename",
+      "src": "SRC-0007",
+      "composition": "rule",
+      "terms": {
+        "condition": "builder_from_items: если в items нет SessionMeta и filename проходит проверки (starts_with ROLLOUT_PREFIX, ends_with ROLLOUT_SUFFIX) — fallback создаёт ThreadMetadataBuilder из filename: created_ts из parse_timestamp_uuid_from_filename → DateTime<Utc>::from_timestamp с with_nanosecond(0); id = ThreadId::from_string(uuid.to_string()); source = SessionSource::default()",
+        "numbers": [
+          {"value": 0, "kind": "nanosecond precision truncation"}
+        ],
+        "formula": "if no SessionMeta in items AND filename matches ROLLOUT_PREFIX/SUFFIX: (ts, uuid) = parse_timestamp_uuid_from_filename; created_at = DateTime::<Utc>::from_timestamp(ts.unix_timestamp(), 0).with_nanosecond(0); ThreadMetadataBuilder::new(ThreadId::from_string(uuid), path, created_at, SessionSource::default())",
+        "gwt": {
+          "given": "rollout files без валидного SessionMeta в первых строках, но filename корректный 'rollout-2025-05-07T17-24-21-<uuid>.jsonl'",
+          "when": "builder_from_items",
+          "then": "fallback путь: ThreadMetadataBuilder с id=<uuid>, created_at=2025-05-07T17:24:21Z (nanosec=0), source=default (Unknown)"
+        }
+      }
+    },
+    {
+      "id": "SRC-0007/rule/head-first-session-meta-wins",
+      "src": "SRC-0007",
+      "composition": "rule",
+      "terms": {
+        "condition": "При read_head_summary И load_rollout_items: первая встреченная SessionMeta определяет канонический thread_id и основную session информацию; последующие SessionMeta в файле сохраняются в items (все items intact), но thread_id остаётся неизменным. В build_thread_item summary заполняется только если !summary.saw_session_meta (guard)",
+        "numbers": null,
+        "formula": "if !summary.saw_session_meta: summary.thread_id = Some(session_meta_line.meta.id); ... summary.saw_session_meta=true; subsequent SessionMeta → no update to summary",
+        "gwt": {
+          "given": "rollout содержит 3 SessionMeta (fork из fork): (id=A), затем (id=B), затем (id=C)",
+          "when": "load_rollout_items / read_head_summary",
+          "then": "thread_id = A (первая); все три SessionMeta записаны в items; ThreadItem.thread_id = A"
+        }
+      }
+    },
+    {
+      "id": "SRC-0007/rule/timestamp-parsing-fallback",
+      "src": "SRC-0007",
+      "composition": "rule",
+      "terms": {
+        "condition": "parse_timestamp_to_utc (metadata.rs): сначала пробует format '%Y-%m-%dT%H-%M-%S' (дефис-separated, filename style) → DateTime<Utc>::from_naive_utc_and_offset с with_nanosecond(0); при неудаче — DateTime::parse_from_rfc3339 (колонный стандартный формат). Cursor-десериализация и cursor_to_anchor используют аналогичную last-chance fallback",
+        "numbers": [
+          {"value": "%Y-%m-%dT%H-%M-%S", "kind": "filename timestamp format"},
+          {"value": "RFC3339", "kind": "fallback timestamp format"}
+        ],
+        "formula": "parse_timestamp_to_utc(ts) = NaiveDateTime::parse_from_str(ts, '%Y-%m-%dT%H-%M-%S').ok().map(assume_utc, with_nanosecond(0)) OR DateTime::parse_from_rfc3339(ts).ok().map(with_timezone(Utc))",
+        "gwt": {
+          "given": "ts1='2025-05-07T17-24-21'; ts2='2025-05-07T17:24:21.123Z'; ts3='invalid'",
+          "when": "parse_timestamp_to_utc",
+          "then": "ts1 → Some(2025-05-07T17:24:21Z, nanosec=0) через filename format; ts2 → Some(2025-05-07T17:24:21.123Z) через RFC3339; ts3 → None"
+        }
+      }
+    },
+    {
+      "id": "SRC-0007/rule/cursor-serialization-format",
+      "src": "SRC-0007",
+      "composition": "rule",
+      "terms": {
+        "condition": "Cursor сериализуется как '<ts_rfc3339>|<uuid>' (serde::Serialize); десериализуется через parse_cursor: split_once('|'); uuid — Uuid::parse_str; ts — сначала OffsetDateTime::parse(RFC3339), fallback на PrimitiveDateTime::parse с '[year]-[month]-[day]T[hour]-[minute]-[second]'.assume_utc()",
+        "numbers": [
+          {"value": "|", "kind": "cursor separator"},
+          {"value": "RFC3339", "kind": "primary ts format"},
+          {"value": "[year]-[month]-[day]T[hour]-[minute]-[second]", "kind": "fallback ts format"}
+        ],
+        "formula": "token = '{ts_rfc3339}|{uuid}'; parse: (file_ts, uuid_str) = split_once('|'); uuid = Uuid::parse_str(uuid_str); ts = OffsetDateTime::parse(file_ts, Rfc3339).or_else(PrimitiveDateTime::parse(format!('[year]-[month]-[day]T[hour]-[minute]-[second]')).assume_utc())",
+        "gwt": {
+          "given": "Cursor { ts=2025-05-07T17:24:21Z, id=UUID-X }",
+          "when": "serialize",
+          "then": "'2025-05-07T17:24:21Z|UUID-X'; deserialize этого обратно даёт равный Cursor; альтернативный token '2025-05-07T17-24-21|UUID-X' тоже валиден (fallback формат)"
+        }
+      }
+    },
+    {
+      "id": "SRC-0007/rule/cursor-anchor-id-no-pipe",
+      "src": "SRC-0007",
+      "composition": "rule",
+      "terms": {
+        "condition": "cursor_to_anchor: после split_once('|') проверка — id_str не должен содержать ещё один '|' (если contains → return None). Это защита от malformed cursor, где UUID-часть случайно содержит разделитель",
+        "numbers": [
+          {"value": "|", "kind": "separator that must not appear in id_str"}
+        ],
+        "formula": "if id_str.contains('|') then return None",
+        "gwt": {
+          "given": "cursor_str = '2025-05-07T17-24-21|UUID|extra'",
+          "when": "cursor_to_anchor",
+          "then": "split_once('|') → (ts='2025-05-07T17-24-21', id='UUID|extra'); id.contains('|') → true → return None (cursor отклонён)"
+        }
+      }
+    },
+    {
+      "id": "SRC-0007/rule/truncate-mtime-to-millis",
+      "src": "SRC-0007",
+      "composition": "rule",
+      "terms": {
+        "condition": "file_modified_time округляет наносекунды mtime до миллисекунд: millis_nanos = (dt.nanosecond() / 1_000_000) * 1_000_000. Используется для поля ThreadItem.updated_at (RFC3339 string). SQLite-обратная конвертация — to_rfc3339_opts(SecondsFormat::Millis, true)",
+        "numbers": [
+          {"value": 1000000, "kind": "nanoseconds per millisecond"}
+        ],
+        "formula": "millis_nanos = (dt.nanosecond() / 1_000_000) * 1_000_000; dt.replace_nanosecond(millis_nanos)",
+        "gwt": {
+          "given": "dt.nanosecond() = 123_456_789",
+          "when": "truncate_to_millis",
+          "then": "millis_nanos = (123_456_789 / 1_000_000) * 1_000_000 = 123 * 1_000_000 = 123_000_000; replace_nanosecond(123_000_000) → mtime с точностью до миллисекунды"
+        }
+      }
+    },
+    {
+      "id": "SRC-0007/rule/provider-matcher-default-fallback",
+      "src": "SRC-0007",
+      "composition": "rule",
+      "terms": {
+        "condition": "ProviderMatcher: если filters пустой — matcher не создаётся (None). Если session не указал provider (None), matcher.matches возвращает matches_default_provider — true только если default_provider сам присутствует в filters. Если session provider задан — сравнение filters.any(candidate == provider)",
+        "numbers": null,
+        "formula": "ProviderMatcher::new: if filters.is_empty() then None else Some(filters, matches_default=filters.any(==default_provider)); matches(session_provider): match session_provider { Some(p) => filters.any(==p); None => matches_default_provider }",
+        "gwt": {
+          "given": "filters=['openai', 'anthropic']; default_provider='openai'; session1 provider=Some('openai'), session2 provider=None, session3 provider=Some('other')",
+          "when": "matches per session",
+          "then": "session1 → true (provider в filters); session2 → true (matches_default_provider=true т.к. 'openai' в filters); session3 → false"
+        }
+      }
+    }
+  ]
+}

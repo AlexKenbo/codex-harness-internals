@@ -1,0 +1,1185 @@
+{
+  "src": "SRC-0003",
+  "schema_version": "2.0",
+  "lens": "structural",
+  "compositions": [
+    {
+      "id": "SRC-0003/entity/account-plan",
+      "src": "SRC-0003",
+      "composition": "entity",
+      "terms": {
+        "object": "PlanType (account-level)",
+        "attributes": [
+          "variant: enum (Free/Go/Plus/Pro/ProLite/Team/SelfServeBusinessUsageBased/Business/EnterpriseCbpUsageBased/Enterprise/Edu/Unknown)",
+          "is_team_like: bool (computed — Team or SelfServeBusinessUsageBased)",
+          "is_business_like: bool (computed — Business or EnterpriseCbpUsageBased)"
+        ],
+        "relationships": null,
+        "data_flows": [
+          {"source": "wire JSON (serde rename_all=lowercase)", "transform": "deserialize variant; unknown values → Unknown variant", "sink": "PlanType"},
+          {"source": "PlanType", "transform": "serialize with snake_case wire names (self_serve_business_usage_based, enterprise_cbp_usage_based)", "sink": "wire JSON"}
+        ],
+        "enumerations": {
+          "PlanType": ["Free", "Go", "Plus", "Pro", "ProLite", "Team", "SelfServeBusinessUsageBased", "Business", "EnterpriseCbpUsageBased", "Enterprise", "Edu", "Unknown"],
+          "team_like_group": ["Team", "SelfServeBusinessUsageBased"],
+          "business_like_group": ["Business", "EnterpriseCbpUsageBased"]
+        },
+        "config": {
+          "default_plan": {"value": "Free", "source": "Default derive on PlanType enum", "default": "Free"}
+        }
+      }
+    },
+    {
+      "id": "SRC-0003/entity/agent-path",
+      "src": "SRC-0003",
+      "composition": "entity",
+      "terms": {
+        "object": "AgentPath",
+        "attributes": [
+          "value: String (absolute path starting with /root)",
+          "ROOT: const string (\"/root\")",
+          "ROOT_SEGMENT: const string (\"root\")",
+          "name: derived (last segment after `/`, defaults to ROOT_SEGMENT for root)",
+          "is_root: bool (path equals \"/root\")"
+        ],
+        "relationships": [
+          {"to": "SRC-0003/entity/agent-path", "rel": "join_to_child", "card": "1:N", "note": "parent path joined with agent_name produces child path"}
+        ],
+        "data_flows": [
+          {"source": "String input", "transform": "validate_absolute_path (must start with /root, must not end with /, segments validated by validate_agent_name)", "sink": "AgentPath"},
+          {"source": "AgentPath + agent_name", "transform": "join — validate_agent_name + concat with /", "sink": "child AgentPath"},
+          {"source": "AgentPath + reference (relative or absolute)", "transform": "resolve — empty rejected; ROOT returns root; absolute parsed via try_from; otherwise validate_relative_reference + concat", "sink": "AgentPath"}
+        ],
+        "enumerations": null,
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0003/entity/known-plan",
+      "src": "SRC-0003",
+      "composition": "entity",
+      "terms": {
+        "object": "KnownPlan (auth-context plan family)",
+        "attributes": [
+          "variant: enum (Free/Go/Plus/Pro/ProLite/Team/SelfServeBusinessUsageBased/Business/EnterpriseCbpUsageBased/Enterprise/Edu)",
+          "display_name: &'static str (Free/Go/Plus/Pro/Pro Lite/Team/Self Serve Business Usage Based/Business/Enterprise CBP Usage Based/Enterprise/Edu)",
+          "raw_value: &'static str (lowercase wire form)",
+          "is_workspace_account: bool (computed — Team, SelfServeBusinessUsageBased, Business, EnterpriseCbpUsageBased, Enterprise, Edu)"
+        ],
+        "relationships": [
+          {"to": "SRC-0003/entity/auth-plan-type", "rel": "wrapped_by", "card": "1:1", "note": "PlanType::Known wraps a KnownPlan variant"}
+        ],
+        "data_flows": [
+          {"source": "raw string from auth API", "transform": "PlanType::from_raw_value: ascii-lowercase → match arm; aliases hc→Enterprise, education→Edu", "sink": "PlanType::Known(KnownPlan) or PlanType::Unknown(raw)"},
+          {"source": "KnownPlan", "transform": "raw_value()", "sink": "lowercase wire string"}
+        ],
+        "enumerations": {
+          "KnownPlan": ["Free", "Go", "Plus", "Pro", "ProLite", "Team", "SelfServeBusinessUsageBased", "Business", "EnterpriseCbpUsageBased", "Enterprise", "Edu"],
+          "workspace_account_group": ["Team", "SelfServeBusinessUsageBased", "Business", "EnterpriseCbpUsageBased", "Enterprise", "Edu"],
+          "raw_value_aliases": {"hc": "Enterprise", "education": "Edu"}
+        },
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0003/entity/auth-plan-type",
+      "src": "SRC-0003",
+      "composition": "entity",
+      "terms": {
+        "object": "PlanType (auth context — Known or Unknown(raw))",
+        "attributes": [
+          "Known(KnownPlan): recognised plan family",
+          "Unknown(String): raw plan string not matched by from_raw_value"
+        ],
+        "relationships": [
+          {"to": "SRC-0003/entity/known-plan", "rel": "contains_known_variant", "card": "1:1"}
+        ],
+        "data_flows": [
+          {"source": "wire JSON (untagged)", "transform": "serde untagged: try KnownPlan first, fall back to String → Unknown", "sink": "PlanType"}
+        ],
+        "enumerations": {"PlanType_variants": ["Known", "Unknown"]},
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0003/entity/refresh-token-failed-error",
+      "src": "SRC-0003",
+      "composition": "entity",
+      "terms": {
+        "object": "RefreshTokenFailedError",
+        "attributes": [
+          "reason: RefreshTokenFailedReason",
+          "message: String (human-readable failure message, used as Display)"
+        ],
+        "relationships": [
+          {"to": "SRC-0003/entity/refresh-token-failed-reason", "rel": "categorised_by", "card": "N:1"}
+        ],
+        "data_flows": [
+          {"source": "auth subsystem (token refresh outcome)", "transform": "RefreshTokenFailedError::new(reason, message)", "sink": "RefreshTokenFailedError"}
+        ],
+        "enumerations": null,
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0003/entity/refresh-token-failed-reason",
+      "src": "SRC-0003",
+      "composition": "entity",
+      "terms": {
+        "object": "RefreshTokenFailedReason",
+        "attributes": [
+          "variant: enum (Expired/Exhausted/Revoked/Other)"
+        ],
+        "relationships": null,
+        "data_flows": null,
+        "enumerations": {
+          "RefreshTokenFailedReason": ["Expired", "Exhausted", "Revoked", "Other"]
+        },
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0003/entity/reasoning-summary",
+      "src": "SRC-0003",
+      "composition": "entity",
+      "terms": {
+        "object": "ReasoningSummary (model reasoning summary mode)",
+        "attributes": [
+          "variant: enum (Auto/Concise/Detailed/None)"
+        ],
+        "relationships": null,
+        "data_flows": null,
+        "enumerations": {"ReasoningSummary": ["Auto", "Concise", "Detailed", "None"]},
+        "config": {
+          "default_reasoning_summary": {"value": "Auto", "source": "Default derive", "default": "Auto"}
+        }
+      }
+    },
+    {
+      "id": "SRC-0003/entity/verbosity",
+      "src": "SRC-0003",
+      "composition": "entity",
+      "terms": {
+        "object": "Verbosity (GPT-5 output length/detail control via Responses API)",
+        "attributes": ["variant: enum (Low/Medium/High)"],
+        "relationships": null,
+        "data_flows": null,
+        "enumerations": {"Verbosity": ["Low", "Medium", "High"]},
+        "config": {
+          "default_verbosity": {"value": "Medium", "source": "Default derive", "default": "Medium"}
+        }
+      }
+    },
+    {
+      "id": "SRC-0003/entity/sandbox-mode",
+      "src": "SRC-0003",
+      "composition": "entity",
+      "terms": {
+        "object": "SandboxMode",
+        "attributes": ["variant: enum (read-only/workspace-write/danger-full-access)"],
+        "relationships": null,
+        "data_flows": null,
+        "enumerations": {"SandboxMode": ["read-only", "workspace-write", "danger-full-access"]},
+        "config": {
+          "default_sandbox_mode": {"value": "read-only", "source": "Default derive", "default": "read-only"}
+        }
+      }
+    },
+    {
+      "id": "SRC-0003/entity/approvals-reviewer",
+      "src": "SRC-0003",
+      "composition": "entity",
+      "terms": {
+        "object": "ApprovalsReviewer (who approval requests are routed to)",
+        "attributes": [
+          "variant: enum (User/GuardianSubagent)",
+          "covers: sandbox escapes, blocked network access, MCP approval prompts, ARC escalations"
+        ],
+        "relationships": null,
+        "data_flows": [
+          {"source": "approval request", "transform": "route based on ApprovalsReviewer setting", "sink": "User prompt OR GuardianSubagent (carefully prompted subagent applying risk-based decision framework)"}
+        ],
+        "enumerations": {"ApprovalsReviewer": ["user", "guardian_subagent"]},
+        "config": {
+          "default_reviewer": {"value": "user", "source": "Default derive", "default": "user"}
+        }
+      }
+    },
+    {
+      "id": "SRC-0003/entity/windows-sandbox-level",
+      "src": "SRC-0003",
+      "composition": "entity",
+      "terms": {
+        "object": "WindowsSandboxLevel",
+        "attributes": ["variant: enum (disabled/restricted-token/elevated)"],
+        "relationships": null,
+        "data_flows": null,
+        "enumerations": {"WindowsSandboxLevel": ["disabled", "restricted-token", "elevated"]},
+        "config": {
+          "default_windows_sandbox_level": {"value": "disabled", "source": "Default derive", "default": "disabled"}
+        }
+      }
+    },
+    {
+      "id": "SRC-0003/entity/personality",
+      "src": "SRC-0003",
+      "composition": "entity",
+      "terms": {
+        "object": "Personality (model personality variant)",
+        "attributes": ["variant: enum (None/Friendly/Pragmatic)"],
+        "relationships": [
+          {"to": "SRC-0003/entity/model-instructions-variables", "rel": "selects_message", "card": "1:1"}
+        ],
+        "data_flows": [
+          {"source": "Personality selection (None/Friendly/Pragmatic)", "transform": "ModelInstructionsVariables::get_personality_message — None→empty string; Friendly→personality_friendly; Pragmatic→personality_pragmatic; absent personality→personality_default", "sink": "personality message string"}
+        ],
+        "enumerations": {"Personality": ["None", "Friendly", "Pragmatic"]},
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0003/entity/web-search-mode",
+      "src": "SRC-0003",
+      "composition": "entity",
+      "terms": {
+        "object": "WebSearchMode",
+        "attributes": ["variant: enum (Disabled/Cached/Live)"],
+        "relationships": null,
+        "data_flows": null,
+        "enumerations": {"WebSearchMode": ["Disabled", "Cached", "Live"]},
+        "config": {
+          "default_web_search_mode": {"value": "Cached", "source": "Default derive", "default": "Cached"}
+        }
+      }
+    },
+    {
+      "id": "SRC-0003/entity/web-search-context-size",
+      "src": "SRC-0003",
+      "composition": "entity",
+      "terms": {
+        "object": "WebSearchContextSize",
+        "attributes": ["variant: enum (Low/Medium/High)"],
+        "relationships": null,
+        "data_flows": null,
+        "enumerations": {"WebSearchContextSize": ["Low", "Medium", "High"]},
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0003/entity/web-search-location",
+      "src": "SRC-0003",
+      "composition": "entity",
+      "terms": {
+        "object": "WebSearchLocation (geographic location for web search)",
+        "attributes": [
+          "country: Option<String>",
+          "region: Option<String>",
+          "city: Option<String>",
+          "timezone: Option<String>"
+        ],
+        "relationships": [
+          {"to": "SRC-0003/entity/web-search-tool-config", "rel": "embedded_in", "card": "N:1"},
+          {"to": "SRC-0003/entity/web-search-user-location", "rel": "converts_to", "card": "1:1"}
+        ],
+        "data_flows": [
+          {"source": "base WebSearchLocation + overlay WebSearchLocation", "transform": "merge — overlay value preferred per field; otherwise fallback to base", "sink": "merged WebSearchLocation"},
+          {"source": "WebSearchLocation", "transform": "From<WebSearchLocation> for WebSearchUserLocation — type set to Approximate, fields copied", "sink": "WebSearchUserLocation"}
+        ],
+        "enumerations": null,
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0003/entity/web-search-tool-config",
+      "src": "SRC-0003",
+      "composition": "entity",
+      "terms": {
+        "object": "WebSearchToolConfig (tool-side web search config — denies unknown fields)",
+        "attributes": [
+          "context_size: Option<WebSearchContextSize>",
+          "allowed_domains: Option<Vec<String>>",
+          "location: Option<WebSearchLocation>"
+        ],
+        "relationships": [
+          {"to": "SRC-0003/entity/web-search-config", "rel": "converts_to", "card": "1:1"},
+          {"to": "SRC-0003/entity/web-search-location", "rel": "contains", "card": "1:0..1"}
+        ],
+        "data_flows": [
+          {"source": "base WebSearchToolConfig + overlay WebSearchToolConfig", "transform": "merge — context_size/allowed_domains overlay-then-base; location merged via WebSearchLocation::merge when both Some, otherwise pick the present one", "sink": "merged WebSearchToolConfig"},
+          {"source": "WebSearchToolConfig", "transform": "From<WebSearchToolConfig> for WebSearchConfig — allowed_domains→WebSearchFilters; location→WebSearchUserLocation; context_size→search_context_size", "sink": "WebSearchConfig"}
+        ],
+        "enumerations": null,
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0003/entity/web-search-filters",
+      "src": "SRC-0003",
+      "composition": "entity",
+      "terms": {
+        "object": "WebSearchFilters",
+        "attributes": ["allowed_domains: Option<Vec<String>>"],
+        "relationships": [
+          {"to": "SRC-0003/entity/web-search-config", "rel": "embedded_in", "card": "N:1"}
+        ],
+        "data_flows": null,
+        "enumerations": null,
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0003/entity/web-search-user-location",
+      "src": "SRC-0003",
+      "composition": "entity",
+      "terms": {
+        "object": "WebSearchUserLocation (user location sent to API)",
+        "attributes": [
+          "type: WebSearchUserLocationType (default Approximate)",
+          "country: Option<String>",
+          "region: Option<String>",
+          "city: Option<String>",
+          "timezone: Option<String>"
+        ],
+        "relationships": [
+          {"to": "SRC-0003/entity/web-search-config", "rel": "embedded_in", "card": "N:1"}
+        ],
+        "data_flows": null,
+        "enumerations": {"WebSearchUserLocationType": ["Approximate"]},
+        "config": {
+          "default_user_location_type": {"value": "Approximate", "source": "Default derive on WebSearchUserLocationType", "default": "Approximate"}
+        }
+      }
+    },
+    {
+      "id": "SRC-0003/entity/web-search-config",
+      "src": "SRC-0003",
+      "composition": "entity",
+      "terms": {
+        "object": "WebSearchConfig (final config sent to web-search service)",
+        "attributes": [
+          "filters: Option<WebSearchFilters>",
+          "user_location: Option<WebSearchUserLocation>",
+          "search_context_size: Option<WebSearchContextSize>"
+        ],
+        "relationships": [
+          {"to": "SRC-0003/entity/web-search-filters", "rel": "contains", "card": "1:0..1"},
+          {"to": "SRC-0003/entity/web-search-user-location", "rel": "contains", "card": "1:0..1"}
+        ],
+        "data_flows": null,
+        "enumerations": null,
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0003/entity/service-tier",
+      "src": "SRC-0003",
+      "composition": "entity",
+      "terms": {
+        "object": "ServiceTier",
+        "attributes": ["variant: enum (Fast/Flex)"],
+        "relationships": null,
+        "data_flows": null,
+        "enumerations": {"ServiceTier": ["Fast", "Flex"]},
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0003/entity/forced-login-method",
+      "src": "SRC-0003",
+      "composition": "entity",
+      "terms": {
+        "object": "ForcedLoginMethod",
+        "attributes": ["variant: enum (Chatgpt/Api)"],
+        "relationships": null,
+        "data_flows": null,
+        "enumerations": {"ForcedLoginMethod": ["Chatgpt", "Api"]},
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0003/entity/model-provider-auth-info",
+      "src": "SRC-0003",
+      "composition": "entity",
+      "terms": {
+        "object": "ModelProviderAuthInfo (config for obtaining provider bearer token via command)",
+        "attributes": [
+          "command: String (executable; bare names resolved via PATH; paths resolved against cwd)",
+          "args: Vec<String> (command arguments, default [])",
+          "timeout_ms: NonZeroU64 (max wait for token command exit)",
+          "refresh_interval_ms: u64 (max age for cached token before rerun; 0 disables proactive refresh, only rerun after 401)",
+          "cwd: AbsolutePathBuf (working directory for token command)",
+          "timeout(): Duration (derived from timeout_ms)",
+          "refresh_interval(): Option<Duration> (None when refresh_interval_ms is 0)"
+        ],
+        "relationships": null,
+        "data_flows": [
+          {"source": "config TOML (model_providers.<id>.auth)", "transform": "deserialize with deny_unknown_fields; defaults applied for missing fields", "sink": "ModelProviderAuthInfo"},
+          {"source": "ModelProviderAuthInfo", "transform": "spawn command with args in cwd; await up to timeout_ms; cache result up to refresh_interval_ms", "sink": "provider bearer token"}
+        ],
+        "enumerations": null,
+        "config": {
+          "timeout_ms": {"value": 5000, "source": "DEFAULT_PROVIDER_AUTH_TIMEOUT_MS const + serde default", "default": 5000},
+          "refresh_interval_ms": {"value": 300000, "source": "DEFAULT_PROVIDER_AUTH_REFRESH_INTERVAL_MS const + serde default", "default": 300000},
+          "args": {"value": "[]", "source": "serde default", "default": "[]"},
+          "cwd": {"value": "current working directory", "source": "default_provider_auth_cwd() — first attempts AbsolutePathBuf::deserialize(\".\"), falls back to AbsolutePathBuf::current_dir(); panics if neither resolves", "default": "."}
+        }
+      }
+    },
+    {
+      "id": "SRC-0003/entity/trust-level",
+      "src": "SRC-0003",
+      "composition": "entity",
+      "terms": {
+        "object": "TrustLevel (project directory trust — determines approval policy and sandbox mode)",
+        "attributes": ["variant: enum (Trusted/Untrusted)"],
+        "relationships": null,
+        "data_flows": null,
+        "enumerations": {"TrustLevel": ["Trusted", "Untrusted"]},
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0003/entity/alt-screen-mode",
+      "src": "SRC-0003",
+      "composition": "entity",
+      "terms": {
+        "object": "AltScreenMode (TUI alternate screen buffer control)",
+        "attributes": [
+          "variant: enum (Auto/Always/Never)",
+          "Auto: detect terminal multiplexer — disable in Zellij to preserve scrollback, enable elsewhere",
+          "Always: always use alternate screen (original behavior)",
+          "Never: never use alternate screen, run inline preserving scrollback in all multiplexers",
+          "CLI override: --no-alt-screen flag"
+        ],
+        "relationships": null,
+        "data_flows": [
+          {"source": "config setting + CLI flag --no-alt-screen + multiplexer detection", "transform": "Auto branches by Zellij detection; Always/Never bypass detection; --no-alt-screen overrides at runtime", "sink": "TUI rendering mode (alternate screen vs inline)"}
+        ],
+        "enumerations": {"AltScreenMode": ["auto", "always", "never"]},
+        "config": {
+          "default_alt_screen_mode": {"value": "auto", "source": "Default derive", "default": "auto"}
+        }
+      }
+    },
+    {
+      "id": "SRC-0003/entity/mode-kind",
+      "src": "SRC-0003",
+      "composition": "entity",
+      "terms": {
+        "object": "ModeKind (initial collaboration mode at TUI start)",
+        "attributes": [
+          "variant: enum (Plan/Default/PairProgramming/Execute)",
+          "display_name: &'static str (Plan/Default/Pair Programming/Execute)",
+          "is_tui_visible: bool (true for Plan and Default)",
+          "allows_request_user_input: bool (true only for Plan)",
+          "TUI_VISIBLE_COLLABORATION_MODES: const [ModeKind; 2] = [Default, Plan]",
+          "deserialize aliases for Default: code, pair_programming, execute, custom"
+        ],
+        "relationships": [
+          {"to": "SRC-0003/entity/collaboration-mode", "rel": "selects_mode", "card": "1:1"}
+        ],
+        "data_flows": [
+          {"source": "wire JSON (snake_case) including aliases code/pair_programming/execute/custom", "transform": "serde deserialize with aliases mapping all to Default; PairProgramming and Execute skipped from serialize/deserialize (hidden)", "sink": "ModeKind"}
+        ],
+        "enumerations": {"ModeKind": ["Plan", "Default", "PairProgramming", "Execute"], "deserialize_aliases_to_Default": ["code", "pair_programming", "execute", "custom"], "tui_visible": ["Default", "Plan"]},
+        "config": {
+          "default_mode_kind": {"value": "Default", "source": "Default derive", "default": "Default"}
+        }
+      }
+    },
+    {
+      "id": "SRC-0003/entity/collaboration-mode",
+      "src": "SRC-0003",
+      "composition": "entity",
+      "terms": {
+        "object": "CollaborationMode (collaboration mode for a Codex session — mode + settings)",
+        "attributes": [
+          "mode: ModeKind",
+          "settings: Settings (model + reasoning_effort + developer_instructions)",
+          "model(): &str (settings.model)",
+          "reasoning_effort(): Option<ReasoningEffort>"
+        ],
+        "relationships": [
+          {"to": "SRC-0003/entity/mode-kind", "rel": "has_mode", "card": "1:1"},
+          {"to": "SRC-0003/entity/settings", "rel": "has_settings", "card": "1:1"},
+          {"to": "SRC-0003/entity/collaboration-mode-mask", "rel": "applied_via_mask", "card": "1:N"}
+        ],
+        "data_flows": [
+          {"source": "CollaborationMode + (model, effort, developer_instructions) options", "transform": "with_updates — None keeps current; Some(value) replaces; Some(None) clears Option fields; mode preserved", "sink": "new CollaborationMode"},
+          {"source": "CollaborationMode + CollaborationModeMask", "transform": "apply_mask — mask.mode/model/reasoning_effort/developer_instructions replace when Some, otherwise keep current; mask.name ignored", "sink": "new CollaborationMode"}
+        ],
+        "enumerations": null,
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0003/entity/settings",
+      "src": "SRC-0003",
+      "composition": "entity",
+      "terms": {
+        "object": "Settings (collaboration mode settings)",
+        "attributes": [
+          "model: String",
+          "reasoning_effort: Option<ReasoningEffort>",
+          "developer_instructions: Option<String>"
+        ],
+        "relationships": [
+          {"to": "SRC-0003/entity/collaboration-mode", "rel": "embedded_in", "card": "N:1"},
+          {"to": "SRC-0003/entity/reasoning-effort", "rel": "uses", "card": "N:0..1"}
+        ],
+        "data_flows": null,
+        "enumerations": null,
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0003/entity/collaboration-mode-mask",
+      "src": "SRC-0003",
+      "composition": "entity",
+      "terms": {
+        "object": "CollaborationModeMask (mask for partial updates of a CollaborationMode)",
+        "attributes": [
+          "name: String (metadata for the mask itself, ignored when applied)",
+          "mode: Option<ModeKind>",
+          "model: Option<String>",
+          "reasoning_effort: Option<Option<ReasoningEffort>> (Some(None) clears)",
+          "developer_instructions: Option<Option<String>> (Some(None) clears)"
+        ],
+        "relationships": [
+          {"to": "SRC-0003/entity/collaboration-mode", "rel": "applied_to", "card": "N:1"}
+        ],
+        "data_flows": null,
+        "enumerations": null,
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0003/entity/reasoning-effort",
+      "src": "SRC-0003",
+      "composition": "entity",
+      "terms": {
+        "object": "ReasoningEffort (model reasoning effort)",
+        "attributes": [
+          "variant: enum (None/Minimal/Low/Medium/High/XHigh)",
+          "from_str: parses lowercase wire string; unknown → 'invalid reasoning_effort: <s>' error",
+          "rank: 0/1/2/3/4/5 (None/Minimal/Low/Medium/High/XHigh)"
+        ],
+        "relationships": [
+          {"to": "SRC-0003/entity/reasoning-effort-preset", "rel": "exposed_via", "card": "1:N"},
+          {"to": "SRC-0003/entity/model-preset", "rel": "default_effort_of", "card": "1:N"}
+        ],
+        "data_flows": [
+          {"source": "string from wire/CLI", "transform": "FromStr — serde_json::from_value with String; on error → 'invalid reasoning_effort: <s>'", "sink": "ReasoningEffort"},
+          {"source": "target ReasoningEffort + supported list", "transform": "nearest_effort — pick supported effort with minimum |rank(candidate) - rank(target)|; fallback target if list empty", "sink": "selected ReasoningEffort"}
+        ],
+        "enumerations": {"ReasoningEffort": ["None", "Minimal", "Low", "Medium", "High", "XHigh"], "rank_mapping": {"None": 0, "Minimal": 1, "Low": 2, "Medium": 3, "High": 4, "XHigh": 5}},
+        "config": {
+          "default_reasoning_effort": {"value": "Medium", "source": "Default derive", "default": "Medium"}
+        }
+      }
+    },
+    {
+      "id": "SRC-0003/entity/input-modality",
+      "src": "SRC-0003",
+      "composition": "entity",
+      "terms": {
+        "object": "InputModality (canonical user-input modality tags advertised by a model)",
+        "attributes": [
+          "variant: enum (Text/Image)",
+          "Text: plain text turns and tool payloads",
+          "Image: image attachments included in user turns"
+        ],
+        "relationships": [
+          {"to": "SRC-0003/entity/model-info", "rel": "advertised_by", "card": "N:N"},
+          {"to": "SRC-0003/entity/model-preset", "rel": "advertised_by", "card": "N:N"}
+        ],
+        "data_flows": [
+          {"source": "wire JSON (legacy payloads omit input_modalities)", "transform": "default_input_modalities — assume both [Text, Image] when omitted", "sink": "Vec<InputModality>"}
+        ],
+        "enumerations": {"InputModality": ["Text", "Image"]},
+        "config": {
+          "default_input_modalities": {"value": "[Text, Image]", "source": "default_input_modalities() — backward-compat default for legacy payloads", "default": "[Text, Image]"}
+        }
+      }
+    },
+    {
+      "id": "SRC-0003/entity/reasoning-effort-preset",
+      "src": "SRC-0003",
+      "composition": "entity",
+      "terms": {
+        "object": "ReasoningEffortPreset (a reasoning effort option surfaced for a model)",
+        "attributes": [
+          "effort: ReasoningEffort",
+          "description: String (short human description shown next to the effort in UIs)"
+        ],
+        "relationships": [
+          {"to": "SRC-0003/entity/reasoning-effort", "rel": "exposes", "card": "N:1"},
+          {"to": "SRC-0003/entity/model-preset", "rel": "exposed_via", "card": "N:1"}
+        ],
+        "data_flows": null,
+        "enumerations": null,
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0003/entity/model-upgrade",
+      "src": "SRC-0003",
+      "composition": "entity",
+      "terms": {
+        "object": "ModelUpgrade (recommended upgrade target for a model preset)",
+        "attributes": [
+          "id: String",
+          "reasoning_effort_mapping: Option<HashMap<ReasoningEffort, ReasoningEffort>>",
+          "migration_config_key: String",
+          "model_link: Option<String>",
+          "upgrade_copy: Option<String>",
+          "migration_markdown: Option<String>"
+        ],
+        "relationships": [
+          {"to": "SRC-0003/entity/model-info-upgrade", "rel": "converts_to", "card": "1:1"},
+          {"to": "SRC-0003/entity/model-preset", "rel": "recommended_for", "card": "N:1"}
+        ],
+        "data_flows": [
+          {"source": "&ModelUpgrade", "transform": "From<&ModelUpgrade> for ModelInfoUpgrade — model=upgrade.id; migration_markdown=upgrade.migration_markdown.clone().unwrap_or_default()", "sink": "ModelInfoUpgrade"}
+        ],
+        "enumerations": null,
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0003/entity/model-availability-nux",
+      "src": "SRC-0003",
+      "composition": "entity",
+      "terms": {
+        "object": "ModelAvailabilityNux (NUX shown when a preset becomes accessible)",
+        "attributes": ["message: String"],
+        "relationships": [
+          {"to": "SRC-0003/entity/model-preset", "rel": "embedded_in", "card": "N:1"},
+          {"to": "SRC-0003/entity/model-info", "rel": "embedded_in", "card": "N:1"}
+        ],
+        "data_flows": null,
+        "enumerations": null,
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0003/entity/model-preset",
+      "src": "SRC-0003",
+      "composition": "entity",
+      "terms": {
+        "object": "ModelPreset (Codex-supported model metadata used by UI/picker)",
+        "attributes": [
+          "id: String (stable preset identifier)",
+          "model: String (model slug, e.g. 'gpt-5')",
+          "display_name: String",
+          "description: String",
+          "default_reasoning_effort: ReasoningEffort (effort applied when none chosen)",
+          "supported_reasoning_efforts: Vec<ReasoningEffortPreset>",
+          "supports_personality: bool (default false)",
+          "additional_speed_tiers: Vec<String> (default [])",
+          "is_default: bool (default model for new users)",
+          "upgrade: Option<ModelUpgrade>",
+          "show_in_picker: bool (whether preset appears in picker UI)",
+          "availability_nux: Option<ModelAvailabilityNux>",
+          "supported_in_api: bool",
+          "input_modalities: Vec<InputModality> (default [Text, Image])",
+          "supports_fast_mode(): true if additional_speed_tiers contains 'fast' (SPEED_TIER_FAST)"
+        ],
+        "relationships": [
+          {"to": "SRC-0003/entity/reasoning-effort-preset", "rel": "supports", "card": "1:N"},
+          {"to": "SRC-0003/entity/reasoning-effort", "rel": "default_effort", "card": "N:1"},
+          {"to": "SRC-0003/entity/model-upgrade", "rel": "recommends_upgrade", "card": "N:0..1"},
+          {"to": "SRC-0003/entity/model-availability-nux", "rel": "advertises_via", "card": "1:0..1"},
+          {"to": "SRC-0003/entity/input-modality", "rel": "accepts", "card": "N:N"},
+          {"to": "SRC-0003/entity/model-info", "rel": "constructed_from", "card": "1:1"}
+        ],
+        "data_flows": [
+          {"source": "ModelInfo", "transform": "From<ModelInfo> — id=slug; default_reasoning_effort=default_reasoning_level.unwrap_or(None); is_default=false; show_in_picker=(visibility==List); upgrade.reasoning_effort_mapping built from supported_reasoning_levels; description.unwrap_or_default()", "sink": "ModelPreset"},
+          {"source": "Vec<ModelPreset> + chatgpt_mode flag", "transform": "filter_by_auth — keep all if chatgpt_mode, else only models with supported_in_api=true", "sink": "filtered Vec<ModelPreset>"},
+          {"source": "&mut [ModelPreset]", "transform": "mark_default_by_picker_visibility — clear all is_default; first picker-visible preset wins; otherwise first preset wins", "sink": "presets with one is_default=true"}
+        ],
+        "enumerations": null,
+        "config": {
+          "SPEED_TIER_FAST": {"value": "fast", "source": "pub const SPEED_TIER_FAST in openai_models.rs", "default": "fast"}
+        }
+      }
+    },
+    {
+      "id": "SRC-0003/entity/model-visibility",
+      "src": "SRC-0003",
+      "composition": "entity",
+      "terms": {
+        "object": "ModelVisibility (visibility of a model in the picker or APIs)",
+        "attributes": ["variant: enum (List/Hide/None)"],
+        "relationships": null,
+        "data_flows": null,
+        "enumerations": {"ModelVisibility": ["List", "Hide", "None"]},
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0003/entity/config-shell-tool-type",
+      "src": "SRC-0003",
+      "composition": "entity",
+      "terms": {
+        "object": "ConfigShellToolType (shell execution capability for a model)",
+        "attributes": ["variant: enum (Default/Local/UnifiedExec/Disabled/ShellCommand)"],
+        "relationships": null,
+        "data_flows": null,
+        "enumerations": {"ConfigShellToolType": ["default", "local", "unified_exec", "disabled", "shell_command"]},
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0003/entity/apply-patch-tool-type",
+      "src": "SRC-0003",
+      "composition": "entity",
+      "terms": {
+        "object": "ApplyPatchToolType",
+        "attributes": ["variant: enum (Freeform/Function)"],
+        "relationships": null,
+        "data_flows": null,
+        "enumerations": {"ApplyPatchToolType": ["freeform", "function"]},
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0003/entity/web-search-tool-type",
+      "src": "SRC-0003",
+      "composition": "entity",
+      "terms": {
+        "object": "WebSearchToolType",
+        "attributes": ["variant: enum (Text/TextAndImage)"],
+        "relationships": null,
+        "data_flows": null,
+        "enumerations": {"WebSearchToolType": ["text", "text_and_image"]},
+        "config": {
+          "default_web_search_tool_type": {"value": "text", "source": "Default derive", "default": "text"}
+        }
+      }
+    },
+    {
+      "id": "SRC-0003/entity/truncation-policy-config",
+      "src": "SRC-0003",
+      "composition": "entity",
+      "terms": {
+        "object": "TruncationPolicyConfig (server-provided truncation policy for a model)",
+        "attributes": [
+          "mode: TruncationMode (Bytes/Tokens)",
+          "limit: i64",
+          "bytes(limit): const constructor (mode=Bytes)",
+          "tokens(limit): const constructor (mode=Tokens)"
+        ],
+        "relationships": [
+          {"to": "SRC-0003/entity/model-info", "rel": "embedded_in", "card": "1:1"}
+        ],
+        "data_flows": null,
+        "enumerations": {"TruncationMode": ["bytes", "tokens"]},
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0003/entity/client-version",
+      "src": "SRC-0003",
+      "composition": "entity",
+      "terms": {
+        "object": "ClientVersion (semantic version triple — major, minor, patch — encoded as JSON array, e.g. [0, 62, 0])",
+        "attributes": [
+          "0: i32 (major)",
+          "1: i32 (minor)",
+          "2: i32 (patch)"
+        ],
+        "relationships": null,
+        "data_flows": null,
+        "enumerations": null,
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0003/entity/model-info",
+      "src": "SRC-0003",
+      "composition": "entity",
+      "terms": {
+        "object": "ModelInfo (model metadata returned by Codex backend /models endpoint)",
+        "attributes": [
+          "slug: String",
+          "display_name: String",
+          "description: Option<String>",
+          "default_reasoning_level: Option<ReasoningEffort>",
+          "supported_reasoning_levels: Vec<ReasoningEffortPreset>",
+          "shell_type: ConfigShellToolType",
+          "visibility: ModelVisibility",
+          "supported_in_api: bool",
+          "priority: i32",
+          "additional_speed_tiers: Vec<String>",
+          "availability_nux: Option<ModelAvailabilityNux>",
+          "upgrade: Option<ModelInfoUpgrade>",
+          "base_instructions: String",
+          "model_messages: Option<ModelMessages>",
+          "supports_reasoning_summaries: bool",
+          "default_reasoning_summary: ReasoningSummary",
+          "support_verbosity: bool",
+          "default_verbosity: Option<Verbosity>",
+          "apply_patch_tool_type: Option<ApplyPatchToolType>",
+          "web_search_tool_type: WebSearchToolType (default Text)",
+          "truncation_policy: TruncationPolicyConfig",
+          "supports_parallel_tool_calls: bool",
+          "supports_image_detail_original: bool",
+          "context_window: Option<i64>",
+          "auto_compact_token_limit: Option<i64> (token threshold for automatic compaction)",
+          "effective_context_window_percent: i64 (percentage of context window usable for inputs after reserving headroom)",
+          "experimental_supported_tools: Vec<String>",
+          "input_modalities: Vec<InputModality>",
+          "used_fallback_model_metadata: bool (internal-only marker; skipped from serde and schemas)",
+          "supports_search_tool: bool",
+          "supports_personality(): true if model_messages.supports_personality()",
+          "auto_compact_token_limit() (computed): when context_window present, derives 90% threshold and clamps config_limit ≤ 90% of context_window; falls back to config_limit alone if no context_window",
+          "get_model_instructions(personality): if model_messages.instructions_template present → replace {{ personality }} with personality message (default-empty); else if personality requested without model_messages → warn and return base_instructions; else return base_instructions"
+        ],
+        "relationships": [
+          {"to": "SRC-0003/entity/model-preset", "rel": "converts_to", "card": "1:1"},
+          {"to": "SRC-0003/entity/reasoning-effort-preset", "rel": "advertises", "card": "1:N"},
+          {"to": "SRC-0003/entity/config-shell-tool-type", "rel": "uses", "card": "N:1"},
+          {"to": "SRC-0003/entity/model-visibility", "rel": "uses", "card": "N:1"},
+          {"to": "SRC-0003/entity/model-availability-nux", "rel": "advertises_via", "card": "1:0..1"},
+          {"to": "SRC-0003/entity/model-info-upgrade", "rel": "recommends_upgrade", "card": "N:0..1"},
+          {"to": "SRC-0003/entity/model-messages", "rel": "uses_template", "card": "1:0..1"},
+          {"to": "SRC-0003/entity/reasoning-summary", "rel": "uses", "card": "N:1"},
+          {"to": "SRC-0003/entity/verbosity", "rel": "uses", "card": "N:0..1"},
+          {"to": "SRC-0003/entity/apply-patch-tool-type", "rel": "uses", "card": "N:0..1"},
+          {"to": "SRC-0003/entity/web-search-tool-type", "rel": "uses", "card": "N:1"},
+          {"to": "SRC-0003/entity/truncation-policy-config", "rel": "uses", "card": "N:1"},
+          {"to": "SRC-0003/entity/input-modality", "rel": "advertises", "card": "N:N"},
+          {"to": "SRC-0003/entity/models-response", "rel": "embedded_in", "card": "N:1"}
+        ],
+        "data_flows": [
+          {"source": "Codex backend /models endpoint", "transform": "deserialize ModelInfo with serde defaults filling missing fields", "sink": "ModelInfo"},
+          {"source": "ModelInfo (with optional ModelMessages template)", "transform": "get_model_instructions — template replace {{ personality }} when present; otherwise base_instructions (with warn! if personality requested but model_messages missing)", "sink": "model instructions string"}
+        ],
+        "enumerations": null,
+        "config": {
+          "default_effective_context_window_percent": {"value": 95, "source": "default_effective_context_window_percent() const fn → 95", "default": 95},
+          "default_input_modalities": {"value": "[Text, Image]", "source": "default_input_modalities() helper", "default": "[Text, Image]"},
+          "default_web_search_tool_type": {"value": "Text", "source": "WebSearchToolType::default()", "default": "Text"},
+          "auto_compact_threshold_pct": {"value": "90% of context_window", "source": "ModelInfo::auto_compact_token_limit derivation", "default": "90% of context_window when context_window present"},
+          "PERSONALITY_PLACEHOLDER": {"value": "{{ personality }}", "source": "const PERSONALITY_PLACEHOLDER in openai_models.rs", "default": "{{ personality }}"}
+        }
+      }
+    },
+    {
+      "id": "SRC-0003/entity/model-messages",
+      "src": "SRC-0003",
+      "composition": "entity",
+      "terms": {
+        "object": "ModelMessages (template for assembling model instructions and developer messages)",
+        "attributes": [
+          "instructions_template: Option<String> (overrides base_instructions when populated and valid)",
+          "instructions_variables: Option<ModelInstructionsVariables>",
+          "has_personality_placeholder(): true if template contains {{ personality }}",
+          "supports_personality(): true if has_personality_placeholder AND instructions_variables.is_complete()",
+          "get_personality_message(personality): delegates to instructions_variables"
+        ],
+        "relationships": [
+          {"to": "SRC-0003/entity/model-instructions-variables", "rel": "uses", "card": "1:0..1"},
+          {"to": "SRC-0003/entity/model-info", "rel": "embedded_in", "card": "1:1"}
+        ],
+        "data_flows": null,
+        "enumerations": null,
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0003/entity/model-instructions-variables",
+      "src": "SRC-0003",
+      "composition": "entity",
+      "terms": {
+        "object": "ModelInstructionsVariables (per-personality template variables)",
+        "attributes": [
+          "personality_default: Option<String>",
+          "personality_friendly: Option<String>",
+          "personality_pragmatic: Option<String>",
+          "is_complete(): true iff all three personality_* are Some",
+          "get_personality_message(personality): None→empty string; Friendly→personality_friendly.clone; Pragmatic→personality_pragmatic.clone; absent personality→personality_default.clone"
+        ],
+        "relationships": [
+          {"to": "SRC-0003/entity/personality", "rel": "selected_by", "card": "1:N"},
+          {"to": "SRC-0003/entity/model-messages", "rel": "embedded_in", "card": "1:1"}
+        ],
+        "data_flows": null,
+        "enumerations": null,
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0003/entity/model-info-upgrade",
+      "src": "SRC-0003",
+      "composition": "entity",
+      "terms": {
+        "object": "ModelInfoUpgrade (upgrade hint surfaced inside ModelInfo)",
+        "attributes": [
+          "model: String (target model slug)",
+          "migration_markdown: String"
+        ],
+        "relationships": [
+          {"to": "SRC-0003/entity/model-upgrade", "rel": "constructed_from", "card": "1:1"},
+          {"to": "SRC-0003/entity/model-info", "rel": "embedded_in", "card": "N:1"}
+        ],
+        "data_flows": null,
+        "enumerations": null,
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0003/entity/models-response",
+      "src": "SRC-0003",
+      "composition": "entity",
+      "terms": {
+        "object": "ModelsResponse (response wrapper for /models endpoint)",
+        "attributes": ["models: Vec<ModelInfo>"],
+        "relationships": [
+          {"to": "SRC-0003/entity/model-info", "rel": "contains", "card": "1:N"}
+        ],
+        "data_flows": [
+          {"source": "Codex backend /models endpoint", "transform": "deserialize as ModelsResponse", "sink": "Vec<ModelInfo>"}
+        ],
+        "enumerations": null,
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0003/entity/sandbox-err",
+      "src": "SRC-0003",
+      "composition": "entity",
+      "terms": {
+        "object": "SandboxErr (sandbox error variants)",
+        "attributes": [
+          "Denied { output: ExecToolCallOutput, network_policy_decision: Option<NetworkPolicyDecisionPayload> } — message includes exit code, stdout, stderr",
+          "SeccompInstall(seccompiler::Error) [linux only]",
+          "SeccompBackend(seccompiler::BackendError) [linux only]",
+          "Timeout { output: ExecToolCallOutput } — 'command timed out'",
+          "Signal(i32) — 'command was killed by a signal'",
+          "LandlockRestrict — 'Landlock was not able to fully enforce all sandbox rules'"
+        ],
+        "relationships": [
+          {"to": "SRC-0003/entity/codex-err", "rel": "wrapped_as", "card": "1:1", "note": "From<SandboxErr> for CodexErr → Sandbox variant"}
+        ],
+        "data_flows": null,
+        "enumerations": {"SandboxErr_variants": ["Denied", "SeccompInstall", "SeccompBackend", "Timeout", "Signal", "LandlockRestrict"]},
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0003/entity/codex-err",
+      "src": "SRC-0003",
+      "composition": "entity",
+      "terms": {
+        "object": "CodexErr (top-level Codex error enum)",
+        "attributes": [
+          "TurnAborted",
+          "Stream(String, Option<Duration>) — SSE stream disconnects after handshake but before response.completed; treated as transient retry by Session loop",
+          "ContextWindowExceeded",
+          "ThreadNotFound(ThreadId)",
+          "AgentLimitReached { max_threads: usize }",
+          "SessionConfiguredNotFirstEvent",
+          "Timeout — child process did not exit (10s timeout per docstring)",
+          "Spawn — run_command_stream could not capture child stdout/stderr",
+          "Interrupted — user pressed Ctrl-C (SIGINT)",
+          "UnexpectedStatus(UnexpectedResponseError)",
+          "InvalidRequest(String)",
+          "InvalidImageRequest()",
+          "UsageLimitReached(UsageLimitReachedError)",
+          "ServerOverloaded — 'Selected model is at capacity'",
+          "ResponseStreamFailed(ResponseStreamFailed)",
+          "ConnectionFailed(ConnectionFailedError)",
+          "QuotaExceeded — 'Quota exceeded. Check your plan and billing details.'",
+          "UsageNotIncluded — 'To use Codex with your ChatGPT plan, upgrade to Plus'",
+          "InternalServerError — 'currently experiencing high demand'",
+          "RetryLimit(RetryLimitReachedError)",
+          "InternalAgentDied — 'agent loop died unexpectedly'",
+          "Sandbox(SandboxErr) — From<SandboxErr>",
+          "LandlockSandboxExecutableNotProvided",
+          "UnsupportedOperation(String)",
+          "RefreshTokenFailed(RefreshTokenFailedError)",
+          "Fatal(String)",
+          "Io(io::Error) — From<io::Error>",
+          "Json(serde_json::Error) — From<serde_json::Error>",
+          "LandlockRuleset [linux] — From<landlock::RulesetError>",
+          "LandlockPathFd [linux] — From<landlock::PathFdError>",
+          "TokioJoin(JoinError) — From<JoinError>",
+          "EnvVar(EnvVarError)",
+          "is_retryable(): bool (transient vs terminal — see retryable enum below)",
+          "downcast_ref<T>: thin shim mirroring anyhow::Error::downcast_ref behaviour on the concrete enum",
+          "to_codex_protocol_error(): translates to CodexErrorInfo for client-facing protocol",
+          "to_error_event(prefix?): builds ErrorEvent with formatted message and codex_error_info=Some(to_codex_protocol_error)",
+          "http_status_code_value(): RetryLimit→err.status; UnexpectedStatus→err.status; ConnectionFailed→err.source.status(); ResponseStreamFailed→err.source.status(); else None"
+        ],
+        "relationships": [
+          {"to": "SRC-0003/entity/sandbox-err", "rel": "wraps", "card": "1:1"},
+          {"to": "SRC-0003/entity/unexpected-response-error", "rel": "wraps", "card": "1:1"},
+          {"to": "SRC-0003/entity/connection-failed-error", "rel": "wraps", "card": "1:1"},
+          {"to": "SRC-0003/entity/response-stream-failed", "rel": "wraps", "card": "1:1"},
+          {"to": "SRC-0003/entity/retry-limit-reached-error", "rel": "wraps", "card": "1:1"},
+          {"to": "SRC-0003/entity/usage-limit-reached-error", "rel": "wraps", "card": "1:1"},
+          {"to": "SRC-0003/entity/refresh-token-failed-error", "rel": "wraps", "card": "1:1"},
+          {"to": "SRC-0003/entity/env-var-error", "rel": "wraps", "card": "1:1"}
+        ],
+        "data_flows": [
+          {"source": "CancelErr (codex_async_utils)", "transform": "From<CancelErr> for CodexErr → CodexErr::TurnAborted (information about cause discarded)", "sink": "CodexErr::TurnAborted"},
+          {"source": "CodexErr", "transform": "to_codex_protocol_error → CodexErrorInfo (mapping table — see Rules)", "sink": "CodexErrorInfo for client protocol"},
+          {"source": "CodexErr (+ optional message_prefix)", "transform": "to_error_event — message = prefix.is_some ? '{prefix}: {error}' : error_string", "sink": "ErrorEvent { message, codex_error_info }"},
+          {"source": "CodexErr message string", "transform": "get_error_message_ui — Sandbox::Denied uses aggregated_output if non-empty, otherwise stderr/stdout combinations or fallback 'command failed inside sandbox with exit code N'; Sandbox::Timeout formats 'error: command timed out after N ms'; everything else uses to_string(); then truncate_text with TruncationPolicy::Bytes(2*1024)", "sink": "UI-safe error message ≤2 KiB"}
+        ],
+        "enumerations": {
+          "retryable_true": ["Stream", "Timeout", "UnexpectedStatus", "ResponseStreamFailed", "ConnectionFailed", "InternalServerError", "InternalAgentDied", "Io", "Json", "TokioJoin"],
+          "retryable_false": ["TurnAborted", "Interrupted", "EnvVar", "Fatal", "UsageNotIncluded", "QuotaExceeded", "InvalidImageRequest", "InvalidRequest", "RefreshTokenFailed", "UnsupportedOperation", "Sandbox", "LandlockSandboxExecutableNotProvided", "RetryLimit", "ContextWindowExceeded", "ThreadNotFound", "AgentLimitReached", "Spawn", "SessionConfiguredNotFirstEvent", "UsageLimitReached", "ServerOverloaded", "LandlockRuleset", "LandlockPathFd"],
+          "to_codex_protocol_error_mapping": {
+            "ContextWindowExceeded": "ContextWindowExceeded",
+            "UsageLimitReached|QuotaExceeded|UsageNotIncluded": "UsageLimitExceeded",
+            "ServerOverloaded": "ServerOverloaded",
+            "RetryLimit": "ResponseTooManyFailedAttempts { http_status_code }",
+            "ConnectionFailed": "HttpConnectionFailed { http_status_code }",
+            "ResponseStreamFailed": "ResponseStreamConnectionFailed { http_status_code }",
+            "RefreshTokenFailed": "Unauthorized",
+            "SessionConfiguredNotFirstEvent|InternalServerError|InternalAgentDied": "InternalServerError",
+            "UnsupportedOperation|ThreadNotFound|AgentLimitReached": "BadRequest",
+            "Sandbox": "SandboxError",
+            "_default": "Other"
+          }
+        },
+        "config": {
+          "ERROR_MESSAGE_UI_MAX_BYTES": {"value": "2 * 1024", "source": "const ERROR_MESSAGE_UI_MAX_BYTES in error.rs", "default": "2048"}
+        }
+      }
+    },
+    {
+      "id": "SRC-0003/entity/connection-failed-error",
+      "src": "SRC-0003",
+      "composition": "entity",
+      "terms": {
+        "object": "ConnectionFailedError",
+        "attributes": [
+          "source: reqwest::Error (underlying transport error)",
+          "Display: 'Connection failed: {source}'"
+        ],
+        "relationships": [
+          {"to": "SRC-0003/entity/codex-err", "rel": "wrapped_by", "card": "1:1"}
+        ],
+        "data_flows": null,
+        "enumerations": null,
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0003/entity/response-stream-failed",
+      "src": "SRC-0003",
+      "composition": "entity",
+      "terms": {
+        "object": "ResponseStreamFailed",
+        "attributes": [
+          "source: reqwest::Error",
+          "request_id: Option<String>",
+          "Display: 'Error while reading the server response: {source}[, request id: {id}]'"
+        ],
+        "relationships": [
+          {"to": "SRC-0003/entity/codex-err", "rel": "wrapped_by", "card": "1:1"}
+        ],
+        "data_flows": null,
+        "enumerations": null,
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0003/entity/unexpected-response-error",
+      "src": "SRC-0003",
+      "composition": "entity",
+      "terms": {
+        "object": "UnexpectedResponseError (HTTP response with unexpected status)",
+        "attributes": [
+          "status: StatusCode",
+          "body: String",
+          "url: Option<String>",
+          "cf_ray: Option<String>",
+          "request_id: Option<String>",
+          "identity_authorization_error: Option<String>",
+          "identity_error_code: Option<String>"
+        ],
+        "relationships": [
+          {"to": "SRC-0003/entity/codex-err", "rel": "wrapped_by", "card": "1:1"}
+        ],
+        "data_flows": [
+          {"source": "UnexpectedResponseError.body (JSON)", "transform": "extract_error_message — parse body as JSON, take .error.message, trim; empty → None", "sink": "Option<String> message"},
+          {"source": "UnexpectedResponseError.body", "transform": "display_body — extract_error_message OR trimmed body OR 'Unknown error'; truncate_with_ellipsis to UNEXPECTED_RESPONSE_BODY_MAX_BYTES (1000)", "sink": "human-readable body string"},
+          {"source": "UnexpectedResponseError (status=403, body contains 'Cloudflare' AND 'blocked')", "transform": "friendly_message — emits CLOUDFLARE_BLOCKED_MESSAGE with status, optional url/cf_ray/request_id/auth error fields", "sink": "Cloudflare-friendly message"},
+          {"source": "UnexpectedResponseError", "transform": "Display — friendly_message if Some, else 'unexpected status {status}: {display_body}' with optional url/cf_ray/request_id/auth-error appended", "sink": "displayed error string"}
+        ],
+        "enumerations": null,
+        "config": {
+          "UNEXPECTED_RESPONSE_BODY_MAX_BYTES": {"value": 1000, "source": "const UNEXPECTED_RESPONSE_BODY_MAX_BYTES in error.rs", "default": 1000},
+          "CLOUDFLARE_BLOCKED_MESSAGE": {"value": "Access blocked by Cloudflare. This usually happens when connecting from a restricted region", "source": "const CLOUDFLARE_BLOCKED_MESSAGE in error.rs", "default": "Access blocked by Cloudflare. This usually happens when connecting from a restricted region"}
+        }
+      }
+    },
+    {
+      "id": "SRC-0003/entity/retry-limit-reached-error",
+      "src": "SRC-0003",
+      "composition": "entity",
+      "terms": {
+        "object": "RetryLimitReachedError (retry budget exhausted)",
+        "attributes": [
+          "status: StatusCode (last status seen)",
+          "request_id: Option<String>",
+          "Display: 'exceeded retry limit, last status: {status}[, request id: {id}]'"
+        ],
+        "relationships": [
+          {"to": "SRC-0003/entity/codex-err", "rel": "wrapped_by", "card": "1:1"}
+        ],
+        "data_flows": null,
+        "enumerations": null,
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0003/entity/usage-limit-reached-error",
+      "src": "SRC-0003",
+      "composition": "entity",
+      "terms": {
+        "object": "UsageLimitReachedError (per-plan usage cap reached)",
+        "attributes": [
+          "plan_type: Option<PlanType>",
+          "resets_at: Option<DateTime<Utc>>",
+          "rate_limits: Option<Box<RateLimitSnapshot>>",
+          "promo_message: Option<String>",
+          "Display: branches by rate_limits.limit_name, promo_message, plan_type — see Rules for full message matrix"
+        ],
+        "relationships": [
+          {"to": "SRC-0003/entity/codex-err", "rel": "wrapped_by", "card": "1:1"},
+          {"to": "SRC-0003/entity/auth-plan-type", "rel": "describes", "card": "N:0..1"}
+        ],
+        "data_flows": [
+          {"source": "UsageLimitReachedError + current time (now_for_retry)", "transform": "Display: pick message branch based on (rate_limits.limit_name non-empty AND not 'codex'), or promo_message present, or plan_type variant; append retry_suffix (or retry_suffix_after_or for some branches) — formatted via format_retry_timestamp", "sink": "displayed message string"}
+        ],
+        "enumerations": null,
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0003/entity/env-var-error",
+      "src": "SRC-0003",
+      "composition": "entity",
+      "terms": {
+        "object": "EnvVarError (missing/invalid environment variable)",
+        "attributes": [
+          "var: String (name of the missing variable)",
+          "instructions: Option<String> (optional help text)",
+          "Display: 'Missing environment variable: `{var}`.[ {instructions}]'"
+        ],
+        "relationships": [
+          {"to": "SRC-0003/entity/codex-err", "rel": "wrapped_by", "card": "1:1"}
+        ],
+        "data_flows": null,
+        "enumerations": null,
+        "config": null
+      }
+    }
+  ]
+}

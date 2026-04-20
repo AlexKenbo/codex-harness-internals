@@ -1,0 +1,2302 @@
+{
+  "src": "SRC-0001",
+  "schema_version": "2.0",
+  "lens": "structural",
+  "compositions": [
+    {
+      "id": "SRC-0001/entity/submission",
+      "src": "SRC-0001",
+      "composition": "entity",
+      "terms": {
+        "object": "Submission — Submission Queue Entry, запрос от пользователя к агенту в SQ/EQ паттерне (protocol.rs:107-116)",
+        "attributes": [
+          "id: String (уникальный id для корреляции с Events)",
+          "op: Op (payload операции)",
+          "trace: Option<W3cTraceContext> (W3C trace carrier для async handoffs)"
+        ],
+        "relationships": [
+          {"to": "SRC-0001/entity/op", "rel": "contains", "card": "1:1"},
+          {"to": "SRC-0001/entity/event", "rel": "correlates_with_by_id", "card": "1:N"}
+        ],
+        "enumerations": null,
+        "data_flows": [
+          {"source": "user/client", "transform": "wrap op + trace + id", "sink": "Submission Queue (agent)"}
+        ],
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0001/entity/op",
+      "src": "SRC-0001",
+      "composition": "entity",
+      "terms": {
+        "object": "Op — submission operation, payload запроса пользователя (protocol.rs:379-688). 32 варианта операций",
+        "attributes": [
+          "kind: &'static str (строковый kind для каждого варианта)"
+        ],
+        "relationships": [
+          {"to": "SRC-0001/entity/submission", "rel": "carried_by", "card": "1:1"},
+          {"to": "SRC-0001/entity/user-input", "rel": "uses", "card": "1:N"},
+          {"to": "SRC-0001/entity/review-request", "rel": "uses", "card": "1:1"},
+          {"to": "SRC-0001/entity/sandbox-policy", "rel": "uses", "card": "1:1"},
+          {"to": "SRC-0001/entity/ask-for-approval", "rel": "uses", "card": "1:1"},
+          {"to": "SRC-0001/entity/inter-agent-communication", "rel": "uses", "card": "1:1"}
+        ],
+        "enumerations": {
+          "Op_variants": [
+            "Interrupt",
+            "CleanBackgroundTerminals",
+            "RealtimeConversationStart",
+            "RealtimeConversationAudio",
+            "RealtimeConversationText",
+            "RealtimeConversationClose",
+            "RealtimeConversationListVoices",
+            "UserInput",
+            "UserTurn",
+            "InterAgentCommunication",
+            "OverrideTurnContext",
+            "ExecApproval",
+            "PatchApproval",
+            "ResolveElicitation",
+            "UserInputAnswer",
+            "RequestPermissionsResponse",
+            "DynamicToolResponse",
+            "AddToHistory",
+            "GetHistoryEntryRequest",
+            "ListMcpTools",
+            "RefreshMcpServers",
+            "ReloadUserConfig",
+            "ListSkills",
+            "Compact",
+            "DropMemories",
+            "UpdateMemories",
+            "SetThreadName",
+            "SetThreadMemoryMode",
+            "Undo",
+            "ThreadRollback",
+            "Review",
+            "Shutdown",
+            "RunUserShellCommand",
+            "ListModels"
+          ]
+        },
+        "data_flows": [
+          {"source": "user client", "transform": "tagged-enum serde (type, snake_case)", "sink": "agent submission handler"}
+        ],
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0001/entity/user-turn",
+      "src": "SRC-0001",
+      "composition": "entity",
+      "terms": {
+        "object": "UserTurn — вариант Op с полным контекстом одного хода (protocol.rs:420-473). Предпочтителен над UserInput",
+        "attributes": [
+          "items: Vec<UserInput>",
+          "cwd: PathBuf (рабочая директория для SandboxPolicy и shell вызовов)",
+          "approval_policy: AskForApproval",
+          "approvals_reviewer: Option<ApprovalsReviewer>",
+          "sandbox_policy: SandboxPolicy",
+          "model: String (slug модели для client session)",
+          "effort: Option<ReasoningEffortConfig>",
+          "summary: Option<ReasoningSummaryConfig>",
+          "service_tier: Option<Option<ServiceTier>>",
+          "final_output_json_schema: Option<Value> (JSON Schema для финального assistant message)",
+          "collaboration_mode: Option<CollaborationMode> (EXPERIMENTAL — приоритет над model, effort, developer instructions)",
+          "personality: Option<Personality>"
+        ],
+        "relationships": [
+          {"to": "SRC-0001/entity/user-input", "rel": "contains", "card": "1:N"},
+          {"to": "SRC-0001/entity/sandbox-policy", "rel": "applies", "card": "1:1"},
+          {"to": "SRC-0001/entity/ask-for-approval", "rel": "applies", "card": "1:1"}
+        ],
+        "enumerations": null,
+        "data_flows": null,
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0001/entity/event",
+      "src": "SRC-0001",
+      "composition": "entity",
+      "terms": {
+        "object": "Event — Event Queue Entry, событие от агента (protocol.rs:1387-1392)",
+        "attributes": [
+          "id: String (Submission id с которым это событие коррелирует)",
+          "msg: EventMsg (payload)"
+        ],
+        "relationships": [
+          {"to": "SRC-0001/entity/submission", "rel": "correlates_with_by_id", "card": "N:1"},
+          {"to": "SRC-0001/entity/event-msg", "rel": "contains", "card": "1:1"}
+        ],
+        "enumerations": null,
+        "data_flows": [
+          {"source": "agent", "transform": "wrap msg + submission id", "sink": "Event Queue (client)"}
+        ],
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0001/entity/event-msg",
+      "src": "SRC-0001",
+      "composition": "entity",
+      "terms": {
+        "object": "EventMsg — response event payload от агента (protocol.rs:1400-1604). Tagged enum со snake_case variants. Инвариант: none of these values have optional types (иначе ломает extension code-gen)",
+        "attributes": null,
+        "relationships": [
+          {"to": "SRC-0001/entity/event", "rel": "carried_by", "card": "1:1"},
+          {"to": "SRC-0001/entity/turn-item", "rel": "wraps_in_item_started_completed", "card": "1:1"},
+          {"to": "SRC-0001/entity/response-item", "rel": "wraps_in_raw_response_item", "card": "1:1"}
+        ],
+        "enumerations": {
+          "EventMsg_variants": [
+            "Error",
+            "Warning",
+            "RealtimeConversationStarted",
+            "RealtimeConversationRealtime",
+            "RealtimeConversationClosed",
+            "RealtimeConversationSdp",
+            "ModelReroute",
+            "ContextCompacted",
+            "ThreadRolledBack",
+            "TurnStarted (serde rename task_started, alias turn_started)",
+            "TurnComplete (serde rename task_complete, alias turn_complete)",
+            "TokenCount",
+            "AgentMessage",
+            "UserMessage",
+            "AgentMessageDelta",
+            "AgentReasoning",
+            "AgentReasoningDelta",
+            "AgentReasoningRawContent",
+            "AgentReasoningRawContentDelta",
+            "AgentReasoningSectionBreak",
+            "SessionConfigured",
+            "ThreadNameUpdated",
+            "McpStartupUpdate",
+            "McpStartupComplete",
+            "McpToolCallBegin",
+            "McpToolCallEnd",
+            "WebSearchBegin",
+            "WebSearchEnd",
+            "ImageGenerationBegin",
+            "ImageGenerationEnd",
+            "ExecCommandBegin",
+            "ExecCommandOutputDelta",
+            "TerminalInteraction",
+            "ExecCommandEnd",
+            "ViewImageToolCall",
+            "ExecApprovalRequest",
+            "RequestPermissions",
+            "RequestUserInput",
+            "DynamicToolCallRequest",
+            "DynamicToolCallResponse",
+            "ElicitationRequest",
+            "ApplyPatchApprovalRequest",
+            "GuardianAssessment",
+            "DeprecationNotice",
+            "BackgroundEvent",
+            "UndoStarted",
+            "UndoCompleted",
+            "StreamError",
+            "PatchApplyBegin",
+            "PatchApplyEnd",
+            "TurnDiff",
+            "GetHistoryEntryResponse",
+            "McpListToolsResponse",
+            "ListSkillsResponse",
+            "RealtimeConversationListVoicesResponse",
+            "SkillsUpdateAvailable",
+            "PlanUpdate",
+            "TurnAborted",
+            "ShutdownComplete",
+            "EnteredReviewMode",
+            "ExitedReviewMode",
+            "RawResponseItem",
+            "ItemStarted",
+            "ItemCompleted",
+            "HookStarted",
+            "HookCompleted",
+            "AgentMessageContentDelta",
+            "PlanDelta",
+            "ReasoningContentDelta",
+            "ReasoningRawContentDelta",
+            "CollabAgentSpawnBegin",
+            "CollabAgentSpawnEnd",
+            "CollabAgentInteractionBegin",
+            "CollabAgentInteractionEnd",
+            "CollabWaitingBegin",
+            "CollabWaitingEnd",
+            "CollabCloseBegin",
+            "CollabCloseEnd",
+            "CollabResumeBegin",
+            "CollabResumeEnd"
+          ]
+        },
+        "data_flows": [
+          {"source": "agent turn processing", "transform": "emit as tagged enum (type, snake_case)", "sink": "client UI/frontend"}
+        ],
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0001/entity/turn-item",
+      "src": "SRC-0001",
+      "composition": "entity",
+      "terms": {
+        "object": "TurnItem — элемент потока turn-item (items.rs:28-37). Tagged enum, каждый вариант имеет id() и as_legacy_events()",
+        "attributes": [
+          "id: String (делегируется варианту)"
+        ],
+        "relationships": [
+          {"to": "SRC-0001/entity/user-message-item", "rel": "variant", "card": "1:1"},
+          {"to": "SRC-0001/entity/agent-message-item", "rel": "variant", "card": "1:1"},
+          {"to": "SRC-0001/entity/reasoning-item", "rel": "variant", "card": "1:1"},
+          {"to": "SRC-0001/entity/web-search-item", "rel": "variant", "card": "1:1"},
+          {"to": "SRC-0001/entity/image-generation-item", "rel": "variant", "card": "1:1"},
+          {"to": "SRC-0001/entity/hook-prompt-item", "rel": "variant", "card": "1:1"},
+          {"to": "SRC-0001/entity/plan-item", "rel": "variant", "card": "1:1"},
+          {"to": "SRC-0001/entity/context-compaction-item", "rel": "variant", "card": "1:1"},
+          {"to": "SRC-0001/entity/event-msg", "rel": "converts_to_via_as_legacy_events", "card": "1:N"}
+        ],
+        "enumerations": {
+          "TurnItem_variants": [
+            "UserMessage(UserMessageItem)",
+            "HookPrompt(HookPromptItem)",
+            "AgentMessage(AgentMessageItem)",
+            "Plan(PlanItem)",
+            "Reasoning(ReasoningItem)",
+            "WebSearch(WebSearchItem)",
+            "ImageGeneration(ImageGenerationItem)",
+            "ContextCompaction(ContextCompactionItem)"
+          ]
+        },
+        "data_flows": [
+          {"source": "turn processing", "transform": "TurnItem.as_legacy_events(show_raw_agent_reasoning)", "sink": "Vec<EventMsg>"}
+        ],
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0001/entity/user-message-item",
+      "src": "SRC-0001",
+      "composition": "entity",
+      "terms": {
+        "object": "UserMessageItem — сообщение пользователя в turn-item stream (items.rs:40-43, 153-229). Hook: legacy event flattens only text inputs",
+        "attributes": [
+          "id: String (UUID v4, генерируется в new)",
+          "content: Vec<UserInput>",
+          "message: String (computed — join всех UserInput::Text)",
+          "text_elements: Vec<TextElement> (computed — UI-defined spans, range rebased onto concatenated message)",
+          "image_urls: Vec<String> (computed — из UserInput::Image)",
+          "local_image_paths: Vec<PathBuf> (computed — из UserInput::LocalImage)"
+        ],
+        "relationships": [
+          {"to": "SRC-0001/entity/turn-item", "rel": "variant_of", "card": "N:1"},
+          {"to": "SRC-0001/entity/event-msg", "rel": "converts_to_user-message", "card": "1:1"}
+        ],
+        "enumerations": null,
+        "data_flows": [
+          {"source": "UserInput[]", "transform": "flatten text → message, split image/local into dedicated Vec, rebase text_elements byte_range onto concatenated text", "sink": "UserMessageEvent(EventMsg)"}
+        ],
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0001/entity/agent-message-item",
+      "src": "SRC-0001",
+      "composition": "entity",
+      "terms": {
+        "object": "AgentMessageItem — assistant-authored message в turn-item stream (items.rs:81-94). phase optional потому что не все providers/models его emit; consumers должны использовать когда present, но сохранять legacy completion semantics когда None",
+        "attributes": [
+          "id: String (UUID v4)",
+          "content: Vec<AgentMessageContent> (варианты: Text)",
+          "phase: Option<MessagePhase> (TUI rendering различает mid-turn commentary от final answer и избегает status-indicator jitter)",
+          "memory_citation: Option<MemoryCitation>"
+        ],
+        "relationships": [
+          {"to": "SRC-0001/entity/turn-item", "rel": "variant_of", "card": "N:1"},
+          {"to": "SRC-0001/entity/event-msg", "rel": "converts_to_agent-message_per_content", "card": "1:N"},
+          {"to": "SRC-0001/entity/message-phase", "rel": "tagged_by", "card": "N:1"}
+        ],
+        "enumerations": {
+          "AgentMessageContent": ["Text { text: String }"]
+        },
+        "data_flows": [
+          {"source": "content[]", "transform": "map each AgentMessageContent::Text → EventMsg::AgentMessage(message, phase clone, memory_citation clone)", "sink": "Vec<EventMsg>"}
+        ],
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0001/entity/reasoning-item",
+      "src": "SRC-0001",
+      "composition": "entity",
+      "terms": {
+        "object": "ReasoningItem — reasoning item в turn-item stream (items.rs:103-108)",
+        "attributes": [
+          "id: String",
+          "summary_text: Vec<String>",
+          "raw_content: Vec<String>"
+        ],
+        "relationships": [
+          {"to": "SRC-0001/entity/turn-item", "rel": "variant_of", "card": "N:1"},
+          {"to": "SRC-0001/entity/event-msg", "rel": "converts_to_agent-reasoning_plus_raw", "card": "1:N"}
+        ],
+        "enumerations": null,
+        "data_flows": [
+          {"source": "summary_text[] + raw_content[]", "transform": "для каждого summary emit AgentReasoning; если show_raw_agent_reasoning — дополнительно emit AgentReasoningRawContent для каждого raw entry", "sink": "Vec<EventMsg>"}
+        ],
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0001/entity/web-search-item",
+      "src": "SRC-0001",
+      "composition": "entity",
+      "terms": {
+        "object": "WebSearchItem — web search call в turn-item stream (items.rs:111-115)",
+        "attributes": [
+          "id: String (call_id)",
+          "query: String",
+          "action: WebSearchAction"
+        ],
+        "relationships": [
+          {"to": "SRC-0001/entity/turn-item", "rel": "variant_of", "card": "N:1"},
+          {"to": "SRC-0001/entity/web-search-action", "rel": "uses", "card": "1:1"},
+          {"to": "SRC-0001/entity/event-msg", "rel": "converts_to_web-search-end", "card": "1:1"}
+        ],
+        "enumerations": null,
+        "data_flows": null,
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0001/entity/image-generation-item",
+      "src": "SRC-0001",
+      "composition": "entity",
+      "terms": {
+        "object": "ImageGenerationItem — image generation call в turn-item stream (items.rs:118-128)",
+        "attributes": [
+          "id: String",
+          "status: String",
+          "revised_prompt: Option<String>",
+          "result: String",
+          "saved_path: Option<AbsolutePathBuf>"
+        ],
+        "relationships": [
+          {"to": "SRC-0001/entity/turn-item", "rel": "variant_of", "card": "N:1"},
+          {"to": "SRC-0001/entity/event-msg", "rel": "converts_to_image-generation-end", "card": "1:1"}
+        ],
+        "enumerations": null,
+        "data_flows": null,
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0001/entity/hook-prompt-item",
+      "src": "SRC-0001",
+      "composition": "entity",
+      "terms": {
+        "object": "HookPromptItem — hook prompt в turn-item stream (items.rs:46-49, 231-240). Agrregate с фрагментами",
+        "attributes": [
+          "id: String (UUID v4 если не передан при from_fragments)",
+          "fragments: Vec<HookPromptFragment>"
+        ],
+        "relationships": [
+          {"to": "SRC-0001/entity/turn-item", "rel": "variant_of", "card": "N:1"},
+          {"to": "SRC-0001/entity/hook-prompt-fragment", "rel": "contains", "card": "1:N"},
+          {"to": "SRC-0001/entity/response-item", "rel": "serializes_to_Message_as_user", "card": "1:1"}
+        ],
+        "enumerations": null,
+        "data_flows": [
+          {"source": "fragments[]", "transform": "filter empty hook_run_id, serialize каждый fragment в XML <hook_prompt hook_run_id=...>, wrap в ContentItem::InputText", "sink": "ResponseItem::Message{role: user, content}"},
+          {"source": "ResponseItem::Message.content[]", "transform": "parse каждый InputText как XML <hook_prompt>, filter empty hook_run_id", "sink": "HookPromptItem{fragments}"}
+        ],
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0001/entity/hook-prompt-fragment",
+      "src": "SRC-0001",
+      "composition": "entity",
+      "terms": {
+        "object": "HookPromptFragment — часть hook prompt (items.rs:54-57). camelCase serde. Используется XML-wire формат <hook_prompt hook_run_id=...>text</hook_prompt>",
+        "attributes": [
+          "text: String",
+          "hook_run_id: String"
+        ],
+        "relationships": [
+          {"to": "SRC-0001/entity/hook-prompt-item", "rel": "belongs_to", "card": "N:1"}
+        ],
+        "enumerations": null,
+        "data_flows": [
+          {"source": "HookPromptFragment", "transform": "quick_xml::se::to_string в HookPromptXml{hook_run_id, text}", "sink": "XML строка"},
+          {"source": "XML строка", "transform": "quick_xml::de::from_str, empty hook_run_id trim → None", "sink": "HookPromptFragment"}
+        ],
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0001/entity/plan-item",
+      "src": "SRC-0001",
+      "composition": "entity",
+      "terms": {
+        "object": "PlanItem — план в turn-item stream (items.rs:97-100)",
+        "attributes": [
+          "id: String",
+          "text: String"
+        ],
+        "relationships": [
+          {"to": "SRC-0001/entity/turn-item", "rel": "variant_of", "card": "N:1"}
+        ],
+        "enumerations": null,
+        "data_flows": null,
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0001/entity/context-compaction-item",
+      "src": "SRC-0001",
+      "composition": "entity",
+      "terms": {
+        "object": "ContextCompactionItem — компакция контекста в turn-item stream (items.rs:131-151)",
+        "attributes": [
+          "id: String (UUID v4, генерируется в new)"
+        ],
+        "relationships": [
+          {"to": "SRC-0001/entity/turn-item", "rel": "variant_of", "card": "N:1"},
+          {"to": "SRC-0001/entity/event-msg", "rel": "converts_to_context-compacted", "card": "1:1"}
+        ],
+        "enumerations": null,
+        "data_flows": null,
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0001/entity/response-item",
+      "src": "SRC-0001",
+      "composition": "entity",
+      "terms": {
+        "object": "ResponseItem — элемент Responses API (models.rs:188-341). Tagged enum snake_case. Отдельные варианты для сообщений, reasoning, shell, function/custom tool calls, web/image, ghost snapshot, compaction",
+        "attributes": null,
+        "relationships": [
+          {"to": "SRC-0001/entity/content-item", "rel": "contains_in_Message_variants", "card": "1:N"},
+          {"to": "SRC-0001/entity/message-phase", "rel": "tagged_by_in_Message", "card": "N:1"},
+          {"to": "SRC-0001/entity/local-shell-action", "rel": "uses_in_LocalShellCall", "card": "1:1"},
+          {"to": "SRC-0001/entity/web-search-action", "rel": "uses_in_WebSearchCall", "card": "1:1"},
+          {"to": "SRC-0001/entity/function-call-output-payload", "rel": "uses_in_FunctionCallOutput_CustomToolCallOutput", "card": "1:1"},
+          {"to": "SRC-0001/entity/response-input-item", "rel": "converted_from", "card": "1:1"}
+        ],
+        "enumerations": {
+          "ResponseItem_variants": [
+            "Message { id?, role, content, end_turn?, phase? }",
+            "Reasoning { id, summary, content?, encrypted_content }",
+            "LocalShellCall { id?, call_id?, status, action }",
+            "FunctionCall { id?, name, namespace?, arguments: String, call_id }",
+            "ToolSearchCall { id?, call_id?, status?, execution, arguments: Value }",
+            "FunctionCallOutput { call_id, output: FunctionCallOutputPayload }",
+            "CustomToolCall { id?, status?, call_id, name, input }",
+            "CustomToolCallOutput { call_id, name?, output: FunctionCallOutputPayload }",
+            "ToolSearchOutput { call_id?, status, execution, tools: Vec<Value> }",
+            "WebSearchCall { id?, status?, action? }",
+            "ImageGenerationCall { id, status, revised_prompt?, result }",
+            "GhostSnapshot { ghost_commit: GhostCommit }",
+            "Compaction { encrypted_content } (alias: compaction_summary)",
+            "Other (serde other)"
+          ]
+        },
+        "data_flows": [
+          {"source": "OpenAI Responses API wire", "transform": "FunctionCall.arguments хранится как raw string JSON (не pre-parsed); Session::handle_function_call парсит в Value", "sink": "ResponseItem::FunctionCall"}
+        ],
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0001/entity/response-input-item",
+      "src": "SRC-0001",
+      "composition": "entity",
+      "terms": {
+        "object": "ResponseInputItem — input item для Responses API (models.rs:120-151). Tagged enum snake_case. Конвертируется в ResponseItem через From",
+        "attributes": null,
+        "relationships": [
+          {"to": "SRC-0001/entity/response-item", "rel": "converts_to", "card": "1:1"},
+          {"to": "SRC-0001/entity/content-item", "rel": "contains_in_Message", "card": "1:N"},
+          {"to": "SRC-0001/entity/function-call-output-payload", "rel": "uses_in_outputs", "card": "1:1"}
+        ],
+        "enumerations": {
+          "ResponseInputItem_variants": [
+            "Message { role, content }",
+            "FunctionCallOutput { call_id, output: FunctionCallOutputPayload }",
+            "McpToolCallOutput { call_id, output: CallToolResult } → при конверсии в ResponseItem становится FunctionCallOutput",
+            "CustomToolCallOutput { call_id, name?, output }",
+            "ToolSearchOutput { call_id, status, execution, tools: Vec<Value> }"
+          ]
+        },
+        "data_flows": [
+          {"source": "Vec<UserInput>", "transform": "flat_map: Text → InputText; Image → [open_tag, InputImage, close_tag] с image_index++; LocalImage → read file → local_image_content_items_with_label_number (PromptImageMode::ResizeToFit) или error placeholder; Skill/Mention → empty (tool bodies injected later in core)", "sink": "ResponseInputItem::Message{role: user, content}"}
+        ],
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0001/entity/content-item",
+      "src": "SRC-0001",
+      "composition": "entity",
+      "terms": {
+        "object": "ContentItem — элемент контента сообщения (models.rs:155-159). Tagged enum snake_case. Используется в Message-вариантах ResponseItem/ResponseInputItem",
+        "attributes": null,
+        "relationships": [
+          {"to": "SRC-0001/entity/response-item", "rel": "part_of_Message", "card": "N:1"},
+          {"to": "SRC-0001/entity/response-input-item", "rel": "part_of_Message", "card": "N:1"}
+        ],
+        "enumerations": {
+          "ContentItem_variants": [
+            "InputText { text: String }",
+            "InputImage { image_url: String }",
+            "OutputText { text: String }"
+          ]
+        },
+        "data_flows": null,
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0001/entity/message-phase",
+      "src": "SRC-0001",
+      "composition": "entity",
+      "terms": {
+        "object": "MessagePhase — классификация assistant сообщения: interim commentary или final answer (models.rs:176-184). Providers emit непоследовательно, callers должны трактовать None как phase unknown и сохранять compatibility behavior для legacy моделей",
+        "attributes": null,
+        "relationships": [
+          {"to": "SRC-0001/entity/response-item", "rel": "tags_Message", "card": "1:N"},
+          {"to": "SRC-0001/entity/agent-message-item", "rel": "tags", "card": "1:N"}
+        ],
+        "enumerations": {
+          "MessagePhase": ["Commentary (mid-turn assistant text, e.g. preamble/progress)", "FinalAnswer (terminal answer text for current turn)"]
+        },
+        "data_flows": null,
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0001/entity/image-detail",
+      "src": "SRC-0001",
+      "composition": "entity",
+      "terms": {
+        "object": "ImageDetail — уровень детализации изображения (models.rs:163-168). lowercase serde",
+        "attributes": null,
+        "relationships": [
+          {"to": "SRC-0001/entity/function-call-output-payload", "rel": "used_in_InputImage", "card": "1:1"}
+        ],
+        "enumerations": {
+          "ImageDetail": ["Auto", "Low", "High", "Original"]
+        },
+        "data_flows": null,
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0001/entity/web-search-action",
+      "src": "SRC-0001",
+      "composition": "entity",
+      "terms": {
+        "object": "WebSearchAction — действие web search, возвращаемое Responses API в action поле web_search_call (models.rs:975-1000). Tagged enum snake_case. schemars rename = ResponsesApiWebSearchAction",
+        "attributes": null,
+        "relationships": [
+          {"to": "SRC-0001/entity/web-search-item", "rel": "used_by", "card": "1:N"},
+          {"to": "SRC-0001/entity/response-item", "rel": "used_in_WebSearchCall", "card": "1:N"}
+        ],
+        "enumerations": {
+          "WebSearchAction": [
+            "Search { query?, queries? }",
+            "OpenPage { url? }",
+            "FindInPage { url?, pattern? }",
+            "Other (serde other)"
+          ]
+        },
+        "data_flows": null,
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0001/entity/function-call-output-payload",
+      "src": "SRC-0001",
+      "composition": "entity",
+      "terms": {
+        "object": "FunctionCallOutputPayload — payload отправляемый обратно в OpenAI при отчёте о результате tool call (models.rs:1185-1188). body сериализуется напрямую как wire value для function_call_output.output; success — internal metadata. Wire: либо plain string (Text), либо массив structured content items (ContentItems)",
+        "attributes": [
+          "body: FunctionCallOutputBody (Text(String) | ContentItems(Vec<FunctionCallOutputContentItem>))",
+          "success: Option<bool>"
+        ],
+        "relationships": [
+          {"to": "SRC-0001/entity/response-item", "rel": "carried_in_FunctionCallOutput_CustomToolCallOutput", "card": "1:N"},
+          {"to": "SRC-0001/entity/response-input-item", "rel": "carried_in_outputs", "card": "1:N"}
+        ],
+        "enumerations": {
+          "FunctionCallOutputBody": ["Text(String)", "ContentItems(Vec<FunctionCallOutputContentItem>)"],
+          "FunctionCallOutputContentItem": [
+            "InputText { text: String }",
+            "InputImage { image_url: String, detail?: ImageDetail }"
+          ]
+        },
+        "data_flows": [
+          {"source": "CallToolResult", "transform": "если structured_content не null → serialize в JSON string как Text; иначе convert_mcp_content_to_items (text → InputText; image → data: URL + _meta.codex/imageDetail=original → Some(Original), иначе None); если saw_image → ContentItems, иначе Text(serialized JSON)", "sink": "FunctionCallOutputPayload"},
+          {"source": "FunctionCallOutputPayload.body", "transform": "Serialize: Text → serialize_str(content); ContentItems → items.serialize()", "sink": "wire JSON (string или array)"},
+          {"source": "wire JSON", "transform": "Deserialize: FunctionCallOutputBody::deserialize(untagged) → определяет Text vs ContentItems", "sink": "FunctionCallOutputPayload {body, success: None}"}
+        ],
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0001/entity/local-shell-action",
+      "src": "SRC-0001",
+      "composition": "entity",
+      "terms": {
+        "object": "LocalShellAction — действие local shell в ResponseItem::LocalShellCall (models.rs:959-961, 964-970)",
+        "attributes": null,
+        "relationships": [
+          {"to": "SRC-0001/entity/response-item", "rel": "used_in_LocalShellCall", "card": "1:1"}
+        ],
+        "enumerations": {
+          "LocalShellAction": ["Exec(LocalShellExecAction)"],
+          "LocalShellStatus": ["Completed", "InProgress", "Incomplete"]
+        },
+        "data_flows": null,
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0001/entity/local-shell-exec-action",
+      "src": "SRC-0001",
+      "composition": "entity",
+      "terms": {
+        "object": "LocalShellExecAction — exec action для local shell (models.rs:964-970)",
+        "attributes": [
+          "command: Vec<String>",
+          "timeout_ms: Option<u64>",
+          "working_directory: Option<String>",
+          "env: Option<HashMap<String, String>>",
+          "user: Option<String>"
+        ],
+        "relationships": [
+          {"to": "SRC-0001/entity/local-shell-action", "rel": "variant_Exec", "card": "1:1"}
+        ],
+        "enumerations": null,
+        "data_flows": null,
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0001/entity/thread-id",
+      "src": "SRC-0001",
+      "composition": "entity",
+      "terms": {
+        "object": "ThreadId — идентификатор thread на базе UUID v7 (thread_id.rs:13-29). ts(type = string)",
+        "attributes": [
+          "uuid: Uuid (private)"
+        ],
+        "relationships": [
+          {"to": "SRC-0001/entity/session-meta", "rel": "identifies", "card": "1:1"},
+          {"to": "SRC-0001/entity/session-configured-event", "rel": "used_as_session_id", "card": "1:N"}
+        ],
+        "enumerations": null,
+        "data_flows": [
+          {"source": "ThreadId::new()", "transform": "Uuid::now_v7()", "sink": "ThreadId.uuid"},
+          {"source": "&str/String", "transform": "Uuid::parse_str — Err при невалидном uuid", "sink": "Result<ThreadId, uuid::Error>"},
+          {"source": "ThreadId", "transform": "Serialize.collect_str(&self.uuid); Deserialize as String затем Uuid::parse_str; JsonSchema как String", "sink": "wire string"}
+        ],
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0001/entity/tool-name",
+      "src": "SRC-0001",
+      "composition": "entity",
+      "terms": {
+        "object": "ToolName — идентификатор callable tool, preserving namespace split когда модель его предоставляет (tool_name.rs:7-41)",
+        "attributes": [
+          "name: String",
+          "namespace: Option<String>"
+        ],
+        "relationships": null,
+        "enumerations": null,
+        "data_flows": [
+          {"source": "ToolName.display() / fmt::Display", "transform": "если namespace=Some(ns) → format!(\"{ns}{name}\"); если None → name", "sink": "String"},
+          {"source": "String/&str", "transform": "From::from → plain (namespace=None, name)", "sink": "ToolName"}
+        ],
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0001/entity/sandbox-policy",
+      "src": "SRC-0001",
+      "composition": "entity",
+      "terms": {
+        "object": "SandboxPolicy — execution restrictions для shell-команд модели (protocol.rs:980-1042). Tagged enum kebab-case. FromStr через serde_json",
+        "attributes": null,
+        "relationships": [
+          {"to": "SRC-0001/entity/read-only-access", "rel": "uses_in_ReadOnly_WorkspaceWrite", "card": "1:1"},
+          {"to": "SRC-0001/entity/writable-root", "rel": "produces_in_WorkspaceWrite", "card": "1:N"},
+          {"to": "SRC-0001/entity/network-access", "rel": "uses_in_ExternalSandbox", "card": "1:1"},
+          {"to": "SRC-0001/entity/user-turn", "rel": "applied_by", "card": "N:1"}
+        ],
+        "enumerations": {
+          "SandboxPolicy": [
+            "DangerFullAccess (wire: danger-full-access) — no restrictions",
+            "ReadOnly { access: ReadOnlyAccess, network_access: bool } (wire: read-only)",
+            "ExternalSandbox { network_access: NetworkAccess } (wire: external-sandbox) — full disk, processes уже в external sandbox",
+            "WorkspaceWrite { writable_roots, read_only_access, network_access, exclude_tmpdir_env_var, exclude_slash_tmp } (wire: workspace-write)"
+          ]
+        },
+        "data_flows": [
+          {"source": "SandboxPolicy + cwd", "transform": "get_writable_roots_with_cwd: WorkspaceWrite → writable_roots + cwd (AbsolutePathBuf) + /tmp (если cfg!(unix) && !exclude_slash_tmp && is_dir) + $TMPDIR env var (если !exclude_tmpdir_env_var && set && non-empty); для каждого root вычисляется read_only_subpaths через default_read_only_subpaths_for_writable_root; DangerFullAccess/ExternalSandbox/ReadOnly → []", "sink": "Vec<WritableRoot>"},
+          {"source": "SandboxPolicy", "transform": "has_full_disk_read_access: DangerFullAccess/ExternalSandbox → true; ReadOnly/WorkspaceWrite → делегирует access.has_full_disk_read_access()", "sink": "bool"},
+          {"source": "SandboxPolicy", "transform": "has_full_disk_write_access: DangerFullAccess/ExternalSandbox → true; ReadOnly/WorkspaceWrite → false", "sink": "bool"},
+          {"source": "SandboxPolicy", "transform": "has_full_network_access: DangerFullAccess → true; ExternalSandbox → network_access.is_enabled(); ReadOnly/WorkspaceWrite → network_access field", "sink": "bool"}
+        ],
+        "config": {
+          "new_read_only_policy": {"value": "ReadOnly{access: FullAccess, network_access: false}", "source": "hardcoded protocol.rs:1101", "default": "read-only, no network"},
+          "new_workspace_write_policy": {"value": "WorkspaceWrite{writable_roots: [], read_only_access: FullAccess, network_access: false, exclude_tmpdir_env_var: false, exclude_slash_tmp: false}", "source": "hardcoded protocol.rs:1111", "default": "workspace-write, no network, include /tmp & TMPDIR"},
+          "TMPDIR": {"value": "$TMPDIR env var (per-user на macOS)", "source": "env var", "default": "included unless exclude_tmpdir_env_var=true"}
+        }
+      }
+    },
+    {
+      "id": "SRC-0001/entity/read-only-access",
+      "src": "SRC-0001",
+      "composition": "entity",
+      "terms": {
+        "object": "ReadOnlyAccess — как предоставляется read-only доступ к файлам внутри restricted sandbox (protocol.rs:915-933). Tagged enum kebab-case. Default: FullAccess",
+        "attributes": null,
+        "relationships": [
+          {"to": "SRC-0001/entity/sandbox-policy", "rel": "nested_in_ReadOnly_WorkspaceWrite", "card": "N:1"}
+        ],
+        "enumerations": {
+          "ReadOnlyAccess": [
+            "Restricted { include_platform_defaults: bool (default true), readable_roots: Vec<AbsolutePathBuf> }",
+            "FullAccess (default)"
+          ]
+        },
+        "data_flows": [
+          {"source": "ReadOnlyAccess + cwd", "transform": "get_readable_roots_with_cwd: FullAccess → []; Restricted → readable_roots + cwd (если валиден); dedup", "sink": "Vec<AbsolutePathBuf>"}
+        ],
+        "config": {
+          "include_platform_defaults": {"value": true, "source": "hardcoded default_include_platform_defaults", "default": true}
+        }
+      }
+    },
+    {
+      "id": "SRC-0001/entity/writable-root",
+      "src": "SRC-0001",
+      "composition": "entity",
+      "terms": {
+        "object": "WritableRoot — writable root path с subpaths которые остаются read-only даже когда root writable (protocol.rs:1050-1055). Защищает файлы escalating privileges (.codex, .git, .git/hooks). По построению subpaths все под root",
+        "attributes": [
+          "root: AbsolutePathBuf",
+          "read_only_subpaths: Vec<AbsolutePathBuf>"
+        ],
+        "relationships": [
+          {"to": "SRC-0001/entity/sandbox-policy", "rel": "produced_by_WorkspaceWrite", "card": "N:1"}
+        ],
+        "enumerations": null,
+        "data_flows": [
+          {"source": "WritableRoot + path", "transform": "is_path_writable: path.starts_with(root) && !path.starts_with(any read_only_subpath)", "sink": "bool"},
+          {"source": "writable_root", "transform": "default_read_only_subpaths_for_writable_root: collect top_level .git (если is_file и is_git_pointer_file → resolve gitdir через `gitdir: ...` header + push gitdir; затем push .git); top_level .agents (если is_dir); top_level .codex (если is_dir или protect_missing_dot_codex — когда writable_root == cwd); dedup", "sink": "Vec<AbsolutePathBuf>"}
+        ],
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0001/entity/ask-for-approval",
+      "src": "SRC-0001",
+      "composition": "entity",
+      "terms": {
+        "object": "AskForApproval — политика согласования команд, проверяет когда пользователь просит approve команду предложенную Codex (protocol.rs:816-847). kebab-case serde. Default: OnRequest",
+        "attributes": null,
+        "relationships": [
+          {"to": "SRC-0001/entity/granular-approval-config", "rel": "carries_in_Granular", "card": "1:1"},
+          {"to": "SRC-0001/entity/user-turn", "rel": "applied_by", "card": "N:1"},
+          {"to": "SRC-0001/entity/session-configured-event", "rel": "advertised_by", "card": "N:1"}
+        ],
+        "enumerations": {
+          "AskForApproval": [
+            "UnlessTrusted (wire: untrusted) — только known-safe read-only команды auto-approved; всё остальное спрашивает",
+            "OnFailure (DEPRECATED) — все команды auto-approved в sandbox (no network, writes ограничены); при fail escalate для approve без sandbox",
+            "OnRequest (default) — модель решает когда спрашивать",
+            "Granular(GranularApprovalConfig) — fine-grained controls для категорий",
+            "Never — никогда не спрашивать, failures возвращаются модели"
+          ]
+        },
+        "data_flows": null,
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0001/entity/granular-approval-config",
+      "src": "SRC-0001",
+      "composition": "entity",
+      "terms": {
+        "object": "GranularApprovalConfig — fine-grained controls для approval flows (protocol.rs:850-864). true = prompt; false = auto-reject",
+        "attributes": [
+          "sandbox_approval: bool (shell command approval requests: inline with_additional_permissions и require_escalated)",
+          "rules: bool (execpolicy prompt rules)",
+          "skill_approval: bool (skill script execution; default false)",
+          "request_permissions: bool (request_permissions tool prompts; default false)",
+          "mcp_elicitations: bool (MCP elicitation prompts)"
+        ],
+        "relationships": [
+          {"to": "SRC-0001/entity/ask-for-approval", "rel": "carried_by_Granular", "card": "1:1"}
+        ],
+        "enumerations": null,
+        "data_flows": null,
+        "config": {
+          "skill_approval_default": {"value": false, "source": "serde default protocol.rs:857-858", "default": false},
+          "request_permissions_default": {"value": false, "source": "serde default protocol.rs:859-860", "default": false}
+        }
+      }
+    },
+    {
+      "id": "SRC-0001/entity/network-access",
+      "src": "SRC-0001",
+      "composition": "entity",
+      "terms": {
+        "object": "NetworkAccess — доступен ли outbound network доступ для агента (protocol.rs:894-898). kebab-case. Default: Restricted",
+        "attributes": null,
+        "relationships": [
+          {"to": "SRC-0001/entity/sandbox-policy", "rel": "carried_in_ExternalSandbox", "card": "N:1"}
+        ],
+        "enumerations": {
+          "NetworkAccess": ["Restricted (default)", "Enabled"]
+        },
+        "data_flows": null,
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0001/entity/inter-agent-communication",
+      "src": "SRC-0001",
+      "composition": "entity",
+      "terms": {
+        "object": "InterAgentCommunication — коммуникация между агентами, пишется как assistant history при нормальном thread submission lifecycle (protocol.rs:708-755)",
+        "attributes": [
+          "author: AgentPath",
+          "recipient: AgentPath",
+          "other_recipients: Vec<AgentPath> (serde default)",
+          "content: String",
+          "trigger_turn: bool"
+        ],
+        "relationships": [
+          {"to": "SRC-0001/entity/op", "rel": "carried_in_InterAgentCommunication_variant", "card": "1:1"},
+          {"to": "SRC-0001/entity/response-input-item", "rel": "serializes_to_Message_as_assistant", "card": "1:1"}
+        ],
+        "enumerations": null,
+        "data_flows": [
+          {"source": "InterAgentCommunication", "transform": "to_response_input_item: serialize как JSON строку в OutputText, wrap в Message{role: assistant, content}", "sink": "ResponseInputItem::Message"},
+          {"source": "ContentItem[] с одним элементом (InputText или OutputText)", "transform": "from_message_content: serde_json::from_str(text).ok()", "sink": "Option<InterAgentCommunication>"}
+        ],
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0001/entity/session-meta",
+      "src": "SRC-0001",
+      "composition": "entity",
+      "terms": {
+        "object": "SessionMeta — session-level данные не относящиеся к конкретному turn (protocol.rs:2732-2760). NOTE: ранее содержал instructions (user_instructions), сейчас хранится на TurnContext; base_instructions — для сессии, fallback если нет config override",
+        "attributes": [
+          "id: ThreadId",
+          "forked_from_id: Option<ThreadId>",
+          "timestamp: String",
+          "cwd: PathBuf",
+          "originator: String",
+          "cli_version: String",
+          "source: SessionSource (serde default: VSCode)",
+          "agent_nickname: Option<String> (random unique nickname для AgentControl-spawned sub-agent)",
+          "agent_role: Option<String> (alias: agent_type)",
+          "agent_path: Option<String> (canonical agent path)",
+          "model_provider: Option<String>",
+          "base_instructions: Option<BaseInstructions> (fallback если None — render из ModelsManager)",
+          "dynamic_tools: Option<Vec<DynamicToolSpec>>",
+          "memory_mode: Option<String>"
+        ],
+        "relationships": [
+          {"to": "SRC-0001/entity/thread-id", "rel": "identified_by", "card": "1:1"},
+          {"to": "SRC-0001/entity/session-source", "rel": "has", "card": "N:1"},
+          {"to": "SRC-0001/entity/rollout-item", "rel": "wrapped_as_SessionMeta_variant", "card": "1:1"}
+        ],
+        "enumerations": null,
+        "data_flows": null,
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0001/entity/session-source",
+      "src": "SRC-0001",
+      "composition": "entity",
+      "terms": {
+        "object": "SessionSource — источник сессии (protocol.rs:2582-2592). lowercase serde, Default: VSCode",
+        "attributes": null,
+        "relationships": [
+          {"to": "SRC-0001/entity/session-meta", "rel": "part_of", "card": "N:1"},
+          {"to": "SRC-0001/entity/sub-agent-source", "rel": "carried_in_SubAgent", "card": "1:1"},
+          {"to": "SRC-0001/entity/product", "rel": "produces_via_restriction_product", "card": "N:1"}
+        ],
+        "enumerations": {
+          "SessionSource": [
+            "Cli",
+            "VSCode (default)",
+            "Exec",
+            "Mcp",
+            "Custom(String)",
+            "SubAgent(SubAgentSource)",
+            "Unknown (serde other)"
+          ],
+          "SubAgentSource": [
+            "Review",
+            "Compact",
+            "ThreadSpawn { parent_thread_id: ThreadId, depth: i32, agent_path?, agent_nickname?, agent_role? (alias agent_type) }",
+            "MemoryConsolidation",
+            "Other(String)"
+          ]
+        },
+        "data_flows": [
+          {"source": "&str startup arg", "transform": "from_startup_arg: trim, lowercase; cli/vscode/exec/mcp+appserver aliases/unknown → соотв. варианты; иначе Custom(normalized)", "sink": "SessionSource"},
+          {"source": "SessionSource", "transform": "thread_source_name: Cli/VSCode/Exec → user; SubAgent → subagent; Mcp/Custom/Unknown → None", "sink": "Option<&'static str>"},
+          {"source": "SessionSource", "transform": "restriction_product: Custom → Product::from_session_source_name(chatgpt/codex/atlas); Cli/VSCode/Exec/Mcp/Unknown → Codex; SubAgent → None", "sink": "Option<Product>"}
+        ],
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0001/entity/sub-agent-source",
+      "src": "SRC-0001",
+      "composition": "entity",
+      "terms": {
+        "object": "SubAgentSource — подтип SessionSource для sub-agent потоков (protocol.rs:2597-2612). snake_case serde. MemoryConsolidation имеет nickname Morpheus и role 'memory builder'",
+        "attributes": null,
+        "relationships": [
+          {"to": "SRC-0001/entity/session-source", "rel": "variant_of_SubAgent", "card": "1:1"},
+          {"to": "SRC-0001/entity/thread-id", "rel": "references_parent_in_ThreadSpawn", "card": "N:1"}
+        ],
+        "enumerations": {
+          "SubAgentSource": [
+            "Review",
+            "Compact",
+            "ThreadSpawn { parent_thread_id, depth, agent_path?, agent_nickname?, agent_role? }",
+            "MemoryConsolidation",
+            "Other(String)"
+          ]
+        },
+        "data_flows": null,
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0001/entity/product",
+      "src": "SRC-0001",
+      "composition": "entity",
+      "terms": {
+        "object": "Product — продукт-ограничение для session/skill (protocol.rs:3337-3344). lowercase serde с UPPERCASE aliases",
+        "attributes": null,
+        "relationships": [
+          {"to": "SRC-0001/entity/session-source", "rel": "derived_from_via_restriction_product", "card": "N:1"}
+        ],
+        "enumerations": {
+          "Product": [
+            "Chatgpt (alias CHATGPT, wire chatgpt, app_platform chat)",
+            "Codex (alias CODEX, wire codex, app_platform codex)",
+            "Atlas (alias ATLAS, wire atlas, app_platform atlas)"
+          ]
+        },
+        "data_flows": [
+          {"source": "&str", "transform": "from_session_source_name: trim + lowercase; chatgpt/codex/atlas → Some; иначе None", "sink": "Option<Product>"},
+          {"source": "Product + &[Product]", "transform": "matches_product_restriction: products.is_empty() || products.contains(self)", "sink": "bool"}
+        ],
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0001/entity/rollout-item",
+      "src": "SRC-0001",
+      "composition": "entity",
+      "terms": {
+        "object": "RolloutItem — элемент rollout/history потока (protocol.rs:2793-2799). Tagged enum с tag=type, content=payload, snake_case",
+        "attributes": null,
+        "relationships": [
+          {"to": "SRC-0001/entity/session-meta", "rel": "wraps_in_SessionMeta", "card": "1:1"},
+          {"to": "SRC-0001/entity/response-item", "rel": "wraps_in_ResponseItem", "card": "1:1"},
+          {"to": "SRC-0001/entity/event-msg", "rel": "wraps_in_EventMsg", "card": "1:1"},
+          {"to": "SRC-0001/entity/turn-context-item", "rel": "wraps_in_TurnContext", "card": "1:1"}
+        ],
+        "enumerations": {
+          "RolloutItem": [
+            "SessionMeta(SessionMetaLine)",
+            "ResponseItem(ResponseItem)",
+            "Compacted(CompactedItem)",
+            "TurnContext(TurnContextItem)",
+            "EventMsg(EventMsg)"
+          ]
+        },
+        "data_flows": null,
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0001/entity/turn-context-item",
+      "src": "SRC-0001",
+      "composition": "entity",
+      "terms": {
+        "object": "TurnContextItem — persist один раз на каждый реальный user turn после вычисления model-visible context updates и снова после mid-turn compaction когда replacement history восстанавливает full context, чтобы resume/fork replay мог восстановить последний durable baseline (protocol.rs:2833-2865)",
+        "attributes": [
+          "turn_id: Option<String>",
+          "trace_id: Option<String>",
+          "cwd: PathBuf",
+          "current_date: Option<String>",
+          "timezone: Option<String>",
+          "approval_policy: AskForApproval",
+          "sandbox_policy: SandboxPolicy",
+          "network: Option<TurnContextNetworkItem{allowed_domains, denied_domains}>",
+          "model: String",
+          "personality: Option<Personality>",
+          "collaboration_mode: Option<CollaborationMode>",
+          "realtime_active: Option<bool>",
+          "effort: Option<ReasoningEffortConfig>",
+          "summary: ReasoningSummaryConfig",
+          "user_instructions: Option<String>",
+          "developer_instructions: Option<String>",
+          "final_output_json_schema: Option<Value>",
+          "truncation_policy: Option<TruncationPolicy>"
+        ],
+        "relationships": [
+          {"to": "SRC-0001/entity/rollout-item", "rel": "variant_of_TurnContext", "card": "N:1"},
+          {"to": "SRC-0001/entity/sandbox-policy", "rel": "uses", "card": "1:1"},
+          {"to": "SRC-0001/entity/ask-for-approval", "rel": "uses", "card": "1:1"},
+          {"to": "SRC-0001/entity/truncation-policy", "rel": "uses", "card": "1:1"}
+        ],
+        "enumerations": null,
+        "data_flows": null,
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0001/entity/initial-history",
+      "src": "SRC-0001",
+      "composition": "entity",
+      "terms": {
+        "object": "InitialHistory — начальное состояние thread history (protocol.rs:2465-2470)",
+        "attributes": null,
+        "relationships": [
+          {"to": "SRC-0001/entity/rollout-item", "rel": "contains", "card": "1:N"},
+          {"to": "SRC-0001/entity/thread-id", "rel": "references_via_forked_from_id", "card": "N:1"}
+        ],
+        "enumerations": {
+          "InitialHistory": [
+            "New",
+            "Cleared",
+            "Resumed(ResumedHistory {conversation_id: ThreadId, history: Vec<RolloutItem>, rollout_path: PathBuf})",
+            "Forked(Vec<RolloutItem>)"
+          ]
+        },
+        "data_flows": [
+          {"source": "InitialHistory", "transform": "scan_rollout_items/forked_from_id/session_cwd/get_rollout_items/get_event_msgs/get_base_instructions/get_dynamic_tools — scan/extract из history items", "sink": "соотв. типы"}
+        ],
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0001/entity/token-usage",
+      "src": "SRC-0001",
+      "composition": "entity",
+      "terms": {
+        "object": "TokenUsage — учёт токенов турна (protocol.rs:2079-2090). Default derived",
+        "attributes": [
+          "input_tokens: i64",
+          "cached_input_tokens: i64",
+          "output_tokens: i64",
+          "reasoning_output_tokens: i64",
+          "total_tokens: i64"
+        ],
+        "relationships": [
+          {"to": "SRC-0001/entity/token-usage-info", "rel": "part_of", "card": "N:1"},
+          {"to": "SRC-0001/entity/final-output", "rel": "wrapped_by", "card": "1:1"}
+        ],
+        "enumerations": null,
+        "data_flows": [
+          {"source": "TokenUsage", "transform": "is_zero: total_tokens == 0; cached_input: max(cached_input_tokens, 0); non_cached_input: max(input_tokens - cached_input, 0); blended_total: max(non_cached_input + max(output_tokens, 0), 0); tokens_in_context_window: total_tokens", "sink": "i64/bool"},
+          {"source": "TokenUsage + context_window", "transform": "percent_of_context_window_remaining: если context_window <= BASELINE_TOKENS → 0; иначе effective = context_window - BASELINE_TOKENS, used = max(total_tokens - BASELINE_TOKENS, 0), remaining = max(effective - used, 0); round(remaining/effective * 100) clamp 0..100", "sink": "i64"},
+          {"source": "TokenUsage + other", "transform": "add_assign: element-wise += по всем 5 полям", "sink": "TokenUsage"}
+        ],
+        "config": {
+          "BASELINE_TOKENS": {"value": 12000, "source": "hardcoded protocol.rs:2195", "default": 12000}
+        }
+      }
+    },
+    {
+      "id": "SRC-0001/entity/token-usage-info",
+      "src": "SRC-0001",
+      "composition": "entity",
+      "terms": {
+        "object": "TokenUsageInfo — агрегированный usage для сессии с total/last и model context window (protocol.rs:2093-2099)",
+        "attributes": [
+          "total_token_usage: TokenUsage",
+          "last_token_usage: TokenUsage",
+          "model_context_window: Option<i64>"
+        ],
+        "relationships": [
+          {"to": "SRC-0001/entity/token-usage", "rel": "contains", "card": "1:2"}
+        ],
+        "enumerations": null,
+        "data_flows": [
+          {"source": "Option<TokenUsageInfo> + Option<TokenUsage> last + Option<i64> model_context_window", "transform": "new_or_append: если оба None → None; иначе clone info или init по defaults; если last Some → append_last_usage (total += last, last_token_usage = last); override model_context_window", "sink": "Option<TokenUsageInfo>"},
+          {"source": "context_window: i64", "transform": "fill_to_context_window: delta = max(window - prev_total, 0); total_token_usage = {total_tokens: window}; last_token_usage = {total_tokens: delta}; model_context_window = Some(window)", "sink": "TokenUsageInfo"}
+        ],
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0001/entity/rate-limit-snapshot",
+      "src": "SRC-0001",
+      "composition": "entity",
+      "terms": {
+        "object": "RateLimitSnapshot — снимок лимитов на момент turn (protocol.rs:2166-2173)",
+        "attributes": [
+          "limit_id: Option<String>",
+          "limit_name: Option<String>",
+          "primary: Option<RateLimitWindow>",
+          "secondary: Option<RateLimitWindow>",
+          "credits: Option<CreditsSnapshot>",
+          "plan_type: Option<PlanType> (из crate::account)"
+        ],
+        "relationships": [
+          {"to": "SRC-0001/entity/token-count-event", "rel": "carried_by", "card": "N:1"}
+        ],
+        "enumerations": null,
+        "data_flows": null,
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0001/entity/rate-limit-window",
+      "src": "SRC-0001",
+      "composition": "entity",
+      "terms": {
+        "object": "RateLimitWindow — rolling window лимитов (protocol.rs:2176-2185)",
+        "attributes": [
+          "used_percent: f64 (0-100 процент consumed)",
+          "window_minutes: Option<i64> (rolling window duration в минутах)",
+          "resets_at: Option<i64> (Unix timestamp seconds когда window сбросится)"
+        ],
+        "relationships": [
+          {"to": "SRC-0001/entity/rate-limit-snapshot", "rel": "part_of", "card": "N:1"}
+        ],
+        "enumerations": null,
+        "data_flows": null,
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0001/entity/credits-snapshot",
+      "src": "SRC-0001",
+      "composition": "entity",
+      "terms": {
+        "object": "CreditsSnapshot — состояние credits (protocol.rs:2188-2192)",
+        "attributes": [
+          "has_credits: bool",
+          "unlimited: bool",
+          "balance: Option<String>"
+        ],
+        "relationships": [
+          {"to": "SRC-0001/entity/rate-limit-snapshot", "rel": "part_of", "card": "N:1"}
+        ],
+        "enumerations": null,
+        "data_flows": null,
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0001/entity/token-count-event",
+      "src": "SRC-0001",
+      "composition": "entity",
+      "terms": {
+        "object": "TokenCountEvent — payload EventMsg::TokenCount (protocol.rs:2160-2163). Optional = unknown — UIs не должны отображать None",
+        "attributes": [
+          "info: Option<TokenUsageInfo>",
+          "rate_limits: Option<RateLimitSnapshot>"
+        ],
+        "relationships": [
+          {"to": "SRC-0001/entity/event-msg", "rel": "carried_by", "card": "N:1"}
+        ],
+        "enumerations": null,
+        "data_flows": null,
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0001/entity/turn-started-event",
+      "src": "SRC-0001",
+      "composition": "entity",
+      "terms": {
+        "object": "TurnStartedEvent — начало turn. Wire alias task_started / turn_started (protocol.rs:2066-2076)",
+        "attributes": [
+          "turn_id: String",
+          "started_at: Option<i64> (Unix timestamp seconds)",
+          "model_context_window: Option<i64>",
+          "collaboration_mode_kind: ModeKind (serde default)"
+        ],
+        "relationships": [
+          {"to": "SRC-0001/entity/event-msg", "rel": "carried_by", "card": "N:1"}
+        ],
+        "enumerations": null,
+        "data_flows": null,
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0001/entity/turn-complete-event",
+      "src": "SRC-0001",
+      "composition": "entity",
+      "terms": {
+        "object": "TurnCompleteEvent — завершение turn. Wire alias task_complete / turn_complete (protocol.rs:2052-2063)",
+        "attributes": [
+          "turn_id: String",
+          "last_agent_message: Option<String>",
+          "completed_at: Option<i64> (Unix timestamp seconds)",
+          "duration_ms: Option<i64>"
+        ],
+        "relationships": [
+          {"to": "SRC-0001/entity/event-msg", "rel": "carried_by", "card": "N:1"}
+        ],
+        "enumerations": null,
+        "data_flows": null,
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0001/entity/turn-aborted-event",
+      "src": "SRC-0001",
+      "composition": "entity",
+      "terms": {
+        "object": "TurnAbortedEvent — turn был прерван (protocol.rs:3608-3619)",
+        "attributes": [
+          "turn_id: Option<String>",
+          "reason: TurnAbortReason",
+          "completed_at: Option<i64>",
+          "duration_ms: Option<i64>"
+        ],
+        "relationships": [
+          {"to": "SRC-0001/entity/event-msg", "rel": "carried_by", "card": "N:1"}
+        ],
+        "enumerations": {
+          "TurnAbortReason": ["Interrupted", "Replaced", "ReviewEnded"]
+        },
+        "data_flows": null,
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0001/entity/codex-error-info",
+      "src": "SRC-0001",
+      "composition": "entity",
+      "terms": {
+        "object": "CodexErrorInfo — Codex ошибки которые expose'им клиентам (protocol.rs:1825-1855). snake_case. Участвует в ErrorEvent.codex_error_info. Имеет affects_turn_status() логику",
+        "attributes": null,
+        "relationships": [
+          {"to": "SRC-0001/entity/error-event", "rel": "nested_in", "card": "N:1"}
+        ],
+        "enumerations": {
+          "CodexErrorInfo": [
+            "ContextWindowExceeded",
+            "UsageLimitExceeded",
+            "ServerOverloaded",
+            "HttpConnectionFailed { http_status_code? }",
+            "ResponseStreamConnectionFailed { http_status_code? }",
+            "InternalServerError",
+            "Unauthorized",
+            "BadRequest",
+            "SandboxError",
+            "ResponseStreamDisconnected { http_status_code? }",
+            "ResponseTooManyFailedAttempts { http_status_code? }",
+            "ActiveTurnNotSteerable { turn_kind: NonSteerableTurnKind }",
+            "ThreadRollbackFailed",
+            "Other"
+          ],
+          "NonSteerableTurnKind": ["Review", "Compact"]
+        },
+        "data_flows": [
+          {"source": "CodexErrorInfo", "transform": "affects_turn_status: ThreadRollbackFailed/ActiveTurnNotSteerable → false; всё остальное → true", "sink": "bool"}
+        ],
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0001/entity/error-event",
+      "src": "SRC-0001",
+      "composition": "entity",
+      "terms": {
+        "object": "ErrorEvent — ошибка при выполнении submission (protocol.rs:2014-2018). Подавляется через affects_turn_status делегацией в CodexErrorInfo",
+        "attributes": [
+          "message: String",
+          "codex_error_info: Option<CodexErrorInfo>"
+        ],
+        "relationships": [
+          {"to": "SRC-0001/entity/event-msg", "rel": "carried_by", "card": "N:1"},
+          {"to": "SRC-0001/entity/codex-error-info", "rel": "uses", "card": "1:1"}
+        ],
+        "enumerations": null,
+        "data_flows": [
+          {"source": "ErrorEvent", "transform": "affects_turn_status: codex_error_info.is_none_or(CodexErrorInfo::affects_turn_status)", "sink": "bool"}
+        ],
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0001/entity/agent-status",
+      "src": "SRC-0001",
+      "composition": "entity",
+      "terms": {
+        "object": "AgentStatus — жизненный цикл агента, derived из emitted events (protocol.rs:1794-1810). snake_case. Default: PendingInit",
+        "attributes": null,
+        "relationships": [
+          {"to": "SRC-0001/entity/event-msg", "rel": "reported_in_Collab_events", "card": "N:1"}
+        ],
+        "enumerations": {
+          "AgentStatus": [
+            "PendingInit (default) — ждёт инициализации",
+            "Running — выполняется",
+            "Interrupted — turn прерван, может получать ещё input",
+            "Completed(Option<String>) — готов, содержит final assistant message",
+            "Errored(String) — ошибка",
+            "Shutdown — остановлен",
+            "NotFound — не найден"
+          ]
+        },
+        "data_flows": null,
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0001/entity/realtime-voice",
+      "src": "SRC-0001",
+      "composition": "entity",
+      "terms": {
+        "object": "RealtimeVoice — голос для realtime conversation (protocol.rs:196-216). snake_case serde. Имеет wire_name() возвращающий lowercase ASCII",
+        "attributes": null,
+        "relationships": [
+          {"to": "SRC-0001/entity/realtime-voices-list", "rel": "enumerated_by", "card": "N:1"},
+          {"to": "SRC-0001/entity/conversation-start-params", "rel": "used_by", "card": "N:1"}
+        ],
+        "enumerations": {
+          "RealtimeVoice": [
+            "Alloy", "Arbor", "Ash", "Ballad", "Breeze", "Cedar", "Coral", "Cove", "Echo", "Ember", "Juniper", "Maple", "Marin", "Sage", "Shimmer", "Sol", "Spruce", "Vale", "Verse"
+          ]
+        },
+        "data_flows": null,
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0001/entity/realtime-voices-list",
+      "src": "SRC-0001",
+      "composition": "entity",
+      "terms": {
+        "object": "RealtimeVoicesList — встроенные списки голосов v1/v2 и их defaults (protocol.rs:247-284). camelCase",
+        "attributes": [
+          "v1: Vec<RealtimeVoice>",
+          "v2: Vec<RealtimeVoice>",
+          "default_v1: RealtimeVoice",
+          "default_v2: RealtimeVoice"
+        ],
+        "relationships": [
+          {"to": "SRC-0001/entity/realtime-voice", "rel": "lists", "card": "1:N"}
+        ],
+        "enumerations": {
+          "builtin_v1": ["Juniper", "Maple", "Spruce", "Ember", "Vale", "Breeze", "Arbor", "Sol", "Cove"],
+          "builtin_v2": ["Alloy", "Ash", "Ballad", "Coral", "Echo", "Sage", "Shimmer", "Verse", "Marin", "Cedar"]
+        },
+        "data_flows": null,
+        "config": {
+          "default_v1": {"value": "Cove", "source": "hardcoded protocol.rs:280", "default": "Cove"},
+          "default_v2": {"value": "Marin", "source": "hardcoded protocol.rs:281", "default": "Marin"}
+        }
+      }
+    },
+    {
+      "id": "SRC-0001/entity/realtime-output-modality",
+      "src": "SRC-0001",
+      "composition": "entity",
+      "terms": {
+        "object": "RealtimeOutputModality — выбирает должна ли realtime сессия производить text или audio output (protocol.rs:164-167). snake_case",
+        "attributes": null,
+        "relationships": [
+          {"to": "SRC-0001/entity/conversation-start-params", "rel": "used_by", "card": "N:1"}
+        ],
+        "enumerations": {
+          "RealtimeOutputModality": ["Text", "Audio"]
+        },
+        "data_flows": null,
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0001/entity/conversation-start-params",
+      "src": "SRC-0001",
+      "composition": "entity",
+      "terms": {
+        "object": "ConversationStartParams — параметры старта realtime conversation (protocol.rs:136-152)",
+        "attributes": [
+          "output_modality: RealtimeOutputModality",
+          "prompt: Option<Option<String>> (double_option: None = default, Some(None) = null, Some(Some) = строка)",
+          "session_id: Option<String>",
+          "transport: Option<ConversationStartTransport>",
+          "voice: Option<RealtimeVoice>"
+        ],
+        "relationships": [
+          {"to": "SRC-0001/entity/op", "rel": "carried_in_RealtimeConversationStart", "card": "1:1"},
+          {"to": "SRC-0001/entity/realtime-voice", "rel": "uses", "card": "1:1"}
+        ],
+        "enumerations": {
+          "ConversationStartTransport": ["Websocket", "Webrtc { sdp: String }"]
+        },
+        "data_flows": null,
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0001/entity/realtime-event",
+      "src": "SRC-0001",
+      "composition": "entity",
+      "terms": {
+        "object": "RealtimeEvent — события realtime conversation стрима (protocol.rs:342-362)",
+        "attributes": null,
+        "relationships": [
+          {"to": "SRC-0001/entity/event-msg", "rel": "carried_in_RealtimeConversationRealtime", "card": "N:1"}
+        ],
+        "enumerations": {
+          "RealtimeEvent": [
+            "SessionUpdated { session_id, instructions? }",
+            "InputAudioSpeechStarted(RealtimeInputAudioSpeechStarted)",
+            "InputTranscriptDelta(RealtimeTranscriptDelta)",
+            "InputTranscriptDone(RealtimeTranscriptDone)",
+            "OutputTranscriptDelta(RealtimeTranscriptDelta)",
+            "OutputTranscriptDone(RealtimeTranscriptDone)",
+            "AudioOut(RealtimeAudioFrame)",
+            "ResponseCreated(RealtimeResponseCreated)",
+            "ResponseCancelled(RealtimeResponseCancelled)",
+            "ResponseDone(RealtimeResponseDone)",
+            "ConversationItemAdded(Value)",
+            "ConversationItemDone { item_id }",
+            "HandoffRequested(RealtimeHandoffRequested)",
+            "Error(String)"
+          ]
+        },
+        "data_flows": null,
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0001/entity/realtime-audio-frame",
+      "src": "SRC-0001",
+      "composition": "entity",
+      "terms": {
+        "object": "RealtimeAudioFrame — аудио-фрейм realtime stream (protocol.rs:287-295)",
+        "attributes": [
+          "data: String",
+          "sample_rate: u32",
+          "num_channels: u16",
+          "samples_per_channel: Option<u32>",
+          "item_id: Option<String>"
+        ],
+        "relationships": [
+          {"to": "SRC-0001/entity/realtime-event", "rel": "carried_in_AudioOut", "card": "N:1"}
+        ],
+        "enumerations": null,
+        "data_flows": null,
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0001/entity/truncation-policy",
+      "src": "SRC-0001",
+      "composition": "entity",
+      "terms": {
+        "object": "TruncationPolicy — политика усечения (protocol.rs:2869-2872). Tagged: mode, content=limit, snake_case. Поддерживает Mul<f64> и From<TruncationPolicyConfig>",
+        "attributes": null,
+        "relationships": [
+          {"to": "SRC-0001/entity/turn-context-item", "rel": "used_by", "card": "N:1"}
+        ],
+        "enumerations": {
+          "TruncationPolicy": ["Bytes(usize)", "Tokens(usize)"]
+        },
+        "data_flows": [
+          {"source": "TruncationPolicy", "transform": "token_budget: Bytes → approx_tokens_from_byte_count(bytes) (usize cast fallback MAX); Tokens → tokens", "sink": "usize"},
+          {"source": "TruncationPolicy", "transform": "byte_budget: Bytes → bytes; Tokens → approx_bytes_for_tokens(tokens)", "sink": "usize"},
+          {"source": "TruncationPolicy * f64", "transform": "Mul: каждая ветка = ceil(value * multiplier)", "sink": "TruncationPolicy"}
+        ],
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0001/entity/session-configured-event",
+      "src": "SRC-0001",
+      "composition": "entity",
+      "terms": {
+        "object": "SessionConfiguredEvent — ack client'овского configure сообщения (protocol.rs:3458-3515)",
+        "attributes": [
+          "session_id: ThreadId",
+          "forked_from_id: Option<ThreadId>",
+          "thread_name: Option<String>",
+          "model: String",
+          "model_provider_id: String",
+          "service_tier: Option<ServiceTier>",
+          "approval_policy: AskForApproval",
+          "approvals_reviewer: ApprovalsReviewer (serde default)",
+          "sandbox_policy: SandboxPolicy",
+          "cwd: AbsolutePathBuf",
+          "reasoning_effort: Option<ReasoningEffortConfig>",
+          "history_log_id: u64 (inode на Unix, 0 иначе)",
+          "history_entry_count: usize",
+          "initial_messages: Option<Vec<EventMsg>>",
+          "network_proxy: Option<SessionNetworkProxyRuntime{http_addr, socks_addr}>",
+          "rollout_path: Option<PathBuf>"
+        ],
+        "relationships": [
+          {"to": "SRC-0001/entity/event-msg", "rel": "carried_by", "card": "N:1"},
+          {"to": "SRC-0001/entity/thread-id", "rel": "identifies_via_session_id", "card": "1:1"}
+        ],
+        "enumerations": null,
+        "data_flows": null,
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0001/entity/review-decision",
+      "src": "SRC-0001",
+      "composition": "entity",
+      "terms": {
+        "object": "ReviewDecision — решение пользователя в ответ на ExecApprovalRequest (protocol.rs:3528-3560). snake_case. Default: Denied. to_opaque_string() возвращает анонимные лейблы для логирования",
+        "attributes": null,
+        "relationships": [
+          {"to": "SRC-0001/entity/op", "rel": "carried_in_ExecApproval_PatchApproval", "card": "N:1"}
+        ],
+        "enumerations": {
+          "ReviewDecision": [
+            "Approved",
+            "ApprovedExecpolicyAmendment { proposed_execpolicy_amendment: ExecPolicyAmendment }",
+            "ApprovedForSession — автоматически для session-scoped cache на время сессии",
+            "NetworkPolicyAmendment { network_policy_amendment }",
+            "Denied (default)",
+            "TimedOut — auto approval review timed out",
+            "Abort — денай + не делай ничего до следующей команды"
+          ],
+          "to_opaque_string_values": ["approved", "approved_with_amendment", "approved_for_session", "approved_with_network_policy_allow", "denied_with_network_policy_deny", "denied", "timed_out", "abort"]
+        },
+        "data_flows": null,
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0001/entity/review-request",
+      "src": "SRC-0001",
+      "composition": "entity",
+      "terms": {
+        "object": "ReviewRequest — запрос на code review отправляемый в review session (protocol.rs:2975-2980)",
+        "attributes": [
+          "target: ReviewTarget",
+          "user_facing_hint: Option<String>"
+        ],
+        "relationships": [
+          {"to": "SRC-0001/entity/op", "rel": "carried_in_Review", "card": "1:1"},
+          {"to": "SRC-0001/entity/event-msg", "rel": "carried_in_EnteredReviewMode", "card": "1:1"},
+          {"to": "SRC-0001/entity/review-output-event", "rel": "produces", "card": "1:1"}
+        ],
+        "enumerations": {
+          "ReviewTarget": [
+            "UncommittedChanges — staged/unstaged/untracked",
+            "BaseBranch { branch: String } — diff current vs base",
+            "Commit { sha, title? } — изменения коммита",
+            "Custom { instructions }"
+          ]
+        },
+        "data_flows": null,
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0001/entity/review-output-event",
+      "src": "SRC-0001",
+      "composition": "entity",
+      "terms": {
+        "object": "ReviewOutputEvent — structured результат review от child review session (protocol.rs:2984-2989). Default: пустой с correctness=String::default и confidence=0.0",
+        "attributes": [
+          "findings: Vec<ReviewFinding>",
+          "overall_correctness: String",
+          "overall_explanation: String",
+          "overall_confidence_score: f32"
+        ],
+        "relationships": [
+          {"to": "SRC-0001/entity/review-request", "rel": "produced_by", "card": "N:1"},
+          {"to": "SRC-0001/entity/event-msg", "rel": "wrapped_in_ExitedReviewMode", "card": "1:1"}
+        ],
+        "enumerations": null,
+        "data_flows": null,
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0001/entity/review-finding",
+      "src": "SRC-0001",
+      "composition": "entity",
+      "terms": {
+        "object": "ReviewFinding — одна находка review describing an observed issue or recommendation (protocol.rs:3004-3024)",
+        "attributes": [
+          "title: String",
+          "body: String",
+          "confidence_score: f32",
+          "priority: i32",
+          "code_location: ReviewCodeLocation{absolute_file_path: PathBuf, line_range: ReviewLineRange{start: u32, end: u32}}"
+        ],
+        "relationships": [
+          {"to": "SRC-0001/entity/review-output-event", "rel": "listed_by", "card": "N:1"}
+        ],
+        "enumerations": null,
+        "data_flows": null,
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0001/entity/exec-command-begin-event",
+      "src": "SRC-0001",
+      "composition": "entity",
+      "terms": {
+        "object": "ExecCommandBeginEvent — уведомление о начале выполнения команды (protocol.rs:3047-3068)",
+        "attributes": [
+          "call_id: String",
+          "process_id: Option<String> (underlying PTY process)",
+          "turn_id: String",
+          "command: Vec<String>",
+          "cwd: AbsolutePathBuf",
+          "parsed_cmd: Vec<ParsedCommand>",
+          "source: ExecCommandSource (serde default Agent)",
+          "interaction_input: Option<String>"
+        ],
+        "relationships": [
+          {"to": "SRC-0001/entity/event-msg", "rel": "carried_by", "card": "N:1"},
+          {"to": "SRC-0001/entity/exec-command-end-event", "rel": "paired_by_call_id", "card": "1:1"}
+        ],
+        "enumerations": {
+          "ExecCommandSource": ["Agent (default)", "UserShell", "UnifiedExecStartup", "UnifiedExecInteraction"]
+        },
+        "data_flows": null,
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0001/entity/exec-command-end-event",
+      "src": "SRC-0001",
+      "composition": "entity",
+      "terms": {
+        "object": "ExecCommandEndEvent — результат выполнения команды (protocol.rs:3071-3109)",
+        "attributes": [
+          "call_id: String",
+          "process_id: Option<String>",
+          "turn_id: String",
+          "command: Vec<String>",
+          "cwd: AbsolutePathBuf",
+          "parsed_cmd: Vec<ParsedCommand>",
+          "source: ExecCommandSource (serde default)",
+          "interaction_input: Option<String>",
+          "stdout: String",
+          "stderr: String",
+          "aggregated_output: String (serde default)",
+          "exit_code: i32",
+          "duration: Duration (ts string)",
+          "formatted_output: String (как видит модель)",
+          "status: ExecCommandStatus"
+        ],
+        "relationships": [
+          {"to": "SRC-0001/entity/exec-command-begin-event", "rel": "pairs_by_call_id", "card": "1:1"},
+          {"to": "SRC-0001/entity/event-msg", "rel": "carried_by", "card": "N:1"}
+        ],
+        "enumerations": {
+          "ExecCommandStatus": ["Completed", "Failed", "Declined"]
+        },
+        "data_flows": null,
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0001/entity/exec-command-output-delta-event",
+      "src": "SRC-0001",
+      "composition": "entity",
+      "terms": {
+        "object": "ExecCommandOutputDeltaEvent — инкрементальный chunk output от running команды (protocol.rs:3128-3138). chunk: Vec<u8> serialized как base64 (schemars/ts as string)",
+        "attributes": [
+          "call_id: String",
+          "stream: ExecOutputStream",
+          "chunk: Vec<u8> (wire: base64)"
+        ],
+        "relationships": [
+          {"to": "SRC-0001/entity/exec-command-begin-event", "rel": "refers_to_by_call_id", "card": "N:1"},
+          {"to": "SRC-0001/entity/event-msg", "rel": "carried_by", "card": "N:1"}
+        ],
+        "enumerations": {
+          "ExecOutputStream": ["Stdout", "Stderr"]
+        },
+        "data_flows": null,
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0001/entity/patch-apply-begin-event",
+      "src": "SRC-0001",
+      "composition": "entity",
+      "terms": {
+        "object": "PatchApplyBeginEvent — уведомление о применении patch (protocol.rs:3202-3213). Mirrors ExecCommandBegin чтобы front-ends могли показывать progress",
+        "attributes": [
+          "call_id: String",
+          "turn_id: String (serde default для backcompat)",
+          "auto_approved: bool (true = не было ApplyPatchApprovalRequest)",
+          "changes: HashMap<PathBuf, FileChange>"
+        ],
+        "relationships": [
+          {"to": "SRC-0001/entity/event-msg", "rel": "carried_by", "card": "N:1"},
+          {"to": "SRC-0001/entity/patch-apply-end-event", "rel": "paired_by_call_id", "card": "1:1"}
+        ],
+        "enumerations": {
+          "FileChange": [
+            "Add { content: String }",
+            "Delete { content: String }",
+            "Update { unified_diff: String, move_path: Option<PathBuf> }"
+          ]
+        },
+        "data_flows": null,
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0001/entity/patch-apply-end-event",
+      "src": "SRC-0001",
+      "composition": "entity",
+      "terms": {
+        "object": "PatchApplyEndEvent — результат применения patch (protocol.rs:3216-3234)",
+        "attributes": [
+          "call_id: String",
+          "turn_id: String (serde default)",
+          "stdout: String",
+          "stderr: String",
+          "success: bool",
+          "changes: HashMap<PathBuf, FileChange> (serde default)",
+          "status: PatchApplyStatus"
+        ],
+        "relationships": [
+          {"to": "SRC-0001/entity/patch-apply-begin-event", "rel": "pairs_by_call_id", "card": "1:1"},
+          {"to": "SRC-0001/entity/event-msg", "rel": "carried_by", "card": "N:1"}
+        ],
+        "enumerations": {
+          "PatchApplyStatus": ["Completed", "Failed", "Declined"]
+        },
+        "data_flows": null,
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0001/entity/mcp-tool-call-begin-event",
+      "src": "SRC-0001",
+      "composition": "entity",
+      "terms": {
+        "object": "McpToolCallBeginEvent — начало MCP tool call (protocol.rs:2365-2372)",
+        "attributes": [
+          "call_id: String",
+          "invocation: McpInvocation{server: String, tool: String, arguments: Option<Value>}",
+          "mcp_app_resource_uri: Option<String>"
+        ],
+        "relationships": [
+          {"to": "SRC-0001/entity/event-msg", "rel": "carried_by", "card": "N:1"},
+          {"to": "SRC-0001/entity/mcp-tool-call-end-event", "rel": "paired_by_call_id", "card": "1:1"}
+        ],
+        "enumerations": null,
+        "data_flows": null,
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0001/entity/mcp-tool-call-end-event",
+      "src": "SRC-0001",
+      "composition": "entity",
+      "terms": {
+        "object": "McpToolCallEndEvent — результат MCP tool call (protocol.rs:2375-2386). Результат может быть ошибкой",
+        "attributes": [
+          "call_id: String",
+          "invocation: McpInvocation",
+          "mcp_app_resource_uri: Option<String>",
+          "duration: Duration",
+          "result: Result<CallToolResult, String>"
+        ],
+        "relationships": [
+          {"to": "SRC-0001/entity/mcp-tool-call-begin-event", "rel": "pairs_by_call_id", "card": "1:1"},
+          {"to": "SRC-0001/entity/event-msg", "rel": "carried_by", "card": "N:1"}
+        ],
+        "enumerations": null,
+        "data_flows": [
+          {"source": "McpToolCallEndEvent", "transform": "is_success: Ok(result) && !result.is_error.unwrap_or(false); Err → false", "sink": "bool"}
+        ],
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0001/entity/mcp-auth-status",
+      "src": "SRC-0001",
+      "composition": "entity",
+      "terms": {
+        "object": "McpAuthStatus — auth status для сконфигурированного MCP сервера (protocol.rs:3304-3309). snake_case",
+        "attributes": null,
+        "relationships": [
+          {"to": "SRC-0001/entity/mcp-list-tools-response-event", "rel": "listed_by_server", "card": "N:N"}
+        ],
+        "enumerations": {
+          "McpAuthStatus": ["Unsupported", "NotLoggedIn", "BearerToken", "OAuth"],
+          "display_values": ["Unsupported", "Not logged in", "Bearer token", "OAuth"]
+        },
+        "data_flows": null,
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0001/entity/mcp-startup-status",
+      "src": "SRC-0001",
+      "composition": "entity",
+      "terms": {
+        "object": "McpStartupStatus — текущий статус старта MCP сервера (protocol.rs:3281-3286). snake_case, tag=state",
+        "attributes": null,
+        "relationships": [
+          {"to": "SRC-0001/entity/event-msg", "rel": "carried_in_McpStartupUpdate", "card": "N:1"}
+        ],
+        "enumerations": {
+          "McpStartupStatus": ["Starting", "Ready", "Failed { error: String }", "Cancelled"]
+        },
+        "data_flows": null,
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0001/entity/mcp-startup-complete-event",
+      "src": "SRC-0001",
+      "composition": "entity",
+      "terms": {
+        "object": "McpStartupCompleteEvent — aggregate завершения старта MCP (protocol.rs:3289-3293). Default",
+        "attributes": [
+          "ready: Vec<String>",
+          "failed: Vec<McpStartupFailure{server, error}>",
+          "cancelled: Vec<String>"
+        ],
+        "relationships": [
+          {"to": "SRC-0001/entity/event-msg", "rel": "carried_by", "card": "N:1"}
+        ],
+        "enumerations": null,
+        "data_flows": null,
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0001/entity/mcp-list-tools-response-event",
+      "src": "SRC-0001",
+      "composition": "entity",
+      "terms": {
+        "object": "McpListToolsResponseEvent — список MCP tools и ресурсов (protocol.rs:3259-3268)",
+        "attributes": [
+          "tools: HashMap<String, McpTool> (fully qualified tool name → tool)",
+          "resources: HashMap<String, Vec<McpResource>> (сгруппировано по server)",
+          "resource_templates: HashMap<String, Vec<McpResourceTemplate>>",
+          "auth_statuses: HashMap<String, McpAuthStatus>"
+        ],
+        "relationships": [
+          {"to": "SRC-0001/entity/event-msg", "rel": "carried_by", "card": "N:1"},
+          {"to": "SRC-0001/entity/mcp-auth-status", "rel": "uses_per_server", "card": "1:N"}
+        ],
+        "enumerations": null,
+        "data_flows": null,
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0001/entity/skill-metadata",
+      "src": "SRC-0001",
+      "composition": "entity",
+      "terms": {
+        "object": "SkillMetadata — метаданные skill (protocol.rs:3379-3395)",
+        "attributes": [
+          "name: String",
+          "description: String",
+          "short_description: Option<String> (legacy из SKILL.md; предпочитать interface.short_description из SKILL.json)",
+          "interface: Option<SkillInterface>",
+          "dependencies: Option<SkillDependencies{tools: Vec<SkillToolDependency>}>",
+          "path: AbsolutePathBuf",
+          "scope: SkillScope",
+          "enabled: bool"
+        ],
+        "relationships": [
+          {"to": "SRC-0001/entity/skills-list-entry", "rel": "part_of", "card": "N:1"},
+          {"to": "SRC-0001/entity/skill-interface", "rel": "uses", "card": "1:1"}
+        ],
+        "enumerations": {
+          "SkillScope": ["User", "Repo", "System", "Admin"]
+        },
+        "data_flows": null,
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0001/entity/skill-interface",
+      "src": "SRC-0001",
+      "composition": "entity",
+      "terms": {
+        "object": "SkillInterface — опциональное UI/presentation interface skill (protocol.rs:3398-3411)",
+        "attributes": [
+          "display_name: Option<String>",
+          "short_description: Option<String>",
+          "icon_small: Option<AbsolutePathBuf>",
+          "icon_large: Option<AbsolutePathBuf>",
+          "brand_color: Option<String>",
+          "default_prompt: Option<String>"
+        ],
+        "relationships": [
+          {"to": "SRC-0001/entity/skill-metadata", "rel": "part_of", "card": "N:1"}
+        ],
+        "enumerations": null,
+        "data_flows": null,
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0001/entity/skills-list-entry",
+      "src": "SRC-0001",
+      "composition": "entity",
+      "terms": {
+        "object": "SkillsListEntry — запись ListSkills response (protocol.rs:3445-3449)",
+        "attributes": [
+          "cwd: PathBuf",
+          "skills: Vec<SkillMetadata>",
+          "errors: Vec<SkillErrorInfo{path: PathBuf, message: String}>"
+        ],
+        "relationships": [
+          {"to": "SRC-0001/entity/skill-metadata", "rel": "lists", "card": "1:N"},
+          {"to": "SRC-0001/entity/event-msg", "rel": "carried_by_ListSkillsResponse", "card": "N:1"}
+        ],
+        "enumerations": null,
+        "data_flows": null,
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0001/entity/hook-run-summary",
+      "src": "SRC-0001",
+      "composition": "entity",
+      "terms": {
+        "object": "HookRunSummary — сводка одного hook run (protocol.rs:1667-1684). snake_case. Сигнализируется через HookStartedEvent / HookCompletedEvent",
+        "attributes": [
+          "id: String",
+          "event_name: HookEventName",
+          "handler_type: HookHandlerType",
+          "execution_mode: HookExecutionMode",
+          "scope: HookScope",
+          "source_path: AbsolutePathBuf",
+          "display_order: i64",
+          "status: HookRunStatus",
+          "status_message: Option<String>",
+          "started_at: i64",
+          "completed_at: Option<i64>",
+          "duration_ms: Option<i64>",
+          "entries: Vec<HookOutputEntry>"
+        ],
+        "relationships": [
+          {"to": "SRC-0001/entity/event-msg", "rel": "carried_in_HookStarted_HookCompleted", "card": "N:1"}
+        ],
+        "enumerations": {
+          "HookEventName": ["PreToolUse", "PostToolUse", "SessionStart", "UserPromptSubmit", "Stop"],
+          "HookHandlerType": ["Command", "Prompt", "Agent"],
+          "HookExecutionMode": ["Sync", "Async"],
+          "HookScope": ["Thread", "Turn"],
+          "HookRunStatus": ["Running", "Completed", "Failed", "Blocked", "Stopped"],
+          "HookOutputEntryKind": ["Warning", "Stop", "Feedback", "Context", "Error"]
+        },
+        "data_flows": null,
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0001/entity/agent-path",
+      "src": "SRC-0001",
+      "composition": "entity",
+      "terms": {
+        "object": "AgentPath — канонический path агента, re-exported из crate root (lib.rs:6). Детали реализации в модуле agent_path (вне файлов SRC — оставляем как contract reference)",
+        "attributes": null,
+        "relationships": [
+          {"to": "SRC-0001/entity/inter-agent-communication", "rel": "used_as_author_recipient", "card": "1:N"},
+          {"to": "SRC-0001/entity/session-meta", "rel": "optionally_identifies", "card": "N:1"}
+        ],
+        "enumerations": null,
+        "data_flows": null,
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0001/entity/thread-memory-mode",
+      "src": "SRC-0001",
+      "composition": "entity",
+      "terms": {
+        "object": "ThreadMemoryMode — remains ли thread eligible для memory generation (protocol.rs:692-695). lowercase serde",
+        "attributes": null,
+        "relationships": [
+          {"to": "SRC-0001/entity/op", "rel": "carried_in_SetThreadMemoryMode", "card": "1:1"}
+        ],
+        "enumerations": {
+          "ThreadMemoryMode": ["Enabled", "Disabled"]
+        },
+        "data_flows": null,
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0001/entity/file-change",
+      "src": "SRC-0001",
+      "composition": "entity",
+      "terms": {
+        "object": "FileChange — изменение файла в patch (protocol.rs:3586-3597). Tagged enum snake_case",
+        "attributes": null,
+        "relationships": [
+          {"to": "SRC-0001/entity/patch-apply-begin-event", "rel": "listed_by_path", "card": "N:1"},
+          {"to": "SRC-0001/entity/patch-apply-end-event", "rel": "listed_by_path", "card": "N:1"}
+        ],
+        "enumerations": {
+          "FileChange": [
+            "Add { content: String }",
+            "Delete { content: String }",
+            "Update { unified_diff: String, move_path: Option<PathBuf> }"
+          ]
+        },
+        "data_flows": null,
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0001/entity/compacted-item",
+      "src": "SRC-0001",
+      "composition": "entity",
+      "terms": {
+        "object": "CompactedItem — результат компакции history с опциональной replacement history (protocol.rs:2802-2806)",
+        "attributes": [
+          "message: String",
+          "replacement_history: Option<Vec<ResponseItem>>"
+        ],
+        "relationships": [
+          {"to": "SRC-0001/entity/rollout-item", "rel": "variant_of_Compacted", "card": "N:1"},
+          {"to": "SRC-0001/entity/response-item", "rel": "converts_to_Message_as_assistant", "card": "1:1"}
+        ],
+        "enumerations": null,
+        "data_flows": [
+          {"source": "CompactedItem.message", "transform": "From<CompactedItem> for ResponseItem → Message{role: assistant, content: [OutputText{text: message}]}", "sink": "ResponseItem::Message"}
+        ],
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0001/entity/base-instructions",
+      "src": "SRC-0001",
+      "composition": "entity",
+      "terms": {
+        "object": "BaseInstructions — базовые инструкции для модели на thread. Соответствует instructions в ResponsesAPI (models.rs:348-350). Default: встроенный include_str!(prompts/base_instructions/default.md)",
+        "attributes": [
+          "text: String"
+        ],
+        "relationships": [
+          {"to": "SRC-0001/entity/session-meta", "rel": "used_by", "card": "N:1"}
+        ],
+        "enumerations": null,
+        "data_flows": null,
+        "config": {
+          "BASE_INSTRUCTIONS_DEFAULT": {"value": "include_str!(prompts/base_instructions/default.md)", "source": "hardcoded models.rs:343", "default": "built-in prompt markdown"}
+        }
+      }
+    },
+    {
+      "id": "SRC-0001/entity/shell-tool-call-params",
+      "src": "SRC-0001",
+      "composition": "entity",
+      "terms": {
+        "object": "ShellToolCallParams — структура arguments для ResponseItem::FunctionCall когда name = container.exec или shell (models.rs:1065-1084)",
+        "attributes": [
+          "command: Vec<String>",
+          "workdir: Option<String>",
+          "timeout_ms: Option<u64> (serde alias timeout — максимальное время выполнения)",
+          "sandbox_permissions: Option<SandboxPermissions>",
+          "prefix_rule: Option<Vec<String>> (suggested command prefix для persist на future sessions)",
+          "additional_permissions: Option<PermissionProfile>",
+          "justification: Option<String>"
+        ],
+        "relationships": [
+          {"to": "SRC-0001/entity/sandbox-permissions", "rel": "uses", "card": "1:1"},
+          {"to": "SRC-0001/entity/permission-profile", "rel": "uses", "card": "1:1"}
+        ],
+        "enumerations": null,
+        "data_flows": null,
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0001/entity/shell-command-tool-call-params",
+      "src": "SRC-0001",
+      "composition": "entity",
+      "terms": {
+        "object": "ShellCommandToolCallParams — структура arguments когда name = shell_command (models.rs:1089-1110)",
+        "attributes": [
+          "command: String",
+          "workdir: Option<String>",
+          "login: Option<bool> (run с login shell semantics)",
+          "timeout_ms: Option<u64> (serde alias timeout)",
+          "sandbox_permissions: Option<SandboxPermissions>",
+          "prefix_rule: Option<Vec<String>>",
+          "additional_permissions: Option<PermissionProfile>",
+          "justification: Option<String>"
+        ],
+        "relationships": [
+          {"to": "SRC-0001/entity/sandbox-permissions", "rel": "uses", "card": "1:1"},
+          {"to": "SRC-0001/entity/permission-profile", "rel": "uses", "card": "1:1"}
+        ],
+        "enumerations": null,
+        "data_flows": null,
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0001/entity/search-tool-call-params",
+      "src": "SRC-0001",
+      "composition": "entity",
+      "terms": {
+        "object": "SearchToolCallParams — параметры search tool call (models.rs:1055-1060)",
+        "attributes": [
+          "query: String",
+          "limit: Option<usize>"
+        ],
+        "relationships": null,
+        "enumerations": null,
+        "data_flows": null,
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0001/entity/sandbox-permissions",
+      "src": "SRC-0001",
+      "composition": "entity",
+      "terms": {
+        "object": "SandboxPermissions — контролирует per-command sandbox override запрошенный shell-like tool call (models.rs:53-62). snake_case, Default UseDefault",
+        "attributes": null,
+        "relationships": [
+          {"to": "SRC-0001/entity/shell-tool-call-params", "rel": "used_by", "card": "N:1"},
+          {"to": "SRC-0001/entity/shell-command-tool-call-params", "rel": "used_by", "card": "N:1"}
+        ],
+        "enumerations": {
+          "SandboxPermissions": [
+            "UseDefault (default) — run с turn's sandbox policy unchanged",
+            "RequireEscalated — запрос run outside sandbox",
+            "WithAdditionalPermissions — остаться в sandbox, расширить permissions только для этой команды"
+          ]
+        },
+        "data_flows": [
+          {"source": "SandboxPermissions", "transform": "requires_escalated_permissions: matches!(RequireEscalated); requests_sandbox_override: !matches!(UseDefault); uses_additional_permissions: matches!(WithAdditionalPermissions)", "sink": "bool"}
+        ],
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0001/entity/permission-profile",
+      "src": "SRC-0001",
+      "composition": "entity",
+      "terms": {
+        "object": "PermissionProfile — профиль разрешений для tool call (models.rs:107-116). Default с is_empty()",
+        "attributes": [
+          "network: Option<NetworkPermissions{enabled: Option<bool>}>",
+          "file_system: Option<FileSystemPermissions{read: Option<Vec<AbsolutePathBuf>>, write: Option<Vec<AbsolutePathBuf>>}>"
+        ],
+        "relationships": [
+          {"to": "SRC-0001/entity/shell-tool-call-params", "rel": "used_by", "card": "N:1"},
+          {"to": "SRC-0001/entity/shell-command-tool-call-params", "rel": "used_by", "card": "N:1"}
+        ],
+        "enumerations": null,
+        "data_flows": [
+          {"source": "PermissionProfile", "transform": "is_empty: network.is_none() && file_system.is_none()", "sink": "bool"},
+          {"source": "FileSystemPermissions", "transform": "is_empty: read.is_none() && write.is_none()", "sink": "bool"},
+          {"source": "NetworkPermissions", "transform": "is_empty: enabled.is_none()", "sink": "bool"}
+        ],
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0001/entity/model-reroute-event",
+      "src": "SRC-0001",
+      "composition": "entity",
+      "terms": {
+        "object": "ModelRerouteEvent — смена маршрутизации модели (protocol.rs:2042-2046)",
+        "attributes": [
+          "from_model: String",
+          "to_model: String",
+          "reason: ModelRerouteReason"
+        ],
+        "relationships": [
+          {"to": "SRC-0001/entity/event-msg", "rel": "carried_by", "card": "N:1"}
+        ],
+        "enumerations": {
+          "ModelRerouteReason": ["HighRiskCyberActivity"]
+        },
+        "data_flows": null,
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0001/entity/collab-agent-ref",
+      "src": "SRC-0001",
+      "composition": "entity",
+      "terms": {
+        "object": "CollabAgentRef — ссылка на receiver/new agent в collab events (protocol.rs:3643-3652)",
+        "attributes": [
+          "thread_id: ThreadId",
+          "agent_nickname: Option<String>",
+          "agent_role: Option<String> (alias agent_type)"
+        ],
+        "relationships": [
+          {"to": "SRC-0001/entity/thread-id", "rel": "identified_by", "card": "1:1"}
+        ],
+        "enumerations": null,
+        "data_flows": null,
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0001/entity/collab-events",
+      "src": "SRC-0001",
+      "composition": "entity",
+      "terms": {
+        "object": "Collab events — семейство событий collab lifecycle: spawn begin/end, interaction begin/end, waiting begin/end, close begin/end, resume begin/end (protocol.rs:3630-3815). From impls для авто-конверсии в EventMsg",
+        "attributes": [
+          "CollabAgentSpawnBeginEvent: call_id, sender_thread_id: ThreadId, prompt: String, model, reasoning_effort",
+          "CollabAgentSpawnEndEvent: call_id, sender_thread_id, new_thread_id: Option<ThreadId>, new_agent_nickname?, new_agent_role?, prompt, model, reasoning_effort, status: AgentStatus",
+          "CollabAgentInteractionBeginEvent: call_id, sender_thread_id, receiver_thread_id, prompt",
+          "CollabAgentInteractionEndEvent: call_id, sender, receiver, receiver_agent_nickname?, receiver_agent_role?, prompt, status",
+          "CollabWaitingBeginEvent: sender_thread_id, receiver_thread_ids: Vec<ThreadId>, receiver_agents: Vec<CollabAgentRef>, call_id",
+          "CollabWaitingEndEvent: sender_thread_id, call_id, agent_statuses: Vec<CollabAgentStatusEntry>, statuses: HashMap<ThreadId, AgentStatus>",
+          "CollabCloseBegin/EndEvent: call_id, sender, receiver, (receiver_agent_nickname?/receiver_agent_role? на End), status на End",
+          "CollabResumeBegin/EndEvent: call_id, sender, receiver, receiver_agent_nickname?, receiver_agent_role?, status на End"
+        ],
+        "relationships": [
+          {"to": "SRC-0001/entity/event-msg", "rel": "converted_to_via_From", "card": "N:1"},
+          {"to": "SRC-0001/entity/agent-status", "rel": "reports", "card": "N:1"},
+          {"to": "SRC-0001/entity/thread-id", "rel": "references_sender_receiver", "card": "N:1"},
+          {"to": "SRC-0001/entity/collab-agent-ref", "rel": "uses_in_waiting", "card": "1:N"}
+        ],
+        "enumerations": null,
+        "data_flows": null,
+        "config": null
+      }
+    }
+  ]
+}

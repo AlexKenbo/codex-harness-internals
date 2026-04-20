@@ -1,0 +1,536 @@
+{
+  "src": "SRC-0003",
+  "schema_version": "2.0",
+  "lens": "use_case",
+  "compositions": [
+    {
+      "id": "SRC-0003/uc.sub/build-agent-path",
+      "src": "SRC-0003",
+      "composition": "use_case",
+      "level": "sub",
+      "strategic_domain": null,
+      "terms": {
+        "actor": "Модуль AgentPath (валидатор путей агентов)",
+        "goal": "Построить и провалидировать абсолютный путь агента",
+        "steps": [
+          "1. Вызывающая сторона передаёт строку-путь в from_string (или через TryFrom<String>/TryFrom<&str>/FromStr)",
+          "2. Модуль AgentPath вызывает validate_absolute_path: проверяет, что путь начинается с `/`",
+          "3. Модуль AgentPath отделяет первый сегмент и сравнивает его с ROOT_SEGMENT (`root`)",
+          "4. Модуль AgentPath проверяет, что путь не оканчивается на `/`",
+          "5. Модуль AgentPath для каждого последующего сегмента вызывает validate_agent_name",
+          "6. validate_agent_name отвергает пустое имя, зарезервированные `root`, `.`, `..`, наличие `/` и не-ASCII-lowercase-digit-underscore символы",
+          "7. При успешной валидации Модуль AgentPath заворачивает строку в AgentPath и возвращает Ok"
+        ],
+        "extensions (Cockburn)": [
+          {"step": 2, "condition": "путь не начинается с `/`", "action": "Err(\"absolute agent paths must start with `/root`\")"},
+          {"step": 3, "condition": "первый сегмент пустой", "action": "Err(\"absolute agent path must not be empty\")"},
+          {"step": 3, "condition": "первый сегмент не равен `root`", "action": "Err(\"absolute agent paths must start with `/root`\")"},
+          {"step": 4, "condition": "путь оканчивается на `/`", "action": "Err(\"absolute agent path must not end with `/`\")"},
+          {"step": 6, "condition": "сегмент пустой", "action": "Err(\"agent_name must not be empty\")"},
+          {"step": 6, "condition": "сегмент равен `root`", "action": "Err(\"agent_name `root` is reserved\")"},
+          {"step": 6, "condition": "сегмент равен `.` или `..`", "action": "Err(\"agent_name `<name>` is reserved\")"},
+          {"step": 6, "condition": "сегмент содержит `/`", "action": "Err(\"agent_name must not contain `/`\")"},
+          {"step": 6, "condition": "сегмент содержит запрещённые символы", "action": "Err(\"agent_name must use only lowercase letters, digits, and underscores\")"}
+        ],
+        "edge_cases": [
+          {"condition": "входная строка пустая", "action": "validate_absolute_path возвращает ошибку (отсутствует префикс `/`) ИЛИ resolve возвращает 'agent path must not be empty'"},
+          {"condition": "путь из одного `/root`", "action": "распознаётся как корневой; AgentPath::root() возвращает каноническую константу"}
+        ],
+        "lifecycle": null,
+        "ux": null,
+        "result": "AgentPath, представляющий валидный абсолютный путь /root[/<segment>]*; ошибки возвращаются как Err(String) с диагностическим сообщением"
+      }
+    },
+    {
+      "id": "SRC-0003/uc.sub/resolve-agent-reference",
+      "src": "SRC-0003",
+      "composition": "use_case",
+      "level": "sub",
+      "strategic_domain": null,
+      "terms": {
+        "actor": "Модуль AgentPath (resolve)",
+        "goal": "Разрешить ссылку на агента (относительную или абсолютную) относительно текущего пути",
+        "steps": [
+          "1. Вызывающая сторона передаёт reference в AgentPath::resolve",
+          "2. Модуль AgentPath проверяет, что reference не пустой",
+          "3. Модуль AgentPath сверяет reference с константой ROOT (`/root`); при совпадении возвращает AgentPath::root()",
+          "4. Модуль AgentPath проверяет первый символ reference: если `/`, делегирует в AgentPath::try_from(reference) для валидации абсолютного пути",
+          "5. Иначе Модуль AgentPath вызывает validate_relative_reference: сегменты валидируются как имена агентов, путь не должен оканчиваться на `/`",
+          "6. Модуль AgentPath собирает новый путь форматом `{self}/{reference}` и валидирует через from_string"
+        ],
+        "extensions (Cockburn)": [
+          {"step": 2, "condition": "reference пустой", "action": "Err(\"agent path must not be empty\")"},
+          {"step": 5, "condition": "относительный путь оканчивается на `/`", "action": "Err(\"relative agent path must not end with `/`\")"},
+          {"step": 5, "condition": "сегмент содержит `..` или `.`", "action": "Err(\"agent_name `..` is reserved\") (или `.`)"},
+          {"step": 6, "condition": "собранный путь не проходит validate_absolute_path", "action": "ошибка пробрасывается из from_string"}
+        ],
+        "edge_cases": [
+          {"condition": "reference начинается с `/` но содержит невалидные сегменты", "action": "ошибка пробрасывается через try_from с диагностикой validate_absolute_path"},
+          {"condition": "self не `/root`, reference относительный", "action": "путь конкатенируется через `/` и валидируется заново"}
+        ],
+        "lifecycle": null,
+        "ux": null,
+        "result": "AgentPath новой ссылки; либо Err(String) с человекочитаемой причиной отказа"
+      }
+    },
+    {
+      "id": "SRC-0003/uc.sub/derive-plan-from-raw",
+      "src": "SRC-0003",
+      "composition": "use_case",
+      "level": "sub",
+      "strategic_domain": null,
+      "terms": {
+        "actor": "Модуль auth (PlanType::from_raw_value)",
+        "goal": "Сопоставить сырое строковое значение плана с известным KnownPlan или сохранить как Unknown",
+        "steps": [
+          "1. Модуль auth получает raw &str (например, из ответа auth API)",
+          "2. Модуль auth приводит строку к ascii-lowercase",
+          "3. Модуль auth выполняет match по списку известных литералов (free/go/plus/pro/prolite/team/self_serve_business_usage_based/business/enterprise_cbp_usage_based/enterprise|hc/education|edu)",
+          "4. При совпадении модуль auth возвращает PlanType::Known(KnownPlan::<вариант>)",
+          "5. При несовпадении модуль auth возвращает PlanType::Unknown(raw.to_string())"
+        ],
+        "extensions (Cockburn)": [
+          {"step": 4, "condition": "raw == 'hc'", "action": "распознаётся как KnownPlan::Enterprise (alias)"},
+          {"step": 4, "condition": "raw == 'education'", "action": "распознаётся как KnownPlan::Edu (alias)"}
+        ],
+        "edge_cases": [
+          {"condition": "raw содержит неожиданный регистр (например, 'PRO')", "action": "ascii-lowercase нормализует к 'pro' и совпадает с KnownPlan::Pro"},
+          {"condition": "raw полностью неизвестен", "action": "сохраняется как PlanType::Unknown(raw) — сырое значение не теряется"}
+        ],
+        "lifecycle": null,
+        "ux": null,
+        "result": "PlanType — Known(KnownPlan) для распознанных значений, Unknown(raw) — для всех прочих"
+      }
+    },
+    {
+      "id": "SRC-0003/uc.sub/render-usage-limit-message",
+      "src": "SRC-0003",
+      "composition": "use_case",
+      "level": "sub",
+      "strategic_domain": null,
+      "terms": {
+        "actor": "Модуль error (UsageLimitReachedError::Display)",
+        "goal": "Сформировать сообщение пользователю о достигнутом лимите использования с учётом плана и времени сброса",
+        "steps": [
+          "1. Модуль error извлекает rate_limits.limit_name (если есть), trim, проверяет, что не пусто и не равно 'codex' (case-insensitive)",
+          "2. Если custom limit_name есть → модуль error выводит 'You've hit your usage limit for {limit_name}. Switch to another model now,{retry_suffix_after_or}'",
+          "3. Иначе если promo_message есть → модуль error выводит 'You've hit your usage limit. {promo_message},{retry_suffix_after_or}'",
+          "4. Иначе модуль error выбирает сообщение по plan_type: Plus → 'Upgrade to Pro / purchase credits'; Team/SelfServeBusinessUsageBased/Business/EnterpriseCbpUsageBased → 'send a request to your admin'; Free/Go → 'Upgrade to Plus'; Pro/ProLite → 'purchase more credits'; Enterprise/Edu → нейтральное; Unknown/None → нейтральное",
+          "5. Модуль error добавляет суффикс retry_suffix или retry_suffix_after_or в зависимости от ветки",
+          "6. Модуль error форматирует resets_at через format_retry_timestamp: если та же дата → 'Try again at {H:MM AM/PM}'; иначе 'Try again at {Mon Dst, YYYY H:MM AM/PM}' с правильным day_suffix (st/nd/rd/th, 11-13 → th)"
+        ],
+        "extensions (Cockburn)": [
+          {"step": 1, "condition": "limit_name равен 'codex' (case-insensitive)", "action": "ветка кастомного лимита пропускается, переходим к шагу 3"},
+          {"step": 4, "condition": "plan_type = None или Unknown(_)", "action": "выводится нейтральное 'You've hit your usage limit.{retry_suffix}'"},
+          {"step": 6, "condition": "resets_at == None", "action": "вместо точного времени подставляется 'Try again later.' (или ' or try again later.')"}
+        ],
+        "edge_cases": [
+          {"condition": "день месяца попадает в 11..=13", "action": "day_suffix возвращает 'th' (избегая st/nd/rd для подростковых чисел)"},
+          {"condition": "тестовая среда задаёт NOW_OVERRIDE", "action": "now_for_retry возвращает override вместо Utc::now() — чтобы сравнение дат было детерминированным"}
+        ],
+        "lifecycle": null,
+        "ux": [
+          "сообщение показывается через Display: содержит CTA (upgrade / contact admin / purchase credits) и ожидаемое время повторной попытки",
+          "формат времени локальный (Local timezone)"
+        ],
+        "result": "Строка сообщения, готовая к показу пользователю; включает план-специфичный CTA и retry-подсказку"
+      }
+    },
+    {
+      "id": "SRC-0003/uc.sub/render-unexpected-response",
+      "src": "SRC-0003",
+      "composition": "use_case",
+      "level": "sub",
+      "strategic_domain": null,
+      "terms": {
+        "actor": "Модуль error (UnexpectedResponseError::Display)",
+        "goal": "Сформировать пользовательское сообщение об HTTP-ответе с неожиданным статусом, выделяя Cloudflare-блокировки и распарсенные сообщения провайдера",
+        "steps": [
+          "1. Модуль error пробует friendly_message: если status == 403 И тело содержит и 'Cloudflare', и 'blocked' → возвращает 'Access blocked by Cloudflare. ... (status {status})' с url/cf_ray/request_id/auth-полями (если есть)",
+          "2. Иначе модуль error вызывает display_body: extract_error_message парсит тело как JSON и достаёт .error.message; если не получилось — берёт trim(body); пустое → 'Unknown error'",
+          "3. Модуль error при необходимости усекает тело через truncate_with_ellipsis до UNEXPECTED_RESPONSE_BODY_MAX_BYTES = 1000 байт, сохраняя char-boundary",
+          "4. Модуль error собирает 'unexpected status {status}: {body}' и при наличии добавляет ', url: {url}', ', cf-ray: {cf_ray}', ', request id: {request_id}', ', auth error: {identity_authorization_error}', ', auth error code: {identity_error_code}'"
+        ],
+        "extensions (Cockburn)": [
+          {"step": 1, "condition": "status != 403", "action": "Cloudflare-ветка пропускается, переход к шагу 2"},
+          {"step": 1, "condition": "тело не содержит одновременно 'Cloudflare' и 'blocked'", "action": "Cloudflare-ветка пропускается, переход к шагу 2"},
+          {"step": 2, "condition": "тело пустое", "action": "display_body возвращает 'Unknown error'"},
+          {"step": 2, "condition": "JSON-парсинг тела не удался ИЛИ .error.message отсутствует/пустой", "action": "extract_error_message возвращает None, используется trim(body)"}
+        ],
+        "edge_cases": [
+          {"condition": "тело длиннее UNEXPECTED_RESPONSE_BODY_MAX_BYTES = 1000 байт", "action": "обрезается с ellipsis '...' по char-boundary; cut уменьшается, пока не попадёт в is_char_boundary"},
+          {"condition": "Опциональные поля (url/cf_ray/request_id/identity_*) отсутствуют", "action": "соответствующие фрагменты не добавляются; формат не разрушается"}
+        ],
+        "lifecycle": null,
+        "ux": [
+          "при Cloudflare-блокировке используется отдельное человекочитаемое сообщение, не сырое тело",
+          "длинные тела усекаются, чтобы не перегружать UI"
+        ],
+        "result": "Строка ошибки для UI/логов: либо Cloudflare-friendly формулировка, либо 'unexpected status {status}: {body}' с диагностическими полями"
+      }
+    },
+    {
+      "id": "SRC-0003/uc.sub/format-ui-error-message",
+      "src": "SRC-0003",
+      "composition": "use_case",
+      "level": "sub",
+      "strategic_domain": null,
+      "terms": {
+        "actor": "Модуль error (get_error_message_ui)",
+        "goal": "Подготовить компактное сообщение об ошибке для UI, выделяя осмысленный stdout/stderr из sandbox и применяя бюджет в 2 KiB",
+        "steps": [
+          "1. Модуль error матчит CodexErr; для Sandbox(SandboxErr::Denied) проверяет output.aggregated_output.text",
+          "2. Если aggregated_output не пуст после trim — модуль error берёт его целиком",
+          "3. Иначе модуль error комбинирует stderr/stdout: оба не пусты → 'stderr\\nstdout'; только stderr → stderr; только stdout → stdout; оба пусты → 'command failed inside sandbox with exit code {exit_code}'",
+          "4. Для Sandbox(SandboxErr::Timeout) модуль error выводит 'error: command timed out after {duration_ms} ms'",
+          "5. Для прочих CodexErr модуль error использует e.to_string()",
+          "6. Модуль error усекает результат через truncate_text(TruncationPolicy::Bytes(ERROR_MESSAGE_UI_MAX_BYTES = 2*1024))"
+        ],
+        "extensions (Cockburn)": [
+          {"step": 6, "condition": "TruncationPolicy::Tokens(...)", "action": "вызывается truncate_middle_with_token_budget вместо truncate_middle_chars (для сообщений, ограниченных токенами, не байтами)"}
+        ],
+        "edge_cases": [
+          {"condition": "aggregated_output пуст, stderr и stdout оба пусты", "action": "сообщение = 'command failed inside sandbox with exit code {exit_code}' — пользователь не остаётся без контекста"},
+          {"condition": "сообщение длиннее 2 KiB", "action": "усекается посередине через truncate_middle_chars с ellipsis"}
+        ],
+        "lifecycle": null,
+        "ux": [
+          "ограничение 2 KiB защищает UI от переполнения длинными ответами sandbox",
+          "Sandbox::Timeout — отдельная UX-формулировка, чтобы не выглядеть как security-блокировка"
+        ],
+        "result": "Сжатое UI-сообщение об ошибке (≤ 2 KiB), пригодное для показа в TUI"
+      }
+    },
+    {
+      "id": "SRC-0003/uc.sub/classify-codex-error",
+      "src": "SRC-0003",
+      "composition": "use_case",
+      "level": "sub",
+      "strategic_domain": null,
+      "terms": {
+        "actor": "Модуль error (CodexErr classification)",
+        "goal": "Классифицировать CodexErr для решений Session loop (retry, фатально, сообщение пользователю)",
+        "steps": [
+          "1. Session loop получает CodexErr",
+          "2. Session loop вызывает is_retryable: транзиентные (Stream/Timeout/UnexpectedStatus/ResponseStreamFailed/ConnectionFailed/InternalServerError/InternalAgentDied/Io/Json/TokioJoin) → true; всё остальное → false",
+          "3. При is_retryable=false Session loop вызывает to_codex_protocol_error для перевода в CodexErrorInfo (см. Rules для полной таблицы маппинга)",
+          "4. Session loop собирает ErrorEvent через to_error_event(prefix?), который форматирует message как '{prefix}: {error}' или просто '{error}'",
+          "5. Session loop при необходимости извлекает HTTP-статус через http_status_code_value (RetryLimit→err.status; UnexpectedStatus→err.status; ConnectionFailed/ResponseStreamFailed→err.source.status())"
+        ],
+        "extensions (Cockburn)": [
+          {"step": 2, "condition": "CodexErr::Stream(_, Some(delay))", "action": "Session loop может использовать переданный delay перед retry"},
+          {"step": 3, "condition": "CodexErr::RefreshTokenFailed", "action": "to_codex_protocol_error возвращает CodexErrorInfo::Unauthorized — клиенту сигнализируется требование переавторизации"},
+          {"step": 3, "condition": "CodexErr::Sandbox(_)", "action": "to_codex_protocol_error возвращает CodexErrorInfo::SandboxError"},
+          {"step": 4, "condition": "prefix == None", "action": "message = error_string без префикса"}
+        ],
+        "edge_cases": [
+          {"condition": "CodexErr::TurnAborted, полученный через From<CancelErr>", "action": "оригинальная причина CancelErr теряется (информация о причине отбрасывается, см. impl From)"},
+          {"condition": "Linux-only варианты (LandlockRuleset/LandlockPathFd) на не-Linux", "action": "недоступны через cfg(target_os='linux')"}
+        ],
+        "lifecycle": null,
+        "ux": null,
+        "result": "Решение Session loop о retry vs surface, плюс сформированный ErrorEvent с CodexErrorInfo и опциональным HTTP-кодом"
+      }
+    },
+    {
+      "id": "SRC-0003/uc.sub/build-model-instructions",
+      "src": "SRC-0003",
+      "composition": "use_case",
+      "level": "sub",
+      "strategic_domain": null,
+      "terms": {
+        "actor": "Модуль openai_models (ModelInfo::get_model_instructions)",
+        "goal": "Собрать итоговые инструкции модели с учётом personality (или fallback на base_instructions)",
+        "steps": [
+          "1. Модуль openai_models проверяет наличие model_messages.instructions_template",
+          "2. Если template есть → модуль openai_models получает personality_message через ModelMessages::get_personality_message(personality) (или пустую строку при None)",
+          "3. Модуль openai_models заменяет в template подстроку '{{ personality }}' на personality_message",
+          "4. Если template отсутствует, но personality запрошен — модуль openai_models вызывает tracing::warn 'Model personality requested but model_messages is missing, falling back to base instructions.' и возвращает base_instructions",
+          "5. Если template отсутствует и personality не запрошен — модуль openai_models возвращает base_instructions"
+        ],
+        "extensions (Cockburn)": [
+          {"step": 2, "condition": "instructions_variables не задан или get_personality_message вернул None", "action": "personality_message = String::new(), плейсхолдер всё равно заменяется на пустую строку"},
+          {"step": 3, "condition": "personality == Personality::None", "action": "get_personality_message возвращает Some(String::new()), плейсхолдер заменяется на пустую строку"}
+        ],
+        "edge_cases": [
+          {"condition": "Template содержит '{{ personality }}', но instructions_variables неполный (is_complete=false)", "action": "supports_personality=false; шаблон всё равно используется и заменяется на доступное (или пустое) значение"},
+          {"condition": "Template отсутствует И personality is Some", "action": "warn-лог фиксирует потенциальную ошибку конфигурации, инструкции деградируют до base_instructions"}
+        ],
+        "lifecycle": null,
+        "ux": null,
+        "result": "Строка инструкций модели — заменённый template или base_instructions; warn-лог в trace, если personality запрошен без model_messages"
+      }
+    },
+    {
+      "id": "SRC-0003/uc.sub/select-personality-message",
+      "src": "SRC-0003",
+      "composition": "use_case",
+      "level": "sub",
+      "strategic_domain": null,
+      "terms": {
+        "actor": "Модуль openai_models (ModelInstructionsVariables::get_personality_message)",
+        "goal": "Подобрать строку personality по запрошенному варианту с fallback на default",
+        "steps": [
+          "1. Модуль openai_models получает Option<Personality>",
+          "2. Если personality is Some(Personality::None) → возвращает Some(String::new())",
+          "3. Если Some(Personality::Friendly) → возвращает personality_friendly.clone()",
+          "4. Если Some(Personality::Pragmatic) → возвращает personality_pragmatic.clone()",
+          "5. Если None → возвращает personality_default.clone()"
+        ],
+        "extensions (Cockburn)": [
+          {"step": 3, "condition": "personality_friendly == None", "action": "возвращает None — вызывающий код получает пустоту вместо строки"},
+          {"step": 4, "condition": "personality_pragmatic == None", "action": "возвращает None"},
+          {"step": 5, "condition": "personality_default == None", "action": "возвращает None"}
+        ],
+        "edge_cases": [
+          {"condition": "Personality::None всегда возвращает Some(пустая строка)", "action": "плейсхолдер инструкций гарантированно заменяется, даже если variables пустые — UC build-model-instructions полагается на это"}
+        ],
+        "lifecycle": null,
+        "ux": null,
+        "result": "Option<String> — персональное сообщение или None, если значение для запрошенного personality отсутствует"
+      }
+    },
+    {
+      "id": "SRC-0003/uc.sub/derive-auto-compact-limit",
+      "src": "SRC-0003",
+      "composition": "use_case",
+      "level": "sub",
+      "strategic_domain": null,
+      "terms": {
+        "actor": "Модуль openai_models (ModelInfo::auto_compact_token_limit)",
+        "goal": "Вывести порог автокомпакции для модели с учётом context_window и опциональной конфигурации",
+        "steps": [
+          "1. Модуль openai_models считает context_limit = context_window * 9 / 10 (если context_window задан)",
+          "2. Модуль openai_models берёт config_limit = self.auto_compact_token_limit",
+          "3. Если context_limit есть — модуль openai_models возвращает min(config_limit, context_limit) либо context_limit, если config_limit отсутствует",
+          "4. Если context_limit отсутствует — модуль openai_models возвращает config_limit (может быть None)"
+        ],
+        "extensions (Cockburn)": [
+          {"step": 3, "condition": "config_limit > context_limit", "action": "config_limit зажимается до context_limit (защита от значений выше 90% окна)"},
+          {"step": 3, "condition": "config_limit < context_limit", "action": "берётся config_limit (дополнительное ужесточение)"}
+        ],
+        "edge_cases": [
+          {"condition": "context_window и auto_compact_token_limit оба None", "action": "возвращается None — авто-компакция отключена"},
+          {"condition": "context_window мал (<10)", "action": "result = context_window * 9 / 10 округляется к нулю в целочисленном делении"}
+        ],
+        "lifecycle": null,
+        "ux": null,
+        "result": "Option<i64> — порог автокомпакции в токенах, либо None при отсутствии данных"
+      }
+    },
+    {
+      "id": "SRC-0003/uc.sub/build-model-preset",
+      "src": "SRC-0003",
+      "composition": "use_case",
+      "level": "sub",
+      "strategic_domain": null,
+      "terms": {
+        "actor": "Модуль openai_models (From<ModelInfo> for ModelPreset)",
+        "goal": "Сконвертировать серверный ModelInfo в UI-ориентированный ModelPreset с upgrade-маппингом усилий рассуждения",
+        "steps": [
+          "1. Модуль openai_models вычисляет supports_personality = info.supports_personality()",
+          "2. Модуль openai_models присваивает id = slug.clone(), model = slug.clone(), display_name, description.unwrap_or_default()",
+          "3. Модуль openai_models берёт default_reasoning_effort = info.default_reasoning_level.unwrap_or(ReasoningEffort::None)",
+          "4. Модуль openai_models клонирует supported_reasoning_levels в supported_reasoning_efforts",
+          "5. Модуль openai_models инициализирует is_default = false (выставляется позже через mark_default_by_picker_visibility)",
+          "6. Если info.upgrade задан, модуль openai_models собирает ModelUpgrade: id=upgrade.model.clone(); reasoning_effort_mapping = reasoning_effort_mapping_from_presets(&info.supported_reasoning_levels); migration_config_key = info.slug.clone(); model_link=None; upgrade_copy=None; migration_markdown=Some(upgrade.migration_markdown.clone())",
+          "7. Модуль openai_models выставляет show_in_picker = (visibility == ModelVisibility::List), копирует availability_nux и supported_in_api, переносит input_modalities"
+        ],
+        "extensions (Cockburn)": [
+          {"step": 6, "condition": "info.supported_reasoning_levels пуст", "action": "reasoning_effort_mapping_from_presets возвращает None — апгрейд не получает маппинг усилий"},
+          {"step": 7, "condition": "visibility != List (Hide или None)", "action": "show_in_picker = false"}
+        ],
+        "edge_cases": [
+          {"condition": "info.description == None", "action": "description в presete становится пустой строкой через unwrap_or_default"},
+          {"condition": "info.upgrade == None", "action": "поле upgrade в presete остаётся None"}
+        ],
+        "lifecycle": null,
+        "ux": [
+          "ModelPreset обслуживает UI/picker; show_in_picker управляет видимостью",
+          "availability_nux переносится без изменений и показывается, когда модель становится доступна пользователю"
+        ],
+        "result": "ModelPreset, готовый к показу/фильтрации в UI; upgrade-блок (если был) содержит маппинг рассуждений и миграционные данные"
+      }
+    },
+    {
+      "id": "SRC-0003/uc.sub/filter-presets-by-auth",
+      "src": "SRC-0003",
+      "composition": "use_case",
+      "level": "sub",
+      "strategic_domain": null,
+      "terms": {
+        "actor": "Модуль openai_models (ModelPreset::filter_by_auth)",
+        "goal": "Отфильтровать список ModelPreset в зависимости от режима аутентификации",
+        "steps": [
+          "1. Модуль openai_models получает Vec<ModelPreset> и chatgpt_mode: bool",
+          "2. Модуль openai_models итерирует presets",
+          "3. Если chatgpt_mode == true → модуль openai_models оставляет все presets",
+          "4. Иначе модуль openai_models оставляет только presets c supported_in_api == true"
+        ],
+        "extensions (Cockburn)": [
+          {"step": 4, "condition": "supported_in_api == false и chatgpt_mode == false", "action": "preset исключается из вывода"}
+        ],
+        "edge_cases": [
+          {"condition": "входной список пуст", "action": "возвращается пустой Vec"},
+          {"condition": "все presets supported_in_api=false и chatgpt_mode=false", "action": "возвращается пустой Vec — пользователю нет доступных моделей"}
+        ],
+        "lifecycle": null,
+        "ux": [
+          "в режиме ChatGPT (chatgpt_mode) пользователь видит все модели",
+          "в API-режиме видны только модели с supported_in_api=true"
+        ],
+        "result": "Отфильтрованный Vec<ModelPreset>"
+      }
+    },
+    {
+      "id": "SRC-0003/uc.sub/mark-default-preset",
+      "src": "SRC-0003",
+      "composition": "use_case",
+      "level": "sub",
+      "strategic_domain": null,
+      "terms": {
+        "actor": "Модуль openai_models (ModelPreset::mark_default_by_picker_visibility)",
+        "goal": "Назначить ровно один is_default=true пресет на основе видимости в picker",
+        "steps": [
+          "1. Модуль openai_models сбрасывает is_default = false для всех presets",
+          "2. Модуль openai_models ищет первый preset с show_in_picker == true и устанавливает ему is_default = true",
+          "3. Если ни один preset не виден в picker, модуль openai_models назначает is_default = true первому presetу из списка"
+        ],
+        "extensions (Cockburn)": [
+          {"step": 3, "condition": "входной список пуст", "action": "ни один preset не помечается; ничего не происходит"}
+        ],
+        "edge_cases": [
+          {"condition": "есть несколько picker-visible presets", "action": "default получает только первый — гарантия единственности дефолта"}
+        ],
+        "lifecycle": null,
+        "ux": [
+          "в picker всегда отображается одна модель по умолчанию (либо первая видимая, либо первая в списке)"
+        ],
+        "result": "У одного preset is_default=true (если список не пуст)"
+      }
+    },
+    {
+      "id": "SRC-0003/uc.sub/map-reasoning-efforts",
+      "src": "SRC-0003",
+      "composition": "use_case",
+      "level": "sub",
+      "strategic_domain": null,
+      "terms": {
+        "actor": "Модуль openai_models (reasoning_effort_mapping_from_presets + nearest_effort)",
+        "goal": "Построить отображение каждого канонического ReasoningEffort на ближайший поддерживаемый при апгрейде модели",
+        "steps": [
+          "1. Модуль openai_models принимает срез ReasoningEffortPreset нового апгрейд-таргета",
+          "2. Если presets пуст — модуль openai_models возвращает None (маппинг не строится)",
+          "3. Иначе модуль openai_models собирает supported = presets.iter().map(|p| p.effort).collect()",
+          "4. Для каждого target из ReasoningEffort::iter() модуль openai_models вычисляет nearest_effort: minimal abs(rank(candidate) - rank(target))",
+          "5. Модуль openai_models добавляет (target, nearest) в HashMap"
+        ],
+        "extensions (Cockburn)": [
+          {"step": 4, "condition": "supported список пуст (после фильтрации)", "action": "nearest_effort возвращает target (fallback на сам target)"}
+        ],
+        "edge_cases": [
+          {"condition": "Несколько supported имеют одинаковую дистанцию rank", "action": "min_by_key оставляет первый встреченный (стабильно — порядок presets)"},
+          {"condition": "target = ReasoningEffort::XHigh, supported = [Low, Medium]", "action": "выбирается Medium (rank 3, дистанция 2 vs Low дистанция 3)"}
+        ],
+        "lifecycle": null,
+        "ux": null,
+        "result": "Option<HashMap<ReasoningEffort, ReasoningEffort>> — None, если presets пуст; иначе полный маппинг всех 6 канонических усилий"
+      }
+    },
+    {
+      "id": "SRC-0003/uc.sub/apply-collaboration-mode-mask",
+      "src": "SRC-0003",
+      "composition": "use_case",
+      "level": "sub",
+      "strategic_domain": null,
+      "terms": {
+        "actor": "Модуль config_types (CollaborationMode::apply_mask + with_updates)",
+        "goal": "Применить частичные обновления к CollaborationMode, сохраняя текущие значения для отсутствующих полей",
+        "steps": [
+          "1. Модуль config_types получает текущий CollaborationMode и CollaborationModeMask (или набор Option-параметров для with_updates)",
+          "2. Модуль config_types для mode: mask.mode.unwrap_or(self.mode) — None оставляет текущий ModeKind",
+          "3. Модуль config_types для model: mask.model.clone().unwrap_or_else(|| settings.model.clone())",
+          "4. Модуль config_types для reasoning_effort: mask.reasoning_effort.unwrap_or(settings.reasoning_effort) — Some(None) очищает; None сохраняет",
+          "5. Модуль config_types для developer_instructions: mask.developer_instructions.clone().unwrap_or_else(|| settings.developer_instructions.clone()) — Some(None) очищает; None сохраняет",
+          "6. Модуль config_types собирает новый CollaborationMode { mode, settings: { model, reasoning_effort, developer_instructions } }; mask.name игнорируется"
+        ],
+        "extensions (Cockburn)": [
+          {"step": 4, "condition": "mask.reasoning_effort == Some(None)", "action": "reasoning_effort очищается — текущая модель будет работать без указания усилия"},
+          {"step": 5, "condition": "mask.developer_instructions == Some(None)", "action": "developer_instructions очищаются"},
+          {"step": 6, "condition": "mask.name присутствует", "action": "name не применяется к результату — это метаданные маски"}
+        ],
+        "edge_cases": [
+          {"condition": "with_updates вызван со всеми None", "action": "возвращается клон текущего CollaborationMode без изменений"},
+          {"condition": "model заменяется, но reasoning_effort/developer_instructions сохраняются", "action": "корректная композиция: смена модели не теряет вспомогательные настройки"}
+        ],
+        "lifecycle": null,
+        "ux": null,
+        "result": "Новый CollaborationMode с применёнными изменениями; исходный объект не меняется"
+      }
+    },
+    {
+      "id": "SRC-0003/uc.sub/merge-web-search-config",
+      "src": "SRC-0003",
+      "composition": "use_case",
+      "level": "sub",
+      "strategic_domain": null,
+      "terms": {
+        "actor": "Модуль config_types (WebSearchToolConfig::merge + WebSearchLocation::merge)",
+        "goal": "Слить базовую и оверлейную конфигурации web-search так, чтобы оверлей переопределял поля при наличии",
+        "steps": [
+          "1. Модуль config_types для context_size: other.context_size.or(self.context_size)",
+          "2. Модуль config_types для allowed_domains: other.allowed_domains.clone().or_else(|| self.allowed_domains.clone())",
+          "3. Модуль config_types для location: если оба Some — вызвать WebSearchLocation::merge (per-field overlay-then-base); если только self — клонировать self; если только other — клонировать other; иначе None",
+          "4. WebSearchLocation::merge для каждого поля (country/region/city/timezone) предпочитает other, иначе self"
+        ],
+        "extensions (Cockburn)": [
+          {"step": 3, "condition": "self.location == None и other.location == None", "action": "результат location == None"},
+          {"step": 4, "condition": "поле в other = Some(значение)", "action": "результирующее поле берёт значение из other"},
+          {"step": 4, "condition": "поле в other = None и в self = Some", "action": "результирующее поле сохраняет значение self"}
+        ],
+        "edge_cases": [
+          {"condition": "allowed_domains в overlay None, в base Some", "action": "сохраняется список base — пустой overlay не очищает домены"},
+          {"condition": "context_size в overlay Some, в base Some", "action": "берётся overlay (per-test-evidence: WebSearchContextSize::High побеждает Low)"}
+        ],
+        "lifecycle": null,
+        "ux": null,
+        "result": "Объединённая WebSearchToolConfig (или WebSearchLocation), где overlay имеет приоритет"
+      }
+    },
+    {
+      "id": "SRC-0003/uc.sub/format-token-count",
+      "src": "SRC-0003",
+      "composition": "use_case",
+      "level": "sub",
+      "strategic_domain": null,
+      "terms": {
+        "actor": "Модуль num_format (format_si_suffix)",
+        "goal": "Отформатировать число токенов с тремя значащими цифрами и SI-суффиксом (K/M/G), используя локально-чувствительный разделитель цифр",
+        "steps": [
+          "1. Модуль num_format получает i64 n",
+          "2. Модуль num_format заменяет отрицательные значения на 0 через max(0)",
+          "3. Если n < 1000 — модуль num_format возвращает локализованное представление n без суффикса",
+          "4. Иначе модуль num_format перебирает UNITS = [(1000,'K'), (1_000_000,'M'), (1_000_000_000,'G')]",
+          "5. Для каждой единицы модуль num_format выбирает количество дробных цифр: 2 если round(100*n/scale) < 1000; 1 если round(10*n/scale) < 1000; 0 если round(n/scale) < 1000",
+          "6. Модуль num_format вычисляет scaled = round(value * 10^frac_digits) и формирует Decimal с multiply_pow10(-frac_digits), затем форматирует локализованно",
+          "7. Если n превышает 1000G — модуль num_format возвращает '{round(n/1e9)}G' через format_with_separators_with_formatter"
+        ],
+        "extensions (Cockburn)": [
+          {"step": 1, "condition": "локаль системы недоступна или невалидна", "action": "fallback на en-US formatter (make_en_us_formatter); paniks при невозможности построить даже en-US (assert через expect)"}
+        ],
+        "edge_cases": [
+          {"condition": "n == 0", "action": "возвращает '0' (или локализованный аналог)"},
+          {"condition": "n == 999", "action": "возвращает '999' (без суффикса)"},
+          {"condition": "n == 999_500", "action": "после округления переходит в '1.00M'"},
+          {"condition": "n == 1_234_000_000_000 (>1000G)", "action": "возвращает '1,234G' с разделителями"}
+        ],
+        "lifecycle": null,
+        "ux": [
+          "формат рассчитан на компактный показ счётчиков токенов (UI/CLI)",
+          "три значащих цифры обеспечивают предсказуемую ширину строки"
+        ],
+        "result": "Строка вида '999', '1.20K', '12.3M', '1.00G' либо '1,234G' для значений выше 1000G"
+      }
+    }
+  ]
+}

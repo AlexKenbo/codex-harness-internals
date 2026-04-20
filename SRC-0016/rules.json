@@ -1,0 +1,918 @@
+{
+  "src": "SRC-0016",
+  "schema_version": "2.0",
+  "lens": "rule",
+  "compositions": [
+    {
+      "id": "SRC-0016/rule/apply-patch-requires-environment",
+      "src": "SRC-0016",
+      "composition": "rule",
+      "terms": {
+        "condition": "apply_patch разрешён только при наличии turn.environment; иначе операция недоступна",
+        "numbers": [],
+        "formula": null,
+        "gwt": {
+          "given": "ToolInvocation для apply_patch с turn.environment = None",
+          "when": "ApplyPatchHandler.handle вызывается",
+          "then": "возвращается RespondToModel: 'apply_patch is unavailable in this session'"
+        }
+      }
+    },
+    {
+      "id": "SRC-0016/rule/apply-patch-verification-outcomes",
+      "src": "SRC-0016",
+      "composition": "rule",
+      "terms": {
+        "condition": "Для apply_patch возможны 4 исхода maybe_parse_apply_patch_verified: Body (продолжить), CorrectnessError (отклонить с 'apply_patch verification failed: {err}'), ShellParseError (trace-log + 'invalid patch input' в ApplyPatchHandler, Ok(None) в intercept_apply_patch), NotApplyPatch (отклонить с 'non-apply_patch input' в ApplyPatchHandler, Ok(None) в intercept_apply_patch)",
+        "numbers": [],
+        "formula": null,
+        "gwt": {
+          "given": "command = vec!['apply_patch', patch_input] в ApplyPatchHandler",
+          "when": "maybe_parse_apply_patch_verified возвращает NotApplyPatch",
+          "then": "ApplyPatchHandler возвращает RespondToModel: 'apply_patch handler received non-apply_patch input'; но в intercept_apply_patch тот же исход возвращает Ok(None) — shell-flow продолжается"
+        }
+      }
+    },
+    {
+      "id": "SRC-0016/rule/write-permissions-only-for-blocked-paths",
+      "src": "SRC-0016",
+      "composition": "rule",
+      "terms": {
+        "condition": "В apply_patch доп. write-permissions запрашиваются только для родительских директорий путей, которые нельзя записать в текущей policy; идентичные пути дедуплицируются через BTreeSet; итоговый профиль имеет read=Some([]) и write=Some(paths) и проходит normalize_additional_permissions; если таких путей нет — возвращается None",
+        "numbers": [],
+        "formula": "write_paths = dedupe_sorted({ path.parent() | для каждого p: not file_system_sandbox_policy.can_write_path_with_cwd(parent, cwd) })",
+        "gwt": {
+          "given": "file_paths = [/a/file1, /a/file2, /b/file3], policy позволяет писать в /a, запрещает /b",
+          "when": "write_permissions_for_paths(file_paths, policy, cwd=/workspace)",
+          "then": "PermissionProfile { file_system: FileSystemPermissions { read: Some([]), write: Some([/b]) } } после normalize_additional_permissions"
+        }
+      }
+    },
+    {
+      "id": "SRC-0016/rule/dynamic-tool-call-overwrite-warning",
+      "src": "SRC-0016",
+      "composition": "rule",
+      "terms": {
+        "condition": "Если при регистрации pending dynamic tool call insert_pending_dynamic_tool вернул Some (уже был sender), предыдущий канал перезаписывается и эмитится warn-лог 'Overwriting existing pending dynamic tool call for call_id: {event_id}'",
+        "numbers": [],
+        "formula": null,
+        "gwt": {
+          "given": "для call_id='abc' уже зарегистрирован oneshot::Sender в turn_state",
+          "when": "request_dynamic_tool вызывается повторно с тем же call_id",
+          "then": "старый sender перезаписан, выведено warn!: 'Overwriting existing pending dynamic tool call for call_id: abc'"
+        }
+      }
+    },
+    {
+      "id": "SRC-0016/rule/dynamic-tool-call-cancelled",
+      "src": "SRC-0016",
+      "composition": "rule",
+      "terms": {
+        "condition": "Если rx_response.await вернул None (канал закрыт / отменено) — в DynamicToolCallResponseEvent проставляется content_items=[], success=false, error=Some('dynamic tool call was cancelled before receiving a response'), и обработчик возвращает RespondToModel с тем же текстом",
+        "numbers": [],
+        "formula": null,
+        "gwt": {
+          "given": "DynamicToolCallRequest отправлен, но клиент разорвал канал до ответа",
+          "when": "rx_response.await возвращает Err (ok() -> None)",
+          "then": "EventMsg::DynamicToolCallResponse(DynamicToolCallResponseEvent{content_items: [], success: false, error: Some('dynamic tool call was cancelled before receiving a response'), duration: elapsed}); обработчик возвращает RespondToModel 'dynamic tool call was cancelled before receiving a response'"
+        }
+      }
+    },
+    {
+      "id": "SRC-0016/rule/js-repl-feature-gate",
+      "src": "SRC-0016",
+      "composition": "rule",
+      "terms": {
+        "condition": "JsReplHandler и JsReplResetHandler доступны только при включённой Feature::JsRepl; иначе возвращают RespondToModel: 'js_repl is disabled by feature flag'",
+        "numbers": [],
+        "formula": null,
+        "gwt": {
+          "given": "session.features().enabled(Feature::JsRepl) = false",
+          "when": "JsReplHandler.handle или JsReplResetHandler.handle",
+          "then": "RespondToModel: 'js_repl is disabled by feature flag'"
+        }
+      }
+    },
+    {
+      "id": "SRC-0016/rule/js-repl-freeform-input-validation",
+      "src": "SRC-0016",
+      "composition": "rule",
+      "terms": {
+        "condition": "Для Custom.input в js_repl: input не должен быть пустым; не должен начинаться с ``` markdown fence; не должен парситься как JSON object или JSON string; pragma-строка '// codex-js-repl: ...' допустима и задаёт key=value пары (только timeout_ms=u64, не более одного раза); после pragma должен следовать непустой JS",
+        "numbers": [],
+        "formula": null,
+        "gwt": {
+          "given": "input = '{\"code\":\"console.log(1)\"}'",
+          "when": "parse_freeform_args(input)",
+          "then": "reject_json_or_quoted_source отклоняет как JSON object -> RespondToModel: 'js_repl is a freeform tool and expects raw JavaScript source. Resend plain JS only (optional first line `// codex-js-repl: ...`); do not send JSON (`{\"code\":...}`), quoted code, or markdown fences.'"
+        }
+      }
+    },
+    {
+      "id": "SRC-0016/rule/js-repl-exit-code-mapping",
+      "src": "SRC-0016",
+      "composition": "rule",
+      "terms": {
+        "condition": "Для js_repl ExecToolCallOutput: exit_code = 1 если error присутствует, иначе 0; timed_out всегда false; aggregated_output = stdout если stderr пуст, stderr если stdout пуст, иначе '{stdout}\\n{stderr}'",
+        "numbers": [
+          {"value": 0, "kind": "exit_code (success)"},
+          {"value": 1, "kind": "exit_code (error)"}
+        ],
+        "formula": "exit_code = if error.is_some() { 1 } else { 0 }; aggregated_output = join_outputs(stdout, stderr)",
+        "gwt": {
+          "given": "result.output='hello', error=None, duration=10ms",
+          "when": "build_js_repl_exec_output(output, error, duration)",
+          "then": "ExecToolCallOutput { exit_code: 0, stdout: 'hello', stderr: '', aggregated_output: 'hello', duration: 10ms, timed_out: false }"
+        }
+      }
+    },
+    {
+      "id": "SRC-0016/rule/list-dir-arg-validation",
+      "src": "SRC-0016",
+      "composition": "rule",
+      "terms": {
+        "condition": "list_dir требует: offset>=1 (1-indexed), limit>=1, depth>=1, dir_path абсолютный; нарушение любого -> RespondToModel с конкретным сообщением",
+        "numbers": [
+          {"value": 1, "kind": "default offset"},
+          {"value": 25, "kind": "default limit"},
+          {"value": 2, "kind": "default depth"},
+          {"value": 0, "kind": "reject boundary для offset/limit/depth"}
+        ],
+        "formula": null,
+        "gwt": {
+          "given": "ListDirArgs { dir_path: '/tmp', offset: 0, limit: 25, depth: 2 }",
+          "when": "ListDirHandler.handle",
+          "then": "RespondToModel: 'offset must be a 1-indexed entry number'"
+        }
+      }
+    },
+    {
+      "id": "SRC-0016/rule/list-dir-entry-length-limit",
+      "src": "SRC-0016",
+      "composition": "rule",
+      "terms": {
+        "condition": "Имена файлов/путей, превышающие MAX_ENTRY_LENGTH=500 байт, обрезаются до 500 байт с учётом границы UTF-8 (take_bytes_at_char_boundary); Windows-разделители '\\' нормализуются в '/'",
+        "numbers": [
+          {"value": 500, "kind": "MAX_ENTRY_LENGTH (bytes)"}
+        ],
+        "formula": "display = if len(name) > 500 then take_bytes_at_char_boundary(name, 500) else name",
+        "gwt": {
+          "given": "path = 'a/'.repeat(400) (800 байт) в format_entry_name",
+          "when": "нормализация + длина>500",
+          "then": "возвращается первые 500 байт обрезанные до char boundary"
+        }
+      }
+    },
+    {
+      "id": "SRC-0016/rule/list-dir-slice-pagination",
+      "src": "SRC-0016",
+      "composition": "rule",
+      "terms": {
+        "condition": "list_dir_slice: start_index = offset-1 (1-indexed); если start_index >= entries.len() -> 'offset exceeds directory entry count'; capped_limit = min(limit, entries.len() - start_index); end_index = start_index + capped_limit; если end_index < entries.len() — добавить 'More than {capped_limit} entries found'",
+        "numbers": [],
+        "formula": "start_index = offset - 1; capped_limit = min(limit, entries.len() - start_index); end_index = start_index + capped_limit",
+        "gwt": {
+          "given": "entries.len() = 50, offset=10, limit=25",
+          "when": "list_dir_slice",
+          "then": "start_index=9, capped_limit=min(25, 41)=25, end_index=34; возвращаются 25 элементов + строка 'More than 25 entries found' (т.к. 34 < 50)"
+        }
+      }
+    },
+    {
+      "id": "SRC-0016/rule/list-dir-entry-suffix",
+      "src": "SRC-0016",
+      "composition": "rule",
+      "terms": {
+        "condition": "format_entry_line: отступ = depth*2 пробелов (INDENTATION_SPACES=2); суффикс имени: Directory='/', Symlink='@', Other='?', File='' (без суффикса)",
+        "numbers": [
+          {"value": 2, "kind": "INDENTATION_SPACES (per depth)"}
+        ],
+        "formula": "line = ' '.repeat(depth * 2) + display_name + suffix(kind)",
+        "gwt": {
+          "given": "entry { display_name: 'src', depth: 1, kind: Directory }",
+          "when": "format_entry_line",
+          "then": "'  src/' (2 пробела отступа, суффикс '/')"
+        }
+      }
+    },
+    {
+      "id": "SRC-0016/rule/dir-entry-kind-priority",
+      "src": "SRC-0016",
+      "composition": "rule",
+      "terms": {
+        "condition": "From<&FileType> for DirEntryKind: if is_symlink -> Symlink (приоритет над dir/file); else if is_dir -> Directory; else if is_file -> File; else Other",
+        "numbers": [],
+        "formula": null,
+        "gwt": {
+          "given": "FileType, для которого is_symlink=true и is_dir=true (symlink на директорию)",
+          "when": "DirEntryKind::from(&file_type)",
+          "then": "DirEntryKind::Symlink (Symlink проверяется первым)"
+        }
+      }
+    },
+    {
+      "id": "SRC-0016/rule/mcp-resource-cursor-requires-server",
+      "src": "SRC-0016",
+      "composition": "rule",
+      "terms": {
+        "condition": "Для list_mcp_resources / list_mcp_resource_templates: cursor может быть задан только если server задан; иначе RespondToModel: 'cursor can only be used when a server is specified'",
+        "numbers": [],
+        "formula": null,
+        "gwt": {
+          "given": "ListResourcesArgs { server: None, cursor: Some('x') }",
+          "when": "handle_list_resources",
+          "then": "RespondToModel: 'cursor can only be used when a server is specified'"
+        }
+      }
+    },
+    {
+      "id": "SRC-0016/rule/mcp-resource-default-server-label",
+      "src": "SRC-0016",
+      "composition": "rule",
+      "terms": {
+        "condition": "В McpInvocation для list_mcp_resources/templates: если server не задан — label='codex' (используется в emit_tool_call_begin/end), но сами данные берутся из list_all_*",
+        "numbers": [],
+        "formula": null,
+        "gwt": {
+          "given": "ListResourcesArgs { server: None, cursor: None }",
+          "when": "handle_list_resources формирует McpInvocation",
+          "then": "McpInvocation { server: 'codex', tool: 'list_mcp_resources', arguments }"
+        }
+      }
+    },
+    {
+      "id": "SRC-0016/rule/mcp-read-resource-required-strings",
+      "src": "SRC-0016",
+      "composition": "rule",
+      "terms": {
+        "condition": "Для read_mcp_resource: server и uri обязательны и не могут быть пустыми после trim (normalize_required_string); пустой -> '{field} must be provided'; arguments=None -> 'failed to parse function arguments: expected value'",
+        "numbers": [],
+        "formula": null,
+        "gwt": {
+          "given": "ReadResourceArgs { server: '  ', uri: 'file://x' }",
+          "when": "handle_read_resource",
+          "then": "RespondToModel: 'server must be provided'"
+        }
+      }
+    },
+    {
+      "id": "SRC-0016/rule/update-plan-mode-restriction",
+      "src": "SRC-0016",
+      "composition": "rule",
+      "terms": {
+        "condition": "update_plan запрещён в режиме ModeKind::Plan; иначе отправляется EventMsg::PlanUpdate и возвращается 'Plan updated'",
+        "numbers": [],
+        "formula": null,
+        "gwt": {
+          "given": "turn_context.collaboration_mode.mode = ModeKind::Plan",
+          "when": "handle_update_plan",
+          "then": "RespondToModel: 'update_plan is a TODO/checklist tool and is not allowed in Plan mode'"
+        }
+      }
+    },
+    {
+      "id": "SRC-0016/rule/request-permissions-non-empty",
+      "src": "SRC-0016",
+      "composition": "rule",
+      "terms": {
+        "condition": "request_permissions: permissions после normalize_additional_permissions должны содержать хотя бы один запрос (network или file_system); пустые -> 'request_permissions requires at least one permission'",
+        "numbers": [],
+        "formula": null,
+        "gwt": {
+          "given": "RequestPermissionsArgs { permissions: пусто после нормализации }",
+          "when": "RequestPermissionsHandler.handle",
+          "then": "RespondToModel: 'request_permissions requires at least one permission'"
+        }
+      }
+    },
+    {
+      "id": "SRC-0016/rule/request-user-input-root-only",
+      "src": "SRC-0016",
+      "composition": "rule",
+      "terms": {
+        "condition": "request_user_input разрешён только из root thread; SubAgent -> 'request_user_input can only be used by the root thread'; кроме того, режим collaboration_mode может отклонить запрос через request_user_input_unavailable_message(mode, default_mode_request_user_input)",
+        "numbers": [],
+        "formula": null,
+        "gwt": {
+          "given": "turn.session_source = SessionSource::SubAgent(_)",
+          "when": "RequestUserInputHandler.handle",
+          "then": "RespondToModel: 'request_user_input can only be used by the root thread'"
+        }
+      }
+    },
+    {
+      "id": "SRC-0016/rule/shell-is-mutating-safe-command",
+      "src": "SRC-0016",
+      "composition": "rule",
+      "terms": {
+        "condition": "ShellHandler.is_mutating: если arguments парсятся в ShellToolCallParams — is_mutating = !is_known_safe_command(params.command); LocalShell — !is_known_safe_command(params.command); unknown/некорректный JSON — true (assume mutating). ShellCommandHandler.is_mutating аналогично, но с учётом resolve_use_login_shell и base_command(shell, command, login)",
+        "numbers": [],
+        "formula": "is_mutating = !is_known_safe_command(derived_command)",
+        "gwt": {
+          "given": "ShellCommandToolCallParams { command: 'ls -la', login: None }, allow_login_shell=false, is_known_safe_command('ls -la')=true",
+          "when": "ShellCommandHandler.is_mutating",
+          "then": "false (команда безопасна, не требует approval)"
+        }
+      }
+    },
+    {
+      "id": "SRC-0016/rule/shell-command-login-shell-gate",
+      "src": "SRC-0016",
+      "composition": "rule",
+      "terms": {
+        "condition": "ShellCommandHandler.resolve_use_login_shell: если !allow_login_shell && login=Some(true) -> Err 'login shell is disabled by config; omit `login` or set it to false.'; иначе use_login_shell = login.unwrap_or(allow_login_shell). То же правило применяется в UnifiedExec.get_command",
+        "numbers": [],
+        "formula": "use_login_shell = if allow_login_shell { login.unwrap_or(true) } else if login != Some(true) { login.unwrap_or(false) } else { Err }",
+        "gwt": {
+          "given": "allow_login_shell=false, login=Some(true)",
+          "when": "resolve_use_login_shell",
+          "then": "Err(RespondToModel 'login shell is disabled by config; omit `login` or set it to false.')"
+        }
+      }
+    },
+    {
+      "id": "SRC-0016/rule/shell-unavailable-without-environment",
+      "src": "SRC-0016",
+      "composition": "rule",
+      "terms": {
+        "condition": "shell (ShellHandler/ShellCommandHandler run_exec_like) требует turn.environment; отсутствие -> 'shell is unavailable in this session'. Аналогично unified_exec требует turn.environment; отсутствие -> 'unified exec is unavailable in this session'",
+        "numbers": [],
+        "formula": null,
+        "gwt": {
+          "given": "turn.environment = None",
+          "when": "ShellHandler.run_exec_like или UnifiedExecHandler.handle",
+          "then": "RespondToModel: 'shell is unavailable in this session' | 'unified exec is unavailable in this session'"
+        }
+      }
+    },
+    {
+      "id": "SRC-0016/rule/additional-permissions-allowed-conditions",
+      "src": "SRC-0016",
+      "composition": "rule",
+      "terms": {
+        "condition": "additional_permissions_allowed = Feature::ExecPermissionApprovals включён ИЛИ (Feature::RequestPermissionsTool включён И effective_additional_permissions.permissions_preapproved=true). Если allowed=false и запрос содержит дополнительные права без preapproval — normalize_and_validate_additional_permissions возвращает ошибку 'additional permissions are disabled; enable `features.exec_permission_approvals` before using `with_additional_permissions`'",
+        "numbers": [],
+        "formula": "allowed = exec_permission_approvals_enabled || (request_permissions_tool_enabled && preapproved)",
+        "gwt": {
+          "given": "Feature::ExecPermissionApprovals=false, Feature::RequestPermissionsTool=false; SandboxPermissions::WithAdditionalPermissions; additional_permissions=Some(net); preapproved=false",
+          "when": "normalize_and_validate_additional_permissions",
+          "then": "Err('additional permissions are disabled; enable `features.exec_permission_approvals` before using `with_additional_permissions`')"
+        }
+      }
+    },
+    {
+      "id": "SRC-0016/rule/preapproved-permissions-bypass-feature-gate",
+      "src": "SRC-0016",
+      "composition": "rule",
+      "terms": {
+        "condition": "Если permissions_preapproved=true — normalize_and_validate_additional_permissions пропускает проверку feature flag `features.exec_permission_approvals` (sticky grants не требуют feature gate)",
+        "numbers": [],
+        "formula": null,
+        "gwt": {
+          "given": "additional_permissions_allowed=false, Granular approval with request_permissions=false; sandbox=WithAdditionalPermissions; permissions_preapproved=true; additional_permissions=Some(network)",
+          "when": "normalize_and_validate_additional_permissions",
+          "then": "Ok(Some(network_permissions)) — preapproved bypass"
+        }
+      }
+    },
+    {
+      "id": "SRC-0016/rule/additional-permissions-on-request-policy",
+      "src": "SRC-0016",
+      "composition": "rule",
+      "terms": {
+        "condition": "Если sandbox=WithAdditionalPermissions и !permissions_preapproved: approval_policy должен быть AskForApproval::OnRequest; иначе 'approval policy is {policy:?}; reject command — you cannot request additional permissions unless the approval policy is OnRequest'",
+        "numbers": [],
+        "formula": null,
+        "gwt": {
+          "given": "sandbox=WithAdditionalPermissions, !preapproved, approval_policy=Never",
+          "when": "normalize_and_validate_additional_permissions",
+          "then": "Err('approval policy is Never; reject command — you cannot request additional permissions unless the approval policy is OnRequest')"
+        }
+      }
+    },
+    {
+      "id": "SRC-0016/rule/additional-permissions-missing",
+      "src": "SRC-0016",
+      "composition": "rule",
+      "terms": {
+        "condition": "Если sandbox=WithAdditionalPermissions, policy=OnRequest, но additional_permissions=None -> 'missing `additional_permissions`; provide at least one of `network` or `file_system` when using `with_additional_permissions`'. Если после нормализации профиль пуст -> '`additional_permissions` must include at least one requested permission in `network` or `file_system`'",
+        "numbers": [],
+        "formula": null,
+        "gwt": {
+          "given": "sandbox=WithAdditionalPermissions, approval_policy=OnRequest, additional_permissions=None, !preapproved",
+          "when": "normalize_and_validate_additional_permissions",
+          "then": "Err('missing `additional_permissions`; provide at least one of `network` or `file_system` when using `with_additional_permissions`')"
+        }
+      }
+    },
+    {
+      "id": "SRC-0016/rule/additional-permissions-require-matching-sandbox",
+      "src": "SRC-0016",
+      "composition": "rule",
+      "terms": {
+        "condition": "Если sandbox!=WithAdditionalPermissions, но additional_permissions=Some -> '`additional_permissions` requires `sandbox_permissions` set to `with_additional_permissions`'",
+        "numbers": [],
+        "formula": null,
+        "gwt": {
+          "given": "sandbox=UseDefault, additional_permissions=Some(net)",
+          "when": "normalize_and_validate_additional_permissions (allowed=true)",
+          "then": "Err('`additional_permissions` requires `sandbox_permissions` set to `with_additional_permissions`')"
+        }
+      }
+    },
+    {
+      "id": "SRC-0016/rule/preapproval-intersection-check",
+      "src": "SRC-0016",
+      "composition": "rule",
+      "terms": {
+        "condition": "permissions_preapproved = true только если intersect_permission_profiles(effective, granted) == effective, то есть эффективный набор полностью покрыт ранее предоставленными grants (session+turn merged)",
+        "numbers": [],
+        "formula": "preapproved = (effective != None && granted != None && intersect(effective, granted) == effective)",
+        "gwt": {
+          "given": "effective_permissions={network}, granted_permissions={network, file_system}",
+          "when": "apply_granted_turn_permissions",
+          "then": "intersect({network},{network,fs})={network}==effective -> preapproved=true"
+        }
+      }
+    },
+    {
+      "id": "SRC-0016/rule/require-escalated-bypass-session-grants",
+      "src": "SRC-0016",
+      "composition": "rule",
+      "terms": {
+        "condition": "Если sandbox_permissions=RequireEscalated — apply_granted_turn_permissions возвращает исходные значения без merge с session/turn grants; permissions_preapproved=false",
+        "numbers": [],
+        "formula": null,
+        "gwt": {
+          "given": "sandbox=RequireEscalated, granted_session_permissions=Some(...)",
+          "when": "apply_granted_turn_permissions",
+          "then": "EffectiveAdditionalPermissions { sandbox_permissions: RequireEscalated, additional_permissions: как передано, permissions_preapproved: false } — session grants игнорируются"
+        }
+      }
+    },
+    {
+      "id": "SRC-0016/rule/implicit-granted-permissions-conditions",
+      "src": "SRC-0016",
+      "composition": "rule",
+      "terms": {
+        "condition": "implicit_granted_permissions возвращает effective.additional_permissions (sticky session grant) ТОЛЬКО если sandbox_permissions НЕ uses_additional_permissions, НЕ RequireEscalated, И inline additional_permissions = None; иначе None (явный inline запрос идёт обычным путём)",
+        "numbers": [],
+        "formula": null,
+        "gwt": {
+          "given": "sandbox=UseDefault, inline None, effective.additional_permissions=Some(file_system_grant)",
+          "when": "implicit_granted_permissions",
+          "then": "Some(file_system_grant) — sticky grant применяется автоматически"
+        }
+      }
+    },
+    {
+      "id": "SRC-0016/rule/explicit-inline-bypasses-implicit",
+      "src": "SRC-0016",
+      "composition": "rule",
+      "terms": {
+        "condition": "Если явно указан inline additional_permissions (Some) при sandbox=WithAdditionalPermissions — implicit_granted_permissions возвращает None, запрос идёт через обычный normalize_and_validate_additional_permissions",
+        "numbers": [],
+        "formula": null,
+        "gwt": {
+          "given": "sandbox=WithAdditionalPermissions, inline=Some(fs_request), effective.additional_permissions=Some(fs_request)",
+          "when": "implicit_granted_permissions",
+          "then": "None — implicit путь не используется"
+        }
+      }
+    },
+    {
+      "id": "SRC-0016/rule/sandbox-promotion-on-effective-permissions",
+      "src": "SRC-0016",
+      "composition": "rule",
+      "terms": {
+        "condition": "apply_granted_turn_permissions: если effective_permissions.is_some() и sandbox_permissions НЕ uses_additional_permissions — sandbox_permissions автоматически повышается до WithAdditionalPermissions",
+        "numbers": [],
+        "formula": null,
+        "gwt": {
+          "given": "sandbox=UseDefault (не uses_additional), effective_permissions=Some(net)",
+          "when": "apply_granted_turn_permissions",
+          "then": "sandbox_permissions = WithAdditionalPermissions"
+        }
+      }
+    },
+    {
+      "id": "SRC-0016/rule/shell-sandbox-override-approval-policy",
+      "src": "SRC-0016",
+      "composition": "rule",
+      "terms": {
+        "condition": "В shell run_exec_like и UnifiedExec exec_command: если effective.sandbox_permissions.requests_sandbox_override() && !preapproved && approval_policy != OnRequest -> отклонить с 'approval policy is {policy}; reject command — you should not ask for escalated permissions if the approval policy is {policy}' (shell) / 'you cannot ask for escalated permissions if the approval policy is {policy}' (unified_exec)",
+        "numbers": [],
+        "formula": null,
+        "gwt": {
+          "given": "effective.sandbox_permissions=RequireEscalated (requests override), preapproved=false, approval_policy=Never",
+          "when": "run_exec_like (shell) / unified_exec exec_command",
+          "then": "RespondToModel с сообщением о reject command из-за policy mismatch"
+        }
+      }
+    },
+    {
+      "id": "SRC-0016/rule/shell-sandbox-permissions-preapproved-override",
+      "src": "SRC-0016",
+      "composition": "rule",
+      "terms": {
+        "condition": "При построении ExecApprovalRequest: если preapproved=true — sandbox_permissions подставляются как SandboxPermissions::UseDefault (sticky grants проходят обычный approval flow для конкретной команды), иначе — effective sandbox_permissions",
+        "numbers": [],
+        "formula": "sandbox_permissions_for_approval = if preapproved then UseDefault else effective.sandbox_permissions",
+        "gwt": {
+          "given": "effective.sandbox_permissions=WithAdditionalPermissions, preapproved=true",
+          "when": "create_exec_approval_requirement_for_command",
+          "then": "ExecApprovalRequest использует sandbox_permissions=UseDefault"
+        }
+      }
+    },
+    {
+      "id": "SRC-0016/rule/shell-dependency-env-merge",
+      "src": "SRC-0016",
+      "composition": "rule",
+      "terms": {
+        "condition": "В run_exec_like: session.dependency_env (если не пуст) мёржится в exec_params.env; explicit_env_overrides = turn.shell_environment_policy.set ∪ { key: exec_params.env[key] для key в dependency_env если key существует в env }",
+        "numbers": [],
+        "formula": "env ← env ∪ dependency_env; explicit_env_overrides ← turn.set ∪ {k: env[k] | k ∈ dependency_env}",
+        "gwt": {
+          "given": "dependency_env={PATH: '/deps/bin'}, turn.shell_environment_policy.set={FOO: 'bar'}",
+          "when": "run_exec_like строит ShellRequest",
+          "then": "env содержит PATH и FOO; explicit_env_overrides={FOO: 'bar', PATH: '/deps/bin'}"
+        }
+      }
+    },
+    {
+      "id": "SRC-0016/rule/test-sync-barrier-defaults-and-validation",
+      "src": "SRC-0016",
+      "composition": "rule",
+      "terms": {
+        "condition": "BarrierArgs: timeout_ms по умолчанию DEFAULT_TIMEOUT_MS=1000; участников должно быть > 0; timeout_ms должен быть > 0; если barrier уже зарегистрирован с другим числом участников — ошибка 'barrier {id} already registered with {existing} participants'",
+        "numbers": [
+          {"value": 1000, "kind": "DEFAULT_TIMEOUT_MS (ms)"},
+          {"value": 0, "kind": "reject boundary для participants/timeout"}
+        ],
+        "formula": null,
+        "gwt": {
+          "given": "в barrier_map уже BarrierState { participants: 2 } для id='b1'; BarrierArgs { id: 'b1', participants: 3, timeout_ms: 500 }",
+          "when": "wait_on_barrier",
+          "then": "RespondToModel: 'barrier b1 already registered with 2 participants'"
+        }
+      }
+    },
+    {
+      "id": "SRC-0016/rule/test-sync-barrier-leader-cleanup",
+      "src": "SRC-0016",
+      "composition": "rule",
+      "terms": {
+        "condition": "По завершении wait: leader (wait_result.is_leader()) удаляет entry из barrier_map только если текущий Arc::ptr_eq совпадает с хранимым (защита от race после replacement)",
+        "numbers": [],
+        "formula": null,
+        "gwt": {
+          "given": "wait_result.is_leader()=true и map.get(id).barrier Arc::ptr_eq локальному barrier",
+          "when": "wait_on_barrier после barrier.wait",
+          "then": "map.remove(&barrier_id) выполняется"
+        }
+      }
+    },
+    {
+      "id": "SRC-0016/rule/tool-search-query-and-limit-validation",
+      "src": "SRC-0016",
+      "composition": "rule",
+      "terms": {
+        "condition": "ToolSearch: query (после trim) не должен быть пустым; limit = args.limit.unwrap_or(TOOL_SEARCH_DEFAULT_LIMIT); limit должен быть > 0; пустые entries -> пустой результат (без ошибки)",
+        "numbers": [],
+        "formula": null,
+        "gwt": {
+          "given": "ToolSearchArgs { query: '   ', limit: None }",
+          "when": "ToolSearchHandler.handle",
+          "then": "RespondToModel: 'query must not be empty'"
+        }
+      }
+    },
+    {
+      "id": "SRC-0016/rule/tool-search-computer-use-expansion",
+      "src": "SRC-0016",
+      "composition": "rule",
+      "terms": {
+        "condition": "Если use_default_limit=true (клиент не передал limit) и среди первичных результатов есть tool с server_name='computer-use' — search_engine.search перезапускается с limit=COMPUTER_USE_TOOL_SEARCH_LIMIT=20. Расширение не применяется при явном limit (use_default_limit=false)",
+        "numbers": [
+          {"value": 20, "kind": "COMPUTER_USE_TOOL_SEARCH_LIMIT"}
+        ],
+        "formula": "effective_search_limit = if use_default_limit && results.any(server='computer-use') then 20 else requested_limit",
+        "gwt": {
+          "given": "100 computer-use tools, query='computer use', use_default_limit=true, TOOL_SEARCH_DEFAULT_LIMIT=initial",
+          "when": "search_result_entries",
+          "then": "результатов = 20 (COMPUTER_USE_TOOL_SEARCH_LIMIT), все с server_name=computer-use"
+        }
+      }
+    },
+    {
+      "id": "SRC-0016/rule/tool-search-per-server-limit",
+      "src": "SRC-0016",
+      "composition": "rule",
+      "terms": {
+        "condition": "limit_results_per_server применяется после возможного расширения: на сервер computer-use оставляется до COMPUTER_USE_TOOL_SEARCH_LIMIT=20 результатов, на любой другой сервер — до TOOL_SEARCH_DEFAULT_LIMIT; избыточные отфильтровываются",
+        "numbers": [
+          {"value": 20, "kind": "cap для server='computer-use'"},
+          {"value": null, "kind": "cap для других серверов = TOOL_SEARCH_DEFAULT_LIMIT (imported)"}
+        ],
+        "formula": "cap(server) = if server=='computer-use' then 20 else TOOL_SEARCH_DEFAULT_LIMIT",
+        "gwt": {
+          "given": "100 computer-use tools + 100 other-server tools, query='computer use', use_default_limit=true",
+          "when": "search_result_entries",
+          "then": "computer-use ≤ 20 и other-server ≤ TOOL_SEARCH_DEFAULT_LIMIT в итоговом списке"
+        }
+      }
+    },
+    {
+      "id": "SRC-0016/rule/tool-search-document-fields",
+      "src": "SRC-0016",
+      "composition": "rule",
+      "terms": {
+        "condition": "build_search_text собирает в BM25-документ поля: tool_key, callable_name, tool.name, server_name; опционально (не пустые после trim): tool.title, tool.description, connector_name, connector_description; затем plugin_display_names (trim, не пустые); затем ключи input_schema.properties (если это object). Всё объединяется через пробел",
+        "numbers": [],
+        "formula": "text = join(' ', [name, callable_name, tool.name, server_name] + non_empty(title, description, connector_name, connector_description) + non_empty(plugin_display_names) + schema.properties.keys)",
+        "gwt": {
+          "given": "ToolInfo { server_name='gmail', callable_name='send_email', tool.name='send', tool.description='Send an email', plugin_display_names=['Gmail'], input_schema.properties={to, subject} }",
+          "when": "build_search_text('gmail__send', info)",
+          "then": "'gmail__send send_email send gmail Send an email Gmail to subject'"
+        }
+      }
+    },
+    {
+      "id": "SRC-0016/rule/tool-suggest-input-validation",
+      "src": "SRC-0016",
+      "composition": "rule",
+      "terms": {
+        "condition": "ToolSuggest: suggest_reason (trim) не пуст; action_type=DiscoverableToolAction::Install (других нет); если tool_type=Plugin и app_server_client_name='codex-tui' — отказать 'plugin tool suggestions are not available in codex-tui yet'; tool должен существовать среди discoverable_tools (match tool_type+tool_id)",
+        "numbers": [],
+        "formula": null,
+        "gwt": {
+          "given": "ToolSuggestArgs { suggest_reason: 'need gmail', action_type: Install, tool_type: Plugin, tool_id: 'x' }, app_server_client_name=Some('codex-tui')",
+          "when": "ToolSuggestHandler.handle",
+          "then": "RespondToModel: 'plugin tool suggestions are not available in codex-tui yet'"
+        }
+      }
+    },
+    {
+      "id": "SRC-0016/rule/tool-suggest-completion-protocol",
+      "src": "SRC-0016",
+      "composition": "rule",
+      "terms": {
+        "condition": "completed=true требует: user_confirmed=true (response.action == ElicitationAction::Accept) И verify_tool_suggestion_completed вернул true. Для Connector — accessible_connectors содержат установленный id после возможного hard_refresh_codex_apps_tools_cache. Для Plugin — plugin installed=true в marketplaces (PluginsManager.list_marketplaces_for_config). Только при completed && Connector — merge_connector_selection(HashSet{connector.id})",
+        "numbers": [],
+        "formula": null,
+        "gwt": {
+          "given": "DiscoverableTool::Connector(connector{id:'gmail'}); response.action=Accept; после hard_refresh accessible_connectors включают 'gmail'",
+          "when": "ToolSuggestHandler.handle",
+          "then": "completed=true, user_confirmed=true, session.merge_connector_selection({gmail}) выполняется"
+        }
+      }
+    },
+    {
+      "id": "SRC-0016/rule/tool-suggest-refresh-fallback",
+      "src": "SRC-0016",
+      "composition": "rule",
+      "terms": {
+        "condition": "refresh_missing_suggested_connectors: если expected_connector_ids пуст — вернуть пустой Vec; если все ожидаемые connectors уже в accessible_connectors (all_suggested_connectors_picked_up) — вернуть текущий snapshot; иначе — hard_refresh_codex_apps_tools_cache; при ошибке refresh — warn!-лог 'failed to refresh codex apps tools cache after tool suggestion for {tool_id}: {err:#}' + None",
+        "numbers": [],
+        "formula": null,
+        "gwt": {
+          "given": "expected_connector_ids=['gmail'], accessible_connectors не содержат 'gmail', hard_refresh возвращает Err('timeout')",
+          "when": "refresh_missing_suggested_connectors",
+          "then": "warn! с текстом ошибки + return None"
+        }
+      }
+    },
+    {
+      "id": "SRC-0016/rule/unavailable-tool-message-template",
+      "src": "SRC-0016",
+      "composition": "rule",
+      "terms": {
+        "condition": "unavailable_tool_message возвращает строку: 'Tool `{tool_name}` is not currently available. It appeared in earlier tool calls in this conversation, but its implementation is not available in the current request. {next_step}'. UnavailableToolHandler использует next_step='Retry after the tool becomes available or ask the user to re-enable it.' и success=Some(false)",
+        "numbers": [],
+        "formula": null,
+        "gwt": {
+          "given": "tool_name='foo'",
+          "when": "UnavailableToolHandler.handle для ToolPayload::Function",
+          "then": "FunctionToolOutput::from_text('Tool `foo` is not currently available. ... Retry after the tool becomes available or ask the user to re-enable it.', Some(false))"
+        }
+      }
+    },
+    {
+      "id": "SRC-0016/rule/unified-exec-defaults",
+      "src": "SRC-0016",
+      "composition": "rule",
+      "terms": {
+        "condition": "ExecCommandArgs defaults: tty=false, yield_time_ms=10_000. WriteStdinArgs default yield_time_ms=250. Остальные поля (sandbox_permissions, additional_permissions, justification, prefix_rule, max_output_tokens, workdir, shell, login) по умолчанию None или ::default()",
+        "numbers": [
+          {"value": 10000, "kind": "default_exec_yield_time_ms (ms)"},
+          {"value": 250, "kind": "default_write_stdin_yield_time_ms (ms)"},
+          {"value": false, "kind": "default_tty"}
+        ],
+        "formula": null,
+        "gwt": {
+          "given": "ExecCommandArgs { cmd: 'ls' } — остальные поля по умолчанию",
+          "when": "manager.exec_command",
+          "then": "tty=false, yield_time_ms=10000"
+        }
+      }
+    },
+    {
+      "id": "SRC-0016/rule/unified-exec-shell-mode-construction",
+      "src": "SRC-0016",
+      "composition": "rule",
+      "terms": {
+        "condition": "get_command в зависимости от UnifiedExecShellMode: Direct — если args.shell задан, создать shell через get_shell_by_model_provided_path + empty_shell_snapshot_receiver, иначе — session_shell; вернуть shell.derive_exec_args(cmd, use_login_shell). ZshFork — вернуть [zsh_fork_config.shell_zsh_path, '-lc' если use_login_shell else '-c', args.cmd]",
+        "numbers": [],
+        "formula": "Direct: command = shell.derive_exec_args(cmd, use_login_shell) | ZshFork: command = [zsh, '-lc'|'-c', cmd]",
+        "gwt": {
+          "given": "ExecCommandArgs { cmd: 'echo hi', login: Some(true) }, shell_mode=ZshFork { shell_zsh_path: '/bin/zsh' }, allow_login_shell=true",
+          "when": "get_command",
+          "then": "['/bin/zsh', '-lc', 'echo hi']"
+        }
+      }
+    },
+    {
+      "id": "SRC-0016/rule/unified-exec-process-id-release-on-failure",
+      "src": "SRC-0016",
+      "composition": "rule",
+      "terms": {
+        "condition": "В exec_command: process_id выделяется через manager.allocate_process_id перед любой проверкой; при подсказывающем отклонении (approval policy guard или normalize_and_validate_additional_permissions ошибка) process_id обязан быть освобождён через manager.release_process_id(process_id) перед возвратом ошибки. При успешном intercept_apply_patch — тоже release + возврат ExecCommandToolOutput с дефолтами",
+        "numbers": [],
+        "formula": null,
+        "gwt": {
+          "given": "process_id=42 выделен; normalize_and_validate_additional_permissions вернул Err",
+          "when": "exec_command",
+          "then": "manager.release_process_id(42); RespondToModel с текстом ошибки"
+        }
+      }
+    },
+    {
+      "id": "SRC-0016/rule/unified-exec-tty-metric",
+      "src": "SRC-0016",
+      "composition": "rule",
+      "terms": {
+        "condition": "emit_unified_exec_tty_metric отправляет OTEL counter TOOL_CALL_UNIFIED_EXEC_METRIC с инкрементом 1 и тегом ('tty', 'true'|'false') в зависимости от tty-флага запроса",
+        "numbers": [
+          {"value": 1, "kind": "counter inc"}
+        ],
+        "formula": null,
+        "gwt": {
+          "given": "tty=true",
+          "when": "emit_unified_exec_tty_metric(session_telemetry, true)",
+          "then": "session_telemetry.counter(TOOL_CALL_UNIFIED_EXEC_METRIC, 1, &[('tty','true')])"
+        }
+      }
+    },
+    {
+      "id": "SRC-0016/rule/unified-exec-post-tool-use-tty-skip",
+      "src": "SRC-0016",
+      "composition": "rule",
+      "terms": {
+        "condition": "UnifiedExecHandler.post_tool_use_payload возвращает None, если ExecCommandArgs.tty=true (post-tool hooks не применяются к интерактивным TTY-командам). Иначе возвращает PostToolUsePayload { command: args.cmd, tool_response }",
+        "numbers": [],
+        "formula": null,
+        "gwt": {
+          "given": "ExecCommandArgs { cmd: 'vim', tty: true }",
+          "when": "post_tool_use_payload",
+          "then": "None — post-tool-use обработка пропущена"
+        }
+      }
+    },
+    {
+      "id": "SRC-0016/rule/unified-exec-pre-tool-use-exec-command-only",
+      "src": "SRC-0016",
+      "composition": "rule",
+      "terms": {
+        "condition": "UnifiedExecHandler.pre_tool_use_payload возвращает Some только для tool_name.name='exec_command' без namespace и ToolPayload::Function (то есть write_stdin и namespaced вызовы не эмитят PreToolUse)",
+        "numbers": [],
+        "formula": null,
+        "gwt": {
+          "given": "tool_name { name: 'write_stdin', namespace: None }",
+          "when": "pre_tool_use_payload",
+          "then": "None"
+        }
+      }
+    },
+    {
+      "id": "SRC-0016/rule/view-image-modality-gate",
+      "src": "SRC-0016",
+      "composition": "rule",
+      "terms": {
+        "condition": "view_image требует, чтобы turn.model_info.input_modalities содержал InputModality::Image; иначе RespondToModel: 'view_image is not allowed because you do not support image inputs'",
+        "numbers": [],
+        "formula": null,
+        "gwt": {
+          "given": "turn.model_info.input_modalities = [Text]",
+          "when": "ViewImageHandler.handle",
+          "then": "RespondToModel: 'view_image is not allowed because you do not support image inputs'"
+        }
+      }
+    },
+    {
+      "id": "SRC-0016/rule/view-image-detail-whitelist",
+      "src": "SRC-0016",
+      "composition": "rule",
+      "terms": {
+        "condition": "view_image.detail: None (default resize) или 'original' (оригинальное разрешение). Любая другая строка отклоняется 'view_image.detail only supports `original`; omit `detail` for default resized behavior, got `{detail}`'. Для применения Original нужно ещё can_request_original_image_detail(turn.model_info)=true; иначе image_mode=ResizeToFit и image_detail=None",
+        "numbers": [],
+        "formula": null,
+        "gwt": {
+          "given": "args.detail=Some('original'), can_request_original_detail=false",
+          "when": "ViewImageHandler.handle",
+          "then": "image_mode=ResizeToFit, image_detail=None (detail игнорируется, изображение уменьшается)"
+        }
+      }
+    },
+    {
+      "id": "SRC-0016/rule/view-image-path-must-be-file",
+      "src": "SRC-0016",
+      "composition": "rule",
+      "terms": {
+        "condition": "view_image: metadata.is_file должен быть true; иначе 'image path `{path}` is not a file'. Ошибки get_metadata/read_file формируются как 'unable to locate image at `{path}`: {err}' / 'unable to read image at `{path}`: {err}'. Ошибки load_for_prompt_bytes — 'unable to process image at `{path}`: {err}'",
+        "numbers": [],
+        "formula": null,
+        "gwt": {
+          "given": "abs_path указывает на директорию",
+          "when": "ViewImageHandler.handle",
+          "then": "RespondToModel: 'image path `/x/y/` is not a file'"
+        }
+      }
+    },
+    {
+      "id": "SRC-0016/rule/remote-environment-sandbox-context",
+      "src": "SRC-0016",
+      "composition": "rule",
+      "terms": {
+        "condition": "file_system_sandbox_context строится для проверок apply_patch/view_image только если environment.is_remote()=true; для локального окружения sandbox=None (проверка выполняется локальной ФС без ограничений). Это используется в ApplyPatchHandler.handle, intercept_apply_patch, ViewImageHandler.handle",
+        "numbers": [],
+        "formula": null,
+        "gwt": {
+          "given": "environment.is_remote()=false",
+          "when": "ViewImageHandler или apply_patch parse",
+          "then": "sandbox=None — get_metadata/read_file/maybe_parse_apply_patch_verified вызываются без sandbox"
+        }
+      }
+    },
+    {
+      "id": "SRC-0016/rule/parse-arguments-base-path-guard",
+      "src": "SRC-0016",
+      "composition": "rule",
+      "terms": {
+        "condition": "parse_arguments_with_base_path(arguments, base_path) устанавливает AbsolutePathBufGuard(base_path) на время десериализации — относительные пути в полях Deserialize резолвятся относительно base_path (thread-local guard). По умолчанию parse_arguments просто вызывает serde_json::from_str с маппингом ошибки в 'failed to parse function arguments: {err}'",
+        "numbers": [],
+        "formula": null,
+        "gwt": {
+          "given": "arguments содержит relative path 'src/lib.rs', base_path=/workspace",
+          "when": "parse_arguments_with_base_path",
+          "then": "AbsolutePathBufGuard активен во время from_str; путь в итоговом AbsolutePathBuf = /workspace/src/lib.rs"
+        }
+      }
+    },
+    {
+      "id": "SRC-0016/rule/resolve-workdir-base-path",
+      "src": "SRC-0016",
+      "composition": "rule",
+      "terms": {
+        "condition": "resolve_workdir_base_path(arguments, default_cwd): берёт arguments.workdir как строку; если None или пустая — возвращает default_cwd.clone(); иначе default_cwd.join(workdir)",
+        "numbers": [],
+        "formula": "base_path = if args.workdir is non-empty string then default_cwd.join(workdir) else default_cwd.clone()",
+        "gwt": {
+          "given": "arguments={workdir:'sub'}, default_cwd=/workspace",
+          "when": "resolve_workdir_base_path",
+          "then": "AbsolutePathBuf(/workspace/sub)"
+        }
+      }
+    },
+    {
+      "id": "SRC-0016/rule/mcp-resource-serialization-success-flag",
+      "src": "SRC-0016",
+      "composition": "rule",
+      "terms": {
+        "condition": "serialize_function_output: payload сериализуется через serde_json::to_string и оборачивается в FunctionToolOutput::from_text(content, Some(true)); при ошибке — 'failed to serialize MCP resource response: {err}'. call_tool_result_from_content формирует CallToolResult с content=[{type:text, text:content}], is_error=success.map(|v| !v)",
+        "numbers": [],
+        "formula": "is_error = success.map(|v| !v) — None остаётся None",
+        "gwt": {
+          "given": "content='...', success=Some(true)",
+          "when": "call_tool_result_from_content",
+          "then": "CallToolResult { content: [{type:text,text:'...'}], structured_content:None, is_error: Some(false), meta:None }"
+        }
+      }
+    },
+    {
+      "id": "SRC-0016/rule/normalize-optional-string",
+      "src": "SRC-0016",
+      "composition": "rule",
+      "terms": {
+        "condition": "normalize_optional_string: None -> None; Some(value) -> trim; trimmed empty -> None; иначе Some(trimmed). normalize_required_string: если normalize_optional_string вернул None — ошибка '{field} must be provided'",
+        "numbers": [],
+        "formula": null,
+        "gwt": {
+          "given": "value='  server-1  '",
+          "when": "normalize_optional_string(Some(value))",
+          "then": "Some('server-1')"
+        }
+      }
+    }
+  ]
+}

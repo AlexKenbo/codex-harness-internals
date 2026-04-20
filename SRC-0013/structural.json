@@ -1,0 +1,1177 @@
+{
+  "src": "SRC-0013",
+  "schema_version": "2.0",
+  "lens": "structural",
+  "compositions": [
+    {
+      "id": "SRC-0013/entity/tool-spec",
+      "src": "SRC-0013",
+      "composition": "entity",
+      "terms": {
+        "object": "ToolSpec",
+        "attributes": [
+          "variant: enum {Function, Namespace, ToolSearch, LocalShell, ImageGeneration, WebSearch, Freeform}",
+          "name: derived from variant (tool.name for Function/Freeform/Namespace, literal 'tool_search'/'local_shell'/'image_generation'/'web_search' for typed variants)",
+          "ToolSearch.execution: string",
+          "ToolSearch.description: string",
+          "ToolSearch.parameters: JsonSchema",
+          "ImageGeneration.output_format: string",
+          "WebSearch.external_web_access: Option<bool>",
+          "WebSearch.filters: Option<ResponsesApiWebSearchFilters>",
+          "WebSearch.user_location: Option<ResponsesApiWebSearchUserLocation>",
+          "WebSearch.search_context_size: Option<WebSearchContextSize>",
+          "WebSearch.search_content_types: Option<Vec<String>>"
+        ],
+        "relationships": [
+          {"to": "SRC-0013/entity/responses-api-tool", "rel": "wraps (Function variant)", "card": "1:1"},
+          {"to": "SRC-0013/entity/responses-api-namespace", "rel": "wraps (Namespace variant)", "card": "1:1"},
+          {"to": "SRC-0013/entity/freeform-tool", "rel": "wraps (Freeform variant)", "card": "1:1"},
+          {"to": "SRC-0013/entity/configured-tool-spec", "rel": "contained_in", "card": "1:1"}
+        ],
+        "enumerations": {
+          "variant_tag": ["function", "namespace", "tool_search", "local_shell", "image_generation", "web_search", "custom"],
+          "WEB_SEARCH_TEXT_AND_IMAGE_CONTENT_TYPES": ["text", "image"]
+        },
+        "data_flows": [
+          {"source": "ToolSpec", "transform": "serde_json::to_value", "sink": "Responses API tools JSON array (create_tools_json_for_responses_api)"}
+        ],
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0013/entity/responses-api-tool",
+      "src": "SRC-0013",
+      "composition": "entity",
+      "terms": {
+        "object": "ResponsesApiTool",
+        "attributes": [
+          "name: String",
+          "description: String",
+          "strict: bool",
+          "defer_loading: Option<bool>",
+          "parameters: JsonSchema",
+          "output_schema: Option<Value> (skipped on serialize)"
+        ],
+        "relationships": [
+          {"to": "SRC-0013/entity/json-schema", "rel": "parameters_schema", "card": "1:1"},
+          {"to": "SRC-0013/entity/tool-spec", "rel": "variant_of (Function)", "card": "1:1"}
+        ],
+        "enumerations": null,
+        "data_flows": [
+          {"source": "ToolDefinition (MCP/dynamic)", "transform": "tool_definition_to_responses_api_tool — defer_loading=tool_definition.defer_loading.then_some(true), strict=false", "sink": "ResponsesApiTool"}
+        ],
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0013/entity/freeform-tool",
+      "src": "SRC-0013",
+      "composition": "entity",
+      "terms": {
+        "object": "FreeformTool",
+        "attributes": [
+          "name: String",
+          "description: String",
+          "format: FreeformToolFormat { type: String, syntax: String, definition: String }"
+        ],
+        "relationships": [
+          {"to": "SRC-0013/entity/tool-spec", "rel": "variant_of (Freeform)", "card": "1:1"}
+        ],
+        "enumerations": {
+          "format.type_values": ["grammar"],
+          "format.syntax_values": ["lark"]
+        },
+        "data_flows": null,
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0013/entity/responses-api-namespace",
+      "src": "SRC-0013",
+      "composition": "entity",
+      "terms": {
+        "object": "ResponsesApiNamespace",
+        "attributes": [
+          "name: String",
+          "description: String (defaults to 'Tools in the {namespace_name} namespace.' via default_namespace_description)",
+          "tools: Vec<ResponsesApiNamespaceTool>"
+        ],
+        "relationships": [
+          {"to": "SRC-0013/entity/responses-api-namespace-tool", "rel": "contains", "card": "1:N"}
+        ],
+        "enumerations": null,
+        "data_flows": null,
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0013/entity/responses-api-namespace-tool",
+      "src": "SRC-0013",
+      "composition": "entity",
+      "terms": {
+        "object": "ResponsesApiNamespaceTool",
+        "attributes": [
+          "variant: enum {Function(ResponsesApiTool)}"
+        ],
+        "relationships": [
+          {"to": "SRC-0013/entity/responses-api-tool", "rel": "wraps (Function variant)", "card": "1:1"},
+          {"to": "SRC-0013/entity/responses-api-namespace", "rel": "contained_in", "card": "N:1"}
+        ],
+        "enumerations": {
+          "variant_tag": ["function"]
+        },
+        "data_flows": null,
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0013/entity/tool-search-output-tool",
+      "src": "SRC-0013",
+      "composition": "entity",
+      "terms": {
+        "object": "ToolSearchOutputTool",
+        "attributes": [
+          "variant: enum {Function(ResponsesApiTool), Namespace(ResponsesApiNamespace)}"
+        ],
+        "relationships": [
+          {"to": "SRC-0013/entity/responses-api-tool", "rel": "wraps (Function variant)", "card": "1:1"},
+          {"to": "SRC-0013/entity/responses-api-namespace", "rel": "wraps (Namespace variant)", "card": "1:1"}
+        ],
+        "enumerations": {
+          "variant_tag": ["function", "namespace"]
+        },
+        "data_flows": [
+          {"source": "MCP tool sources grouped by tool_namespace", "transform": "collect_tool_search_output_tools: group by namespace → mcp_tool_to_deferred_responses_api_tool", "sink": "Vec<ToolSearchOutputTool::Namespace>"}
+        ],
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0013/entity/tool-definition",
+      "src": "SRC-0013",
+      "composition": "entity",
+      "terms": {
+        "object": "ToolDefinition",
+        "attributes": [
+          "name: String",
+          "description: String",
+          "input_schema: JsonSchema",
+          "output_schema: Option<JsonValue>",
+          "defer_loading: bool"
+        ],
+        "relationships": [
+          {"to": "SRC-0013/entity/json-schema", "rel": "has input_schema", "card": "1:1"},
+          {"to": "SRC-0013/entity/responses-api-tool", "rel": "converts_to via tool_definition_to_responses_api_tool", "card": "1:1"}
+        ],
+        "enumerations": null,
+        "data_flows": [
+          {"source": "DynamicToolSpec {name, description, input_schema, defer_loading}", "transform": "parse_dynamic_tool → parse_tool_input_schema; output_schema = None", "sink": "ToolDefinition"},
+          {"source": "rmcp::model::Tool (input_schema, output_schema, name, description)", "transform": "parse_mcp_tool: sanitize input_schema with empty properties fallback → parse_tool_input_schema; output_schema = mcp_call_tool_result_output_schema(structured_content_schema)", "sink": "ToolDefinition (defer_loading=false)"}
+        ],
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0013/entity/json-schema",
+      "src": "SRC-0013",
+      "composition": "entity",
+      "terms": {
+        "object": "JsonSchema (subset mirroring OpenAI Structured Outputs)",
+        "attributes": [
+          "schema_type: Option<JsonSchemaType> (Single | Multiple)",
+          "description: Option<String>",
+          "enum_values: Option<Vec<JsonValue>>",
+          "items: Option<Box<JsonSchema>>",
+          "properties: Option<BTreeMap<String, JsonSchema>>",
+          "required: Option<Vec<String>>",
+          "additional_properties: Option<AdditionalProperties> (Boolean | Schema)",
+          "any_of: Option<Vec<JsonSchema>>"
+        ],
+        "relationships": [
+          {"to": "SRC-0013/entity/json-schema", "rel": "self-referential (items, properties values, any_of, additional_properties schema)", "card": "1:N"}
+        ],
+        "enumerations": {
+          "JsonSchemaPrimitiveType": ["string", "number", "boolean", "integer", "object", "array", "null"]
+        },
+        "data_flows": [
+          {"source": "External JsonValue input_schema", "transform": "parse_tool_input_schema → sanitize_json_schema (coerce bools to string, collapse const→enum, infer types from keys, fill object.properties/array.items defaults) → serde_json::from_value; reject singleton null", "sink": "JsonSchema"}
+        ],
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0013/entity/configured-tool-spec",
+      "src": "SRC-0013",
+      "composition": "entity",
+      "terms": {
+        "object": "ConfiguredToolSpec",
+        "attributes": [
+          "spec: ToolSpec",
+          "supports_parallel_tool_calls: bool"
+        ],
+        "relationships": [
+          {"to": "SRC-0013/entity/tool-spec", "rel": "wraps", "card": "1:1"},
+          {"to": "SRC-0013/entity/tool-registry-plan", "rel": "contained_in", "card": "N:1"}
+        ],
+        "enumerations": null,
+        "data_flows": null,
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0013/entity/tool-registry-plan",
+      "src": "SRC-0013",
+      "composition": "entity",
+      "terms": {
+        "object": "ToolRegistryPlan",
+        "attributes": [
+          "specs: Vec<ConfiguredToolSpec>",
+          "handlers: Vec<ToolHandlerSpec>"
+        ],
+        "relationships": [
+          {"to": "SRC-0013/entity/configured-tool-spec", "rel": "contains", "card": "1:N"},
+          {"to": "SRC-0013/entity/tool-handler-spec", "rel": "contains", "card": "1:N"},
+          {"to": "SRC-0013/entity/tools-config", "rel": "built_from", "card": "N:1"}
+        ],
+        "enumerations": null,
+        "data_flows": [
+          {"source": "ToolsConfig + ToolRegistryPlanParams (mcp_tools, deferred_mcp_tools, tool_namespaces, discoverable_tools, dynamic_tools, default_agent_type_description, wait_agent_timeouts)", "transform": "build_tool_registry_plan: conditional push_spec + register_handler per config flag; MCP tools grouped by namespace sorted by ToolName::display then name; dynamic tools appended; if code_mode_enabled, each spec is augmented via augment_tool_spec_for_code_mode", "sink": "ToolRegistryPlan"}
+        ],
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0013/entity/tool-handler-spec",
+      "src": "SRC-0013",
+      "composition": "entity",
+      "terms": {
+        "object": "ToolHandlerSpec",
+        "attributes": [
+          "name: ToolName",
+          "kind: ToolHandlerKind"
+        ],
+        "relationships": [
+          {"to": "SRC-0013/entity/tool-registry-plan", "rel": "contained_in", "card": "N:1"}
+        ],
+        "enumerations": {
+          "ToolHandlerKind": [
+            "AgentJobs", "ApplyPatch", "CloseAgentV1", "CloseAgentV2",
+            "CodeModeExecute", "CodeModeWait", "DynamicTool", "FollowupTaskV2",
+            "JsRepl", "JsReplReset", "ListAgentsV2", "ListDir", "Mcp",
+            "McpResource", "Plan", "RequestPermissions", "RequestUserInput",
+            "ResumeAgentV1", "SendInputV1", "SendMessageV2", "Shell",
+            "ShellCommand", "SpawnAgentV1", "SpawnAgentV2", "TestSync",
+            "ToolSearch", "ToolSuggest", "UnifiedExec", "ViewImage",
+            "WaitAgentV1", "WaitAgentV2"
+          ]
+        },
+        "data_flows": null,
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0013/entity/tools-config",
+      "src": "SRC-0013",
+      "composition": "entity",
+      "terms": {
+        "object": "ToolsConfig",
+        "attributes": [
+          "available_models: Vec<ModelPreset>",
+          "shell_type: ConfigShellToolType",
+          "shell_command_backend: ShellCommandBackendConfig",
+          "unified_exec_shell_mode: UnifiedExecShellMode",
+          "has_environment: bool (default true)",
+          "allow_login_shell: bool (default true)",
+          "apply_patch_tool_type: Option<ApplyPatchToolType>",
+          "web_search_mode: Option<WebSearchMode>",
+          "web_search_config: Option<WebSearchConfig>",
+          "web_search_tool_type: WebSearchToolType",
+          "image_gen_tool: bool",
+          "search_tool: bool",
+          "tool_suggest: bool",
+          "exec_permission_approvals_enabled: bool",
+          "request_permissions_tool_enabled: bool",
+          "code_mode_enabled: bool",
+          "code_mode_only_enabled: bool",
+          "js_repl_enabled: bool",
+          "js_repl_tools_only: bool",
+          "can_request_original_image_detail: bool",
+          "collab_tools: bool",
+          "multi_agent_v2: bool",
+          "hide_spawn_agent_metadata: bool (default false)",
+          "spawn_agent_usage_hint: bool (default true)",
+          "spawn_agent_usage_hint_text: Option<String>",
+          "default_mode_request_user_input: bool",
+          "experimental_supported_tools: Vec<String>",
+          "agent_jobs_tools: bool",
+          "agent_jobs_worker_tools: bool",
+          "agent_type_description: String (default empty)"
+        ],
+        "relationships": [
+          {"to": "SRC-0013/entity/tool-registry-plan", "rel": "drives build_tool_registry_plan", "card": "1:1"},
+          {"to": "SRC-0013/entity/unified-exec-shell-mode", "rel": "uses", "card": "1:1"}
+        ],
+        "enumerations": {
+          "ShellCommandBackendConfig": ["Classic", "ZshFork"],
+          "ToolUserShellType": ["Zsh", "Bash", "PowerShell", "Sh", "Cmd"]
+        },
+        "data_flows": [
+          {"source": "ToolsConfigParams {model_info, available_models, features, image_generation_tool_auth_allowed, web_search_mode, session_source, sandbox_policy, windows_sandbox_level}", "transform": "ToolsConfig::new — map feature flags (ApplyPatchFreeform, CodeMode, CodeModeOnly, JsRepl, JsReplToolsOnly, Collab, MultiAgentV2, SpawnCsv, DefaultModeRequestUserInput, ToolSearch, ToolSuggest+Apps+Plugins, ImageGeneration, ExecPermissionApprovals, RequestPermissionsTool, ShellTool, ShellZshFork, UnifiedExec) to config flags; shell_type selection branches on ShellTool/ShellZshFork/UnifiedExec availability + conpty_supported + model_info.shell_type; apply_patch_tool_type from model_info override or Freeform default when enabled; agent_jobs_worker_tools requires session_source=SubAgent::Other with label prefix 'agent_job:'", "sink": "ToolsConfig"},
+          {"source": "ToolsConfig + builders (with_agent_type_description, with_spawn_agent_usage_hint, with_spawn_agent_usage_hint_text, with_hide_spawn_agent_metadata, with_allow_login_shell, with_has_environment, with_unified_exec_shell_mode, with_unified_exec_shell_mode_for_session, with_web_search_config, for_code_mode_nested_tools)", "transform": "fluent setters; for_code_mode_nested_tools clones with code_mode_enabled=false and code_mode_only_enabled=false", "sink": "ToolsConfig"}
+        ],
+        "config": {
+          "default_has_environment": {"value": true, "source": "ToolsConfig::new hardcoded", "default": true},
+          "default_allow_login_shell": {"value": true, "source": "ToolsConfig::new hardcoded", "default": true},
+          "default_spawn_agent_usage_hint": {"value": true, "source": "ToolsConfig::new hardcoded", "default": true},
+          "default_hide_spawn_agent_metadata": {"value": false, "source": "ToolsConfig::new hardcoded", "default": false}
+        }
+      }
+    },
+    {
+      "id": "SRC-0013/entity/unified-exec-shell-mode",
+      "src": "SRC-0013",
+      "composition": "entity",
+      "terms": {
+        "object": "UnifiedExecShellMode",
+        "attributes": [
+          "variant: enum {Direct, ZshFork(ZshForkConfig)}",
+          "ZshForkConfig.shell_zsh_path: AbsolutePathBuf",
+          "ZshForkConfig.main_execve_wrapper_exe: AbsolutePathBuf"
+        ],
+        "relationships": [
+          {"to": "SRC-0013/entity/tools-config", "rel": "contained_in", "card": "1:1"}
+        ],
+        "enumerations": {
+          "variant_tag": ["Direct", "ZshFork"]
+        },
+        "data_flows": [
+          {"source": "shell_command_backend + user_shell_type + optional shell_zsh_path + optional main_execve_wrapper_exe", "transform": "for_session — returns ZshFork when unix AND backend=ZshFork AND user_shell_type=Zsh AND both paths convertible to AbsolutePathBuf; otherwise Direct. Path conversion errors logged via tracing::warn!", "sink": "UnifiedExecShellMode"}
+        ],
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0013/entity/spawn-agent-tool",
+      "src": "SRC-0013",
+      "composition": "entity",
+      "terms": {
+        "object": "spawn_agent tool (v1 and v2)",
+        "attributes": [
+          "name: 'spawn_agent'",
+          "v1.parameters (properties): message, items (structured array), agent_type, fork_context: boolean, model, reasoning_effort",
+          "v1.required: none",
+          "v2.parameters (properties): message, agent_type, fork_turns (string defaults 'all'), model, reasoning_effort, task_name",
+          "v2.required: [task_name, message]",
+          "options.available_models: &[ModelPreset]",
+          "options.agent_type_description: String",
+          "options.hide_agent_type_model_reasoning: bool (when true, removes agent_type, model, reasoning_effort properties)",
+          "options.include_usage_hint: bool",
+          "options.usage_hint_text: Option<String>",
+          "v1.output_schema: {agent_id: string, nickname: string|null}",
+          "v2.output_schema when hide_agent_metadata=true: {task_name: string}",
+          "v2.output_schema when hide_agent_metadata=false: {task_name: string, nickname: string|null}",
+          "collab_input_items properties: type, text, image_url, path, name",
+          "strict: false",
+          "additionalProperties: false"
+        ],
+        "relationships": [
+          {"to": "SRC-0013/entity/spawn-agent-models-description", "rel": "generated_from available_models when !hide_agent_type_model_reasoning", "card": "1:1"}
+        ],
+        "enumerations": {
+          "collab_input_items.type": ["text", "image", "local_image", "skill", "mention"]
+        },
+        "data_flows": [
+          {"source": "SpawnAgentToolOptions", "transform": "create_spawn_agent_tool_v1/v2 — build properties (optionally hide metadata), compose description (optionally with usage hint), wrap in ResponsesApiTool", "sink": "ToolSpec::Function"}
+        ],
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0013/entity/agent-status-output",
+      "src": "SRC-0013",
+      "composition": "entity",
+      "terms": {
+        "object": "agent_status_output_schema (shared by resume_agent, list_agents, wait v1, close_agent)",
+        "attributes": [
+          "oneOf: [string-enum, {completed: string|null}, {errored: string}]"
+        ],
+        "relationships": [
+          {"to": "SRC-0013/entity/spawn-agent-tool", "rel": "returned_by sibling agent tools", "card": "1:N"}
+        ],
+        "enumerations": {
+          "agent_status_string": ["pending_init", "running", "interrupted", "shutdown", "not_found"]
+        },
+        "data_flows": null,
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0013/entity/wait-agent-tool",
+      "src": "SRC-0013",
+      "composition": "entity",
+      "terms": {
+        "object": "wait_agent tool (v1 and v2)",
+        "attributes": [
+          "v1.parameters.targets: array<string> (agent ids, required)",
+          "v1.parameters.timeout_ms: number (description embeds default/min/max from WaitAgentTimeoutOptions)",
+          "v2.parameters.timeout_ms: number (description embeds default/min/max)",
+          "v1.output_schema: {status: {agent_id → agent_status}, timed_out: boolean}",
+          "v2.output_schema: {message: string, timed_out: boolean}"
+        ],
+        "relationships": [
+          {"to": "SRC-0013/entity/agent-status-output", "rel": "uses (v1 status values)", "card": "1:N"}
+        ],
+        "enumerations": null,
+        "data_flows": null,
+        "config": {
+          "wait_default_timeout_ms": {"value": null, "source": "WaitAgentTimeoutOptions.default_timeout_ms (i64, caller-provided)", "default": null},
+          "wait_min_timeout_ms": {"value": null, "source": "WaitAgentTimeoutOptions.min_timeout_ms (i64, caller-provided)", "default": null},
+          "wait_max_timeout_ms": {"value": null, "source": "WaitAgentTimeoutOptions.max_timeout_ms (i64, caller-provided)", "default": null}
+        }
+      }
+    },
+    {
+      "id": "SRC-0013/entity/send-input-tool",
+      "src": "SRC-0013",
+      "composition": "entity",
+      "terms": {
+        "object": "send_input tool (v1)",
+        "attributes": [
+          "name: 'send_input'",
+          "properties: target (agent id, required), message (legacy plain-text), items (structured array), interrupt: boolean (default false — queue message)",
+          "output_schema: {submission_id: string}"
+        ],
+        "relationships": [
+          {"to": "SRC-0013/entity/spawn-agent-tool", "rel": "targets spawned agent", "card": "N:1"}
+        ],
+        "enumerations": null,
+        "data_flows": null,
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0013/entity/send-message-tool",
+      "src": "SRC-0013",
+      "composition": "entity",
+      "terms": {
+        "object": "send_message tool (v2)",
+        "attributes": [
+          "name: 'send_message'",
+          "properties: target (relative or canonical task name, required), message (required)",
+          "description: 'Send a string message to an existing agent without triggering a new turn.'",
+          "output_schema: none"
+        ],
+        "relationships": [
+          {"to": "SRC-0013/entity/spawn-agent-tool", "rel": "targets spawned agent (v2)", "card": "N:1"}
+        ],
+        "enumerations": null,
+        "data_flows": null,
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0013/entity/followup-task-tool",
+      "src": "SRC-0013",
+      "composition": "entity",
+      "terms": {
+        "object": "followup_task tool (v2)",
+        "attributes": [
+          "name: 'followup_task'",
+          "properties: target (agent id or canonical task name, required), message (required), interrupt: boolean (default false — queue; if target running, starts next turn after current completes)",
+          "output_schema: none"
+        ],
+        "relationships": [
+          {"to": "SRC-0013/entity/spawn-agent-tool", "rel": "triggers new turn on non-root agent (v2)", "card": "N:1"}
+        ],
+        "enumerations": null,
+        "data_flows": null,
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0013/entity/resume-agent-tool",
+      "src": "SRC-0013",
+      "composition": "entity",
+      "terms": {
+        "object": "resume_agent tool",
+        "attributes": [
+          "name: 'resume_agent'",
+          "properties: id (required)",
+          "description: 'Resume a previously closed agent by id so it can receive send_input and wait_agent calls.'",
+          "output_schema: {status: agent_status}"
+        ],
+        "relationships": [
+          {"to": "SRC-0013/entity/agent-status-output", "rel": "returns", "card": "1:1"}
+        ],
+        "enumerations": null,
+        "data_flows": null,
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0013/entity/close-agent-tool",
+      "src": "SRC-0013",
+      "composition": "entity",
+      "terms": {
+        "object": "close_agent tool (v1 and v2)",
+        "attributes": [
+          "name: 'close_agent'",
+          "v1.target: agent id (required)",
+          "v2.target: agent id or canonical task name (required)",
+          "output_schema: {previous_status: agent_status}"
+        ],
+        "relationships": [
+          {"to": "SRC-0013/entity/agent-status-output", "rel": "returns previous_status", "card": "1:1"}
+        ],
+        "enumerations": null,
+        "data_flows": null,
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0013/entity/list-agents-tool",
+      "src": "SRC-0013",
+      "composition": "entity",
+      "terms": {
+        "object": "list_agents tool",
+        "attributes": [
+          "name: 'list_agents'",
+          "properties: path_prefix (optional; not ending with trailing slash)",
+          "output_schema: {agents: array<{agent_name: string, agent_status: agent_status, last_task_message: string|null}>}"
+        ],
+        "relationships": [
+          {"to": "SRC-0013/entity/agent-status-output", "rel": "reports per-agent status", "card": "1:N"}
+        ],
+        "enumerations": null,
+        "data_flows": null,
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0013/entity/spawn-agents-on-csv-tool",
+      "src": "SRC-0013",
+      "composition": "entity",
+      "terms": {
+        "object": "spawn_agents_on_csv tool",
+        "attributes": [
+          "name: 'spawn_agents_on_csv'",
+          "required: [csv_path, instruction]",
+          "properties: csv_path (string), instruction (template with {column_name} placeholders), id_column (optional stable item id), output_csv_path (optional), max_concurrency (number), max_workers (alias for max_concurrency; 1 = sequential), max_runtime_seconds (number), output_schema (object)",
+          "output_schema: none"
+        ],
+        "relationships": [
+          {"to": "SRC-0013/entity/report-agent-job-result-tool", "rel": "each worker must call", "card": "1:N"}
+        ],
+        "enumerations": null,
+        "data_flows": [
+          {"source": "CSV row", "transform": "substitute {column} placeholders into instruction", "sink": "worker sub-agent prompt"},
+          {"source": "worker results", "transform": "write to output_csv_path or default path", "sink": "exported CSV"}
+        ],
+        "config": {
+          "max_concurrency_default": {"value": 16, "source": "create_spawn_agents_on_csv_tool description", "default": 16},
+          "max_runtime_seconds_default": {"value": 1800, "source": "create_spawn_agents_on_csv_tool description", "default": 1800}
+        }
+      }
+    },
+    {
+      "id": "SRC-0013/entity/report-agent-job-result-tool",
+      "src": "SRC-0013",
+      "composition": "entity",
+      "terms": {
+        "object": "report_agent_job_result tool",
+        "attributes": [
+          "name: 'report_agent_job_result'",
+          "required: [job_id, item_id, result]",
+          "properties: job_id (string), item_id (string), result (object), stop: boolean (optional — cancel remaining job items when true)",
+          "description: 'Worker-only tool to report a result for an agent job item. Main agents should not call this.'"
+        ],
+        "relationships": [
+          {"to": "SRC-0013/entity/spawn-agents-on-csv-tool", "rel": "reports_to", "card": "N:1"}
+        ],
+        "enumerations": null,
+        "data_flows": null,
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0013/entity/apply-patch-tool",
+      "src": "SRC-0013",
+      "composition": "entity",
+      "terms": {
+        "object": "apply_patch tool (Freeform and JSON variants)",
+        "attributes": [
+          "name: 'apply_patch'",
+          "freeform.format.type: 'grammar', syntax: 'lark', definition: APPLY_PATCH_LARK_GRAMMAR (include_str! 'tool_apply_patch.lark')",
+          "json.required: [input]",
+          "json.properties: input (string — entire contents of apply_patch command)",
+          "json.description: envelope '*** Begin Patch' … '*** End Patch'",
+          "ApplyPatchToolArgs.input: String"
+        ],
+        "relationships": null,
+        "enumerations": {
+          "file_op_header": ["*** Add File:", "*** Delete File:", "*** Update File:"],
+          "optional_rename_header": ["*** Move to:"],
+          "hunk_markers": ["@@", "*** End of File"],
+          "hunk_line_prefix": [" ", "-", "+"]
+        },
+        "data_flows": null,
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0013/entity/code-mode-tool",
+      "src": "SRC-0013",
+      "composition": "entity",
+      "terms": {
+        "object": "code-mode tool (public exec) + wait tool",
+        "attributes": [
+          "name: codex_code_mode::PUBLIC_TOOL_NAME (Freeform)",
+          "format.type: 'grammar', syntax: 'lark', definition: CODE_MODE_FREEFORM_GRAMMAR",
+          "description: codex_code_mode::build_exec_tool_description(enabled_tools, namespace_descriptions, code_mode_only, deferred_tools_available)",
+          "wait.name: codex_code_mode::WAIT_TOOL_NAME",
+          "wait.required: [cell_id]",
+          "wait.properties: cell_id (string), yield_time_ms (number), max_tokens (number), terminate (boolean)"
+        ],
+        "relationships": [
+          {"to": "SRC-0013/entity/tool-spec", "rel": "augments via augment_tool_spec_for_code_mode", "card": "1:N"}
+        ],
+        "enumerations": null,
+        "data_flows": [
+          {"source": "ToolSpec (Function | Freeform | Namespace)", "transform": "augment_tool_spec_for_code_mode — for Function/Freeform replace description via augmented_description_for_spec (wraps CodeModeToolDefinition, calls codex_code_mode::augment_tool_definition); for Namespace, iterate tools and augment each Function's description with namespaced ToolName::namespaced(namespace.name, tool.name); Namespace variant uses full namespaced name", "sink": "augmented ToolSpec with code-mode sample in description"},
+          {"source": "Vec<ToolSpec>", "transform": "collect_code_mode_tool_definitions — flat_map code_mode_tool_definitions_for_spec, filter is_code_mode_nested_tool, augment, sort by name, dedup by name", "sink": "Vec<CodeModeToolDefinition>"},
+          {"source": "Vec<ToolSpec>", "transform": "collect_code_mode_exec_prompt_tool_definitions — same as above WITHOUT augment step; sort+dedup by name", "sink": "Vec<CodeModeToolDefinition>"}
+        ],
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0013/entity/js-repl-tool",
+      "src": "SRC-0013",
+      "composition": "entity",
+      "terms": {
+        "object": "js_repl and js_repl_reset tools",
+        "attributes": [
+          "js_repl.name: 'js_repl'",
+          "js_repl.format: {type: 'grammar', syntax: 'lark', definition: JS_REPL_FREEFORM_GRAMMAR}",
+          "js_repl.description: 'Runs JavaScript in a persistent Node kernel with top-level await. … send raw JavaScript source text, optionally with a first-line pragma like // codex-js-repl: timeout_ms=15000; do not send JSON/quotes/markdown fences.'",
+          "js_repl_reset.name: 'js_repl_reset'",
+          "js_repl_reset.description: 'Restarts the js_repl kernel for this run and clears persisted top-level bindings.'",
+          "js_repl_reset.parameters: object with no properties"
+        ],
+        "relationships": null,
+        "enumerations": null,
+        "data_flows": null,
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0013/entity/exec-command-tool",
+      "src": "SRC-0013",
+      "composition": "entity",
+      "terms": {
+        "object": "exec_command tool (UnifiedExec)",
+        "attributes": [
+          "name: 'exec_command'",
+          "required: [cmd]",
+          "properties.cmd: string",
+          "properties.workdir: string (defaults to turn cwd)",
+          "properties.shell: string (defaults to user's default shell)",
+          "properties.tty: boolean (default false → plain pipes; true → PTY)",
+          "properties.yield_time_ms: number",
+          "properties.max_output_tokens: number",
+          "properties.login: boolean (only when allow_login_shell; defaults to true)",
+          "approval parameters extended (see request-permissions-tool)",
+          "output_schema: unified_exec_output_schema {chunk_id, wall_time_seconds, exit_code, session_id, original_token_count, output; required: [wall_time_seconds, output]}",
+          "windows description includes windows_destructive_filesystem_guidance"
+        ],
+        "relationships": [
+          {"to": "SRC-0013/entity/write-stdin-tool", "rel": "shares unified_exec session", "card": "1:1"}
+        ],
+        "enumerations": null,
+        "data_flows": null,
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0013/entity/write-stdin-tool",
+      "src": "SRC-0013",
+      "composition": "entity",
+      "terms": {
+        "object": "write_stdin tool (UnifiedExec)",
+        "attributes": [
+          "name: 'write_stdin'",
+          "required: [session_id]",
+          "properties: session_id (number), chars (string — may be empty to poll), yield_time_ms (number), max_output_tokens (number)",
+          "output_schema: unified_exec_output_schema"
+        ],
+        "relationships": [
+          {"to": "SRC-0013/entity/exec-command-tool", "rel": "continues existing session", "card": "N:1"}
+        ],
+        "enumerations": null,
+        "data_flows": null,
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0013/entity/shell-tool",
+      "src": "SRC-0013",
+      "composition": "entity",
+      "terms": {
+        "object": "shell tool (Default backend)",
+        "attributes": [
+          "name: 'shell'",
+          "required: [command]",
+          "properties.command: array<string> (passed to execvp() on unix / CreateProcessW on Windows)",
+          "properties.workdir: string",
+          "properties.timeout_ms: number",
+          "approval parameters extended",
+          "description varies by OS (windows PowerShell examples vs bash -lc)"
+        ],
+        "relationships": null,
+        "enumerations": null,
+        "data_flows": null,
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0013/entity/shell-command-tool",
+      "src": "SRC-0013",
+      "composition": "entity",
+      "terms": {
+        "object": "shell_command tool (ZshFork / fallback backend)",
+        "attributes": [
+          "name: 'shell_command'",
+          "required: [command]",
+          "properties.command: string (shell script)",
+          "properties.workdir: string",
+          "properties.timeout_ms: number",
+          "properties.login: boolean (when allow_login_shell; defaults true)",
+          "approval parameters extended",
+          "description varies by OS"
+        ],
+        "relationships": null,
+        "enumerations": null,
+        "data_flows": null,
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0013/entity/request-permissions-tool",
+      "src": "SRC-0013",
+      "composition": "entity",
+      "terms": {
+        "object": "request_permissions tool + shared approval parameters",
+        "attributes": [
+          "name: 'request_permissions'",
+          "required: [permissions]",
+          "properties.reason: string (optional)",
+          "properties.permissions: permission_profile_schema {network: {enabled: boolean}, file_system: {read: array<string>, write: array<string>}}",
+          "shared approval parameters (created by create_approval_parameters): sandbox_permissions (string), justification (string — only if require_escalated), prefix_rule (array<string> — only when require_escalated), additional_permissions (profile — only when approvals enabled)",
+          "description: tools/request_permissions_tool_description constant string"
+        ],
+        "relationships": [
+          {"to": "SRC-0013/entity/exec-command-tool", "rel": "approval_parameters_shared_with", "card": "1:N"},
+          {"to": "SRC-0013/entity/shell-tool", "rel": "approval_parameters_shared_with", "card": "1:N"},
+          {"to": "SRC-0013/entity/shell-command-tool", "rel": "approval_parameters_shared_with", "card": "1:N"}
+        ],
+        "enumerations": {
+          "sandbox_permissions_values": ["use_default", "with_additional_permissions", "require_escalated"]
+        },
+        "data_flows": null,
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0013/entity/request-user-input-tool",
+      "src": "SRC-0013",
+      "composition": "entity",
+      "terms": {
+        "object": "request_user_input tool",
+        "attributes": [
+          "name: REQUEST_USER_INPUT_TOOL_NAME = 'request_user_input'",
+          "required: [questions]",
+          "questions: array<{id: string snake_case, header: string ≤12 chars, question: string single-sentence, options: array<{label: string 1-5 words, description: string one sentence}>} required fields [id, header, question, options]>",
+          "questions description: 'Questions to show the user. Prefer 1 and do not exceed 3'",
+          "options description: 'Provide 2-3 mutually exclusive choices. Put the recommended option first and suffix its label with \"(Recommended)\". Do not include an \"Other\" option; client adds free-form \"Other\" automatically.'",
+          "RequestUserInputArgs.questions[].is_other: bool (normalized to true)",
+          "description built by request_user_input_tool_description: 'Request user input … available in {allowed_modes}.'"
+        ],
+        "relationships": null,
+        "enumerations": null,
+        "data_flows": [
+          {"source": "RequestUserInputArgs (incoming args)", "transform": "normalize_request_user_input_args — reject when any question has empty options; set is_other=true for each question", "sink": "RequestUserInputArgs (normalized)"},
+          {"source": "ModeKind + default_mode_request_user_input flag", "transform": "request_user_input_is_available = mode.allows_request_user_input() OR (default_mode_request_user_input AND mode == Default); request_user_input_unavailable_message returns None when available else error message '{mode_name} mode'", "sink": "Option<String> availability message"},
+          {"source": "TUI_VISIBLE_COLLABORATION_MODES + default_mode_request_user_input", "transform": "format_allowed_modes — filter by availability, map to display_name; format 0/1/2/N as 'no modes' / '{m} mode' / '{a} or {b} mode' / 'modes: a,b,…'", "sink": "String allowed_modes listing"}
+        ],
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0013/entity/plan-tool",
+      "src": "SRC-0013",
+      "composition": "entity",
+      "terms": {
+        "object": "update_plan tool",
+        "attributes": [
+          "name: 'update_plan'",
+          "required: [plan]",
+          "properties.explanation: string (optional)",
+          "properties.plan: array<{step: string, status: string (required)}> required [step, status]",
+          "description: 'Updates the task plan. Provide an optional explanation and a list of plan items, each with a step and status. At most one step can be in_progress at a time.'"
+        ],
+        "relationships": null,
+        "enumerations": {
+          "plan_item_status": ["pending", "in_progress", "completed"]
+        },
+        "data_flows": null,
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0013/entity/view-image-tool",
+      "src": "SRC-0013",
+      "composition": "entity",
+      "terms": {
+        "object": "view_image tool",
+        "attributes": [
+          "name: VIEW_IMAGE_TOOL_NAME (from codex_protocol::models)",
+          "required: [path]",
+          "properties.path: string — local filesystem path",
+          "properties.detail: string (only when can_request_original_image_detail; only supported value 'original')",
+          "output_schema: {image_url: string, detail: string|null}"
+        ],
+        "relationships": [
+          {"to": "SRC-0013/entity/image-detail-policy", "rel": "gated_by", "card": "1:1"}
+        ],
+        "enumerations": {
+          "detail_supported_values": ["original"]
+        },
+        "data_flows": null,
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0013/entity/image-detail-policy",
+      "src": "SRC-0013",
+      "composition": "entity",
+      "terms": {
+        "object": "image detail policy",
+        "attributes": [
+          "can_request_original_image_detail(model_info): returns model_info.supports_image_detail_original",
+          "normalize_output_image_detail(model_info, Option<ImageDetail>): returns Some(Original) only when Original and allowed, else None",
+          "sanitize_original_image_detail(allowed, items): when !allowed, iterate FunctionCallOutputContentItem::InputImage and clear detail if it was Original"
+        ],
+        "relationships": [
+          {"to": "SRC-0013/entity/view-image-tool", "rel": "enables detail property", "card": "1:1"}
+        ],
+        "enumerations": {
+          "ImageDetail_original_variant": ["Original"]
+        },
+        "data_flows": [
+          {"source": "ModelInfo.supports_image_detail_original", "transform": "can_request_original_image_detail", "sink": "boolean gate for detail schema + output override"},
+          {"source": "FunctionCallOutputContentItem list with Some(ImageDetail::Original)", "transform": "sanitize_original_image_detail — set detail to None when not allowed", "sink": "items mutated in place"}
+        ],
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0013/entity/list-dir-tool",
+      "src": "SRC-0013",
+      "composition": "entity",
+      "terms": {
+        "object": "list_dir tool",
+        "attributes": [
+          "name: 'list_dir'",
+          "required: [dir_path]",
+          "properties.dir_path: string (absolute path)",
+          "properties.offset: number (entry number to start from; must be ≥1)",
+          "properties.limit: number (max entries)",
+          "properties.depth: number (max traversal depth; must be ≥1)",
+          "description: 'Lists entries in a local directory with 1-indexed entry numbers and simple type labels.'"
+        ],
+        "relationships": null,
+        "enumerations": null,
+        "data_flows": null,
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0013/entity/test-sync-tool",
+      "src": "SRC-0013",
+      "composition": "entity",
+      "terms": {
+        "object": "test_sync_tool",
+        "attributes": [
+          "name: 'test_sync_tool'",
+          "properties.sleep_before_ms: number",
+          "properties.sleep_after_ms: number",
+          "properties.barrier: object {id (required), participants (number, required), timeout_ms (number)}",
+          "description: 'Internal synchronization helper used by Codex integration tests.'"
+        ],
+        "relationships": null,
+        "enumerations": null,
+        "data_flows": null,
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0013/entity/mcp-resource-tools",
+      "src": "SRC-0013",
+      "composition": "entity",
+      "terms": {
+        "object": "MCP resource tools (list, list templates, read)",
+        "attributes": [
+          "list_mcp_resources.name: 'list_mcp_resources'",
+          "list_mcp_resources.properties: server (optional), cursor (optional)",
+          "list_mcp_resource_templates.name: 'list_mcp_resource_templates'",
+          "list_mcp_resource_templates.properties: server (optional), cursor (optional)",
+          "read_mcp_resource.name: 'read_mcp_resource'",
+          "read_mcp_resource.required: [server, uri]"
+        ],
+        "relationships": [
+          {"to": "SRC-0013/entity/mcp-call-result", "rel": "returns_mcp_payload", "card": "1:N"}
+        ],
+        "enumerations": null,
+        "data_flows": null,
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0013/entity/mcp-call-result",
+      "src": "SRC-0013",
+      "composition": "entity",
+      "terms": {
+        "object": "MCP CallToolResult output schema",
+        "attributes": [
+          "properties.content: array<object>",
+          "properties.structuredContent: passthrough from tool.output_schema (empty object when absent)",
+          "properties.isError: boolean",
+          "properties._meta: object",
+          "required: [content]"
+        ],
+        "relationships": [
+          {"to": "SRC-0013/entity/tool-definition", "rel": "attached_to MCP ToolDefinition.output_schema", "card": "1:1"}
+        ],
+        "enumerations": null,
+        "data_flows": [
+          {"source": "rmcp::model::Tool.output_schema (optional Map)", "transform": "mcp_call_tool_result_output_schema(structured_content_schema)", "sink": "JsonValue wrapping {content, structuredContent, isError, _meta}"}
+        ],
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0013/entity/tool-search-tool",
+      "src": "SRC-0013",
+      "composition": "entity",
+      "terms": {
+        "object": "tool_search tool",
+        "attributes": [
+          "name: TOOL_SEARCH_TOOL_NAME = 'tool_search'",
+          "required: [query]",
+          "properties.query: string",
+          "properties.limit: number (description embeds default_limit = TOOL_SEARCH_DEFAULT_LIMIT)",
+          "ToolSpec::ToolSearch {execution: 'client', description, parameters}",
+          "description enumerates MCP servers/connectors with format '- {name}: {description}' or '- {name}' (fallback 'None currently enabled.')"
+        ],
+        "relationships": [
+          {"to": "SRC-0013/entity/tool-search-source-info", "rel": "lists", "card": "1:N"},
+          {"to": "SRC-0013/entity/tool-search-output-tool", "rel": "results materialized as", "card": "1:N"}
+        ],
+        "enumerations": null,
+        "data_flows": [
+          {"source": "searchable_sources: &[ToolSearchSourceInfo]", "transform": "collect unique source_descriptions (first-description-wins), render bullet list", "sink": "description string embedded into ToolSpec::ToolSearch"},
+          {"source": "Iterator of ToolSearchSource { server_name, connector_name, connector_description }", "transform": "collect_tool_search_source_infos — prefer connector_name when non-empty, else server_name; drop empty", "sink": "Vec<ToolSearchSourceInfo>"}
+        ],
+        "config": {
+          "TOOL_SEARCH_DEFAULT_LIMIT": {"value": 8, "source": "const TOOL_SEARCH_DEFAULT_LIMIT: usize = 8;", "default": 8}
+        }
+      }
+    },
+    {
+      "id": "SRC-0013/entity/tool-search-source-info",
+      "src": "SRC-0013",
+      "composition": "entity",
+      "terms": {
+        "object": "ToolSearchSourceInfo / ToolSearchSource / ToolSearchResultSource",
+        "attributes": [
+          "ToolSearchSourceInfo.name: String",
+          "ToolSearchSourceInfo.description: Option<String>",
+          "ToolSearchSource { server_name, connector_name: Option<&str>, connector_description: Option<&str> }",
+          "ToolSearchResultSource { server_name, tool_namespace, tool_name, tool: &rmcp::model::Tool, connector_name: Option<&str>, connector_description: Option<&str> }"
+        ],
+        "relationships": [
+          {"to": "SRC-0013/entity/tool-search-tool", "rel": "source_of", "card": "N:1"},
+          {"to": "SRC-0013/entity/tool-search-output-tool", "rel": "grouped_into", "card": "N:1"}
+        ],
+        "enumerations": null,
+        "data_flows": null,
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0013/entity/tool-suggest-tool",
+      "src": "SRC-0013",
+      "composition": "entity",
+      "terms": {
+        "object": "tool_suggest tool",
+        "attributes": [
+          "name: TOOL_SUGGEST_TOOL_NAME = 'tool_suggest'",
+          "required: [tool_type, action_type, tool_id, suggest_reason]",
+          "properties.tool_type: string — 'connector' or 'plugin'",
+          "properties.action_type: string — 'install' or 'enable'",
+          "properties.tool_id: string — must be one of discoverable_tool_ids list",
+          "properties.suggest_reason: string"
+        ],
+        "relationships": [
+          {"to": "SRC-0013/entity/discoverable-tool", "rel": "references", "card": "1:N"},
+          {"to": "SRC-0013/entity/tool-suggest-entry", "rel": "lists", "card": "1:N"}
+        ],
+        "enumerations": {
+          "tool_type_values": ["connector", "plugin"],
+          "action_type_values": ["install", "enable"]
+        },
+        "data_flows": [
+          {"source": "Vec<DiscoverableTool>", "transform": "collect_tool_suggest_entries — map Connector/Plugin variants to ToolSuggestEntry with tool_type, has_skills/mcp_server_names/app_connector_ids (plugin-only or empty)", "sink": "Vec<ToolSuggestEntry>"},
+          {"source": "&[ToolSuggestEntry]", "transform": "format_discoverable_tools — sort by name then id; render '- {name} (id: `{id}`, type: {type}, action: install): {description}' with plugin summary fallback (skills, MCP servers, app connectors)", "sink": "description body"}
+        ],
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0013/entity/discoverable-tool",
+      "src": "SRC-0013",
+      "composition": "entity",
+      "terms": {
+        "object": "DiscoverableTool",
+        "attributes": [
+          "variant: enum {Connector(Box<AppInfo>), Plugin(Box<DiscoverablePluginInfo>)}",
+          "DiscoverablePluginInfo.id: String",
+          "DiscoverablePluginInfo.name: String",
+          "DiscoverablePluginInfo.description: Option<String>",
+          "DiscoverablePluginInfo.has_skills: bool",
+          "DiscoverablePluginInfo.mcp_server_names: Vec<String>",
+          "DiscoverablePluginInfo.app_connector_ids: Vec<String>",
+          "tool_type() → DiscoverableToolType (Connector | Plugin)",
+          "id()/name()/install_url() — install_url from connector only; Plugin always None"
+        ],
+        "relationships": [
+          {"to": "SRC-0013/entity/tool-suggest-entry", "rel": "projects_to", "card": "1:1"}
+        ],
+        "enumerations": {
+          "DiscoverableToolType": ["connector", "plugin"],
+          "DiscoverableToolAction": ["install", "enable"]
+        },
+        "data_flows": [
+          {"source": "Vec<DiscoverableTool> + Option<&str> app_server_client_name", "transform": "filter_tool_suggest_discoverable_tools_for_client — when client is TUI_CLIENT_NAME ('codex-tui'), drop Plugin variants; otherwise pass through", "sink": "Vec<DiscoverableTool>"}
+        ],
+        "config": {
+          "TUI_CLIENT_NAME": {"value": "codex-tui", "source": "const TUI_CLIENT_NAME: &str = \"codex-tui\";", "default": "codex-tui"}
+        }
+      }
+    },
+    {
+      "id": "SRC-0013/entity/tool-suggest-entry",
+      "src": "SRC-0013",
+      "composition": "entity",
+      "terms": {
+        "object": "ToolSuggestEntry / ToolSuggestArgs / ToolSuggestResult / ToolSuggestMeta",
+        "attributes": [
+          "ToolSuggestEntry: {id, name, description, tool_type, has_skills, mcp_server_names, app_connector_ids}",
+          "ToolSuggestArgs: {tool_type, action_type, tool_id, suggest_reason}",
+          "ToolSuggestResult: {completed, user_confirmed, tool_type, action_type, tool_id, tool_name, suggest_reason}",
+          "ToolSuggestMeta<'a>: {codex_approval_kind: 'tool_suggestion', tool_type, suggest_type: DiscoverableToolAction, suggest_reason, tool_id, tool_name, install_url: Option}"
+        ],
+        "relationships": [
+          {"to": "SRC-0013/entity/tool-suggest-tool", "rel": "args/result for", "card": "N:1"},
+          {"to": "SRC-0013/entity/discoverable-tool", "rel": "derived_from", "card": "N:1"}
+        ],
+        "enumerations": null,
+        "data_flows": [
+          {"source": "ToolSuggestArgs + DiscoverableTool + server_name/thread_id/turn_id/suggest_reason", "transform": "build_tool_suggestion_elicitation_request — build ToolSuggestMeta via build_tool_suggestion_meta, wrap in McpServerElicitationRequest::Form with empty requested_schema (Object, no properties)", "sink": "McpServerElicitationRequestParams"},
+          {"source": "expected_connector_ids + accessible_connectors", "transform": "all_suggested_connectors_picked_up / verified_connector_suggestion_completed — connector.id matches AND connector.is_accessible", "sink": "bool completion indicator"}
+        ],
+        "config": {
+          "TOOL_SUGGEST_APPROVAL_KIND_VALUE": {"value": "tool_suggestion", "source": "pub const TOOL_SUGGEST_APPROVAL_KIND_VALUE: &str = \"tool_suggestion\";", "default": "tool_suggestion"}
+        }
+      }
+    },
+    {
+      "id": "SRC-0013/entity/web-search-tool",
+      "src": "SRC-0013",
+      "composition": "entity",
+      "terms": {
+        "object": "web_search tool",
+        "attributes": [
+          "ToolSpec::WebSearch {external_web_access: Option<bool>, filters: Option<ResponsesApiWebSearchFilters>, user_location: Option<ResponsesApiWebSearchUserLocation>, search_context_size: Option<WebSearchContextSize>, search_content_types: Option<Vec<String>>}",
+          "ResponsesApiWebSearchFilters.allowed_domains: Option<Vec<String>>",
+          "ResponsesApiWebSearchUserLocation.{type, country, region, city, timezone}"
+        ],
+        "relationships": null,
+        "enumerations": {
+          "WebSearchMode_to_external_web_access": ["Cached→false", "Live→true", "Disabled/None→tool not created"],
+          "search_content_types_for_TextAndImage": ["text", "image"]
+        },
+        "data_flows": [
+          {"source": "WebSearchToolOptions {web_search_mode, web_search_config, web_search_tool_type}", "transform": "create_web_search_tool — map mode to external_web_access (None when Disabled/None → returns None); map WebSearchToolType::TextAndImage → ['text','image'], Text → None; copy filters/user_location/search_context_size from web_search_config", "sink": "Option<ToolSpec::WebSearch>"}
+        ],
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0013/entity/image-generation-tool",
+      "src": "SRC-0013",
+      "composition": "entity",
+      "terms": {
+        "object": "image_generation tool",
+        "attributes": [
+          "ToolSpec::ImageGeneration { output_format: String }",
+          "factory create_image_generation_tool(output_format: &str)"
+        ],
+        "relationships": null,
+        "enumerations": null,
+        "data_flows": null,
+        "config": {
+          "default_output_format_used_in_registry": {"value": "png", "source": "build_tool_registry_plan call: create_image_generation_tool(\"png\")", "default": "png"}
+        }
+      }
+    },
+    {
+      "id": "SRC-0013/entity/local-shell-tool",
+      "src": "SRC-0013",
+      "composition": "entity",
+      "terms": {
+        "object": "local_shell tool",
+        "attributes": [
+          "ToolSpec::LocalShell {}",
+          "factory create_local_shell_tool()",
+          "name() → 'local_shell'"
+        ],
+        "relationships": null,
+        "enumerations": null,
+        "data_flows": null,
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0013/entity/windows-destructive-guidance",
+      "src": "SRC-0013",
+      "composition": "entity",
+      "terms": {
+        "object": "Windows destructive filesystem guidance",
+        "attributes": [
+          "text appended to exec_command and shell tool descriptions on Windows",
+          "rule 1: do not compose destructive filesystem commands across shells; use one shell end-to-end, prefer native PowerShell cmdlets Remove-Item / Move-Item with -LiteralPath",
+          "rule 2: before any recursive delete or move on Windows, verify resolved absolute target paths stay within the intended workspace or explicitly named target directory"
+        ],
+        "relationships": [
+          {"to": "SRC-0013/entity/exec-command-tool", "rel": "injected_into windows description", "card": "1:1"},
+          {"to": "SRC-0013/entity/shell-tool", "rel": "injected_into windows description", "card": "1:1"},
+          {"to": "SRC-0013/entity/shell-command-tool", "rel": "injected_into windows description", "card": "1:1"}
+        ],
+        "enumerations": null,
+        "data_flows": null,
+        "config": null
+      }
+    }
+  ]
+}

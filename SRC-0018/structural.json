@@ -1,0 +1,1365 @@
+{
+  "src": "SRC-0018",
+  "schema_version": "2.0",
+  "lens": "structural",
+  "compositions": [
+    {
+      "id": "SRC-0018/entity/apply-patch-request",
+      "src": "SRC-0018",
+      "composition": "entity",
+      "terms": {
+        "object": "ApplyPatchRequest — запрос на применение verified-патча к файловой системе",
+        "attributes": [
+          "action: ApplyPatchAction (содержит patch, cwd)",
+          "file_paths: Vec<AbsolutePathBuf> (абсолютные пути затронутых файлов)",
+          "changes: HashMap<PathBuf, FileChange> (карта пути → изменение)",
+          "exec_approval_requirement: ExecApprovalRequirement (требование апрува)",
+          "additional_permissions: Option<PermissionProfile> (профиль дополнительных разрешений)",
+          "permissions_preapproved: bool (флаг — разрешения уже апрувнуты выше по стеку)"
+        ],
+        "relationships": [
+          {"to": "SRC-0018/entity/apply-patch-runtime", "rel": "input_of", "card": "1:1"},
+          {"to": "codex_apply_patch::ApplyPatchAction", "rel": "contains", "card": "1:1"}
+        ],
+        "enumerations": null,
+        "data_flows": [
+          {"source": "model tool call", "transform": "verified upstream by apply_patch assess_patch_safety", "sink": "ApplyPatchRequest"}
+        ],
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0018/entity/apply-patch-runtime",
+      "src": "SRC-0018",
+      "composition": "entity",
+      "terms": {
+        "object": "ApplyPatchRuntime — runtime применения patch-ей под оркестратором с sandbox + approval",
+        "attributes": [
+          "sandbox_preference: SandboxablePreference::Auto (фикс)",
+          "escalate_on_failure: true (при sandbox-denied делать эскалацию)",
+          "approval_key_type: AbsolutePathBuf (ключ кеша апрувов = путь файла)"
+        ],
+        "relationships": [
+          {"to": "SRC-0018/entity/apply-patch-request", "rel": "consumes", "card": "1:1"},
+          {"to": "SRC-0018/entity/exec-tool-call-output", "rel": "produces", "card": "1:1"},
+          {"to": "SRC-0018/entity/file-system-sandbox-context", "rel": "builds_per_attempt", "card": "1:1"},
+          {"to": "guardian", "rel": "delegates_approval_to", "card": "1:1"}
+        ],
+        "enumerations": null,
+        "data_flows": [
+          {"source": "ApplyPatchRequest", "transform": "guardian/patch approval → sandbox context for attempt → codex_apply_patch::apply_patch → emit stdout/stderr deltas", "sink": "ExecToolCallOutput"},
+          {"source": "stdout bytes", "transform": "emit_output_delta", "sink": "ExecCommandOutputDeltaEvent (Stdout)"},
+          {"source": "stderr bytes", "transform": "emit_output_delta", "sink": "ExecCommandOutputDeltaEvent (Stderr)"}
+        ],
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0018/entity/file-system-sandbox-context",
+      "src": "SRC-0018",
+      "composition": "entity",
+      "terms": {
+        "object": "FileSystemSandboxContext — контекст sandbox-полиси для файловой системы в текущей попытке",
+        "attributes": [
+          "sandbox_policy: policy текущей попытки",
+          "windows_sandbox_level: уровень Windows sandbox",
+          "windows_sandbox_private_desktop: флаг приватного рабочего стола Windows",
+          "use_legacy_landlock: флаг legacy landlock",
+          "additional_permissions: Option<PermissionProfile>"
+        ],
+        "relationships": [
+          {"to": "SRC-0018/entity/apply-patch-runtime", "rel": "built_by", "card": "N:1"}
+        ],
+        "enumerations": null,
+        "data_flows": [
+          {"source": "SandboxAttempt + ApplyPatchRequest.additional_permissions", "transform": "file_system_sandbox_context_for_attempt (None если SandboxType::None)", "sink": "codex_apply_patch::apply_patch"}
+        ],
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0018/entity/shell-request",
+      "src": "SRC-0018",
+      "composition": "entity",
+      "terms": {
+        "object": "ShellRequest — запрос на выполнение команды в shell под оркестратором",
+        "attributes": [
+          "command: Vec<String> (argv команды)",
+          "cwd: AbsolutePathBuf",
+          "timeout_ms: Option<u64>",
+          "env: HashMap<String, String> (полное окружение)",
+          "explicit_env_overrides: HashMap<String, String> (policy-driven overrides)",
+          "network: Option<NetworkProxy>",
+          "sandbox_permissions: SandboxPermissions",
+          "additional_permissions: Option<PermissionProfile>",
+          "additional_permissions_preapproved: bool (unix-only)",
+          "justification: Option<String>",
+          "exec_approval_requirement: ExecApprovalRequirement"
+        ],
+        "relationships": [
+          {"to": "SRC-0018/entity/shell-runtime", "rel": "input_of", "card": "1:1"},
+          {"to": "SRC-0018/entity/approval-key", "rel": "projected_to", "card": "1:1"}
+        ],
+        "enumerations": null,
+        "data_flows": [
+          {"source": "model tool call (shell или shell_command)", "transform": "tool router → canonicalize_command_for_approval для approval_key", "sink": "ShellRuntime.run"}
+        ],
+        "config": {
+          "timeout_ms": {"value": null, "source": "request field; fallback DEFAULT_EXEC_COMMAND_TIMEOUT_MS", "default": "crate::exec::DEFAULT_EXEC_COMMAND_TIMEOUT_MS"}
+        }
+      }
+    },
+    {
+      "id": "SRC-0018/entity/shell-runtime",
+      "src": "SRC-0018",
+      "composition": "entity",
+      "terms": {
+        "object": "ShellRuntime — runtime для shell-команд с выбором backend (Generic / ShellCommandClassic / ShellCommandZshFork)",
+        "attributes": [
+          "backend: ShellRuntimeBackend (default Generic)",
+          "sandbox_preference: SandboxablePreference::Auto",
+          "escalate_on_failure: true",
+          "network_approval_mode: Immediate (при наличии network)"
+        ],
+        "relationships": [
+          {"to": "SRC-0018/entity/shell-request", "rel": "consumes", "card": "1:1"},
+          {"to": "SRC-0018/entity/exec-tool-call-output", "rel": "produces", "card": "1:1"},
+          {"to": "SRC-0018/entity/shell-runtime-backend", "rel": "selects_via", "card": "N:1"},
+          {"to": "SRC-0018/entity/zsh-fork-backend-adapter", "rel": "delegates_to", "card": "1:1"},
+          {"to": "guardian", "rel": "delegates_approval_to", "card": "1:1"}
+        ],
+        "enumerations": null,
+        "data_flows": [
+          {"source": "ShellRequest.command", "transform": "maybe_wrap_shell_lc_with_snapshot → powershell prefix (если PowerShell) → zsh-fork backend (если включён и conditions met) → build_sandbox_command → attempt.env_for → execute_env", "sink": "ExecToolCallOutput"}
+        ],
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0018/entity/shell-runtime-backend",
+      "src": "SRC-0018",
+      "composition": "entity",
+      "terms": {
+        "object": "ShellRuntimeBackend — селектор backend для ShellRuntime",
+        "attributes": [
+          "variant: Generic | ShellCommandClassic | ShellCommandZshFork",
+          "default: Generic"
+        ],
+        "relationships": [
+          {"to": "SRC-0018/entity/shell-runtime", "rel": "selected_by", "card": "N:1"}
+        ],
+        "enumerations": {
+          "backend": [
+            "Generic — tool-agnostic/default runtime path",
+            "ShellCommandClassic — legacy backend для shell_command без zsh-fork adapter",
+            "ShellCommandZshFork — zsh-fork + codex-shell-escalation adapter на Unix с fallback на стандарт"
+          ]
+        },
+        "data_flows": null,
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0018/entity/approval-key",
+      "src": "SRC-0018",
+      "composition": "entity",
+      "terms": {
+        "object": "ApprovalKey — ключ кеша апрувов для shell-команды",
+        "attributes": [
+          "command: Vec<String> (канонизированная)",
+          "cwd: AbsolutePathBuf",
+          "sandbox_permissions: SandboxPermissions",
+          "additional_permissions: Option<PermissionProfile>"
+        ],
+        "relationships": [
+          {"to": "SRC-0018/entity/shell-request", "rel": "derived_from", "card": "1:1"}
+        ],
+        "enumerations": null,
+        "data_flows": [
+          {"source": "ShellRequest.command", "transform": "canonicalize_command_for_approval", "sink": "ApprovalKey.command"}
+        ],
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0018/entity/unified-exec-request",
+      "src": "SRC-0018",
+      "composition": "entity",
+      "terms": {
+        "object": "UnifiedExecRequest — запрос unified-exec runtime после resolved approvals + sandbox",
+        "attributes": [
+          "command: Vec<String>",
+          "process_id: i32 (идентификатор PTY-сессии)",
+          "cwd: AbsolutePathBuf",
+          "env: HashMap<String, String>",
+          "exec_server_env_config: Option<ExecServerEnvConfig>",
+          "explicit_env_overrides: HashMap<String, String>",
+          "network: Option<NetworkProxy>",
+          "tty: bool",
+          "sandbox_permissions: SandboxPermissions",
+          "additional_permissions: Option<PermissionProfile>",
+          "additional_permissions_preapproved: bool (unix-only)",
+          "justification: Option<String>",
+          "exec_approval_requirement: ExecApprovalRequirement"
+        ],
+        "relationships": [
+          {"to": "SRC-0018/entity/unified-exec-runtime", "rel": "input_of", "card": "1:1"},
+          {"to": "SRC-0018/entity/unified-exec-approval-key", "rel": "projected_to", "card": "1:1"}
+        ],
+        "enumerations": null,
+        "data_flows": [
+          {"source": "model tool call (exec_command / unified_exec)", "transform": "turn orchestrator → approval/sandbox resolve", "sink": "UnifiedExecRuntime.run"}
+        ],
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0018/entity/unified-exec-approval-key",
+      "src": "SRC-0018",
+      "composition": "entity",
+      "terms": {
+        "object": "UnifiedExecApprovalKey — кеш-ключ апрувов эквивалентных unified-exec launch",
+        "attributes": [
+          "command: Vec<String> (канонизированная)",
+          "cwd: AbsolutePathBuf",
+          "tty: bool",
+          "sandbox_permissions: SandboxPermissions",
+          "additional_permissions: Option<PermissionProfile>"
+        ],
+        "relationships": [
+          {"to": "SRC-0018/entity/unified-exec-request", "rel": "derived_from", "card": "1:1"}
+        ],
+        "enumerations": null,
+        "data_flows": null,
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0018/entity/unified-exec-runtime",
+      "src": "SRC-0018",
+      "composition": "entity",
+      "terms": {
+        "object": "UnifiedExecRuntime — runtime для unified-exec, держит approval/sandbox policy, делегирует старт процесса менеджеру",
+        "attributes": [
+          "manager: &UnifiedExecProcessManager (shared PTY менеджер)",
+          "shell_mode: UnifiedExecShellMode (Auto / ZshFork(config))",
+          "sandbox_preference: SandboxablePreference::Auto",
+          "escalate_on_failure: true",
+          "network_approval_mode: Deferred"
+        ],
+        "relationships": [
+          {"to": "SRC-0018/entity/unified-exec-request", "rel": "consumes", "card": "1:1"},
+          {"to": "UnifiedExecProcess", "rel": "produces", "card": "1:1"},
+          {"to": "SRC-0018/entity/zsh-fork-backend-adapter", "rel": "prepares_via", "card": "1:1"},
+          {"to": "UnifiedExecProcessManager", "rel": "delegates_spawn_to", "card": "1:1"}
+        ],
+        "enumerations": null,
+        "data_flows": [
+          {"source": "UnifiedExecRequest.command", "transform": "если remote env — без wrap; иначе maybe_wrap_shell_lc_with_snapshot → powershell prefix → при ZshFork mode: build_sandbox_command + attempt.env_for + maybe_prepare_unified_exec → manager.open_session_with_exec_env", "sink": "UnifiedExecProcess"}
+        ],
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0018/entity/unified-exec-shell-mode",
+      "src": "SRC-0018",
+      "composition": "entity",
+      "terms": {
+        "object": "UnifiedExecShellMode — режим shell для unified-exec",
+        "attributes": [
+          "variant: Auto | ZshFork(ZshForkConfig)"
+        ],
+        "relationships": [
+          {"to": "SRC-0018/entity/unified-exec-runtime", "rel": "selects", "card": "1:N"}
+        ],
+        "enumerations": {
+          "mode": [
+            "Auto — прямой запуск через UnifiedExecProcessManager",
+            "ZshFork(ZshForkConfig) — попытка подготовки через zsh-fork escalation с fallback на direct execution"
+          ]
+        },
+        "data_flows": null,
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0018/entity/prepared-unified-exec-zsh-fork",
+      "src": "SRC-0018",
+      "composition": "entity",
+      "terms": {
+        "object": "PreparedUnifiedExecZshFork — результат подготовки unified-exec через zsh-fork",
+        "attributes": [
+          "exec_request: ExecRequest (модифицированный, с env от escalation_session)",
+          "escalation_session: EscalationSession"
+        ],
+        "relationships": [
+          {"to": "SRC-0018/entity/zsh-fork-backend-adapter", "rel": "output_of", "card": "1:1"}
+        ],
+        "enumerations": null,
+        "data_flows": [
+          {"source": "ExecRequest", "transform": "escalate_server.start_session + extend env из EscalationSession.env()", "sink": "PreparedUnifiedExecZshFork"}
+        ],
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0018/entity/prepared-unified-exec-spawn",
+      "src": "SRC-0018",
+      "composition": "entity",
+      "terms": {
+        "object": "PreparedUnifiedExecSpawn — пакет для unified-exec через zsh-fork backend, содержит exec_request и spawn_lifecycle",
+        "attributes": [
+          "exec_request: ExecRequest (преобразованный)",
+          "spawn_lifecycle: SpawnLifecycleHandle (lifecycle с after_spawn cleanup)"
+        ],
+        "relationships": [
+          {"to": "SRC-0018/entity/zsh-fork-spawn-lifecycle", "rel": "wraps", "card": "1:1"}
+        ],
+        "enumerations": null,
+        "data_flows": null,
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0018/entity/zsh-fork-backend-adapter",
+      "src": "SRC-0018",
+      "composition": "entity",
+      "terms": {
+        "object": "ZshFork Backend Adapter — mod zsh_fork_backend, условно запускает/готовит unified-exec через zsh-fork shell-escalation",
+        "attributes": [
+          "platform_split: unix имеет реальную реализацию, non-unix возвращает Ok(None)",
+          "feature_gate: Feature::ShellZshFork",
+          "shell_type_gate: ShellType::Zsh",
+          "service_gate: session.services.shell_zsh_path настроен",
+          "wrapper_gate: session.services.main_execve_wrapper_exe настроен"
+        ],
+        "relationships": [
+          {"to": "SRC-0018/entity/shell-runtime", "rel": "invoked_by", "card": "N:1"},
+          {"to": "SRC-0018/entity/unified-exec-runtime", "rel": "invoked_by", "card": "N:1"},
+          {"to": "SRC-0018/entity/core-shell-action-provider", "rel": "provides", "card": "1:1"},
+          {"to": "SRC-0018/entity/core-shell-command-executor", "rel": "provides", "card": "1:1"}
+        ],
+        "enumerations": null,
+        "data_flows": [
+          {"source": "ShellRequest + SandboxAttempt", "transform": "try_run_zsh_fork: gate-check → build sandbox_exec_request → extract_shell_script → EscalateServer.exec → map_exec_result", "sink": "ExecToolCallOutput"},
+          {"source": "UnifiedExecRequest + ExecRequest", "transform": "prepare_unified_exec_zsh_fork: extract_shell_script → EscalateServer.start_session → extend env", "sink": "PreparedUnifiedExecZshFork"}
+        ],
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0018/entity/zsh-fork-spawn-lifecycle",
+      "src": "SRC-0018",
+      "composition": "entity",
+      "terms": {
+        "object": "ZshForkSpawnLifecycle — lifecycle для zsh-fork spawn PTY, владеет EscalationSession и чистит client-сокет после spawn (unix-only)",
+        "attributes": [
+          "escalation_session: EscalationSession",
+          "inherited_fds: читает CODEX_ESCALATE_SOCKET env → fd номер → inherit",
+          "after_spawn_action: escalation_session.close_client_socket()"
+        ],
+        "relationships": [
+          {"to": "SpawnLifecycle (trait)", "rel": "implements", "card": "N:1"},
+          {"to": "SRC-0018/entity/prepared-unified-exec-spawn", "rel": "contained_in", "card": "1:1"}
+        ],
+        "enumerations": null,
+        "data_flows": null,
+        "config": {
+          "escalate_socket_env_var": {"value": "CODEX_ESCALATE_SOCKET", "source": "codex_shell_escalation::ESCALATE_SOCKET_ENV_VAR", "default": null}
+        }
+      }
+    },
+    {
+      "id": "SRC-0018/entity/core-shell-action-provider",
+      "src": "SRC-0018",
+      "composition": "entity",
+      "terms": {
+        "object": "CoreShellActionProvider — реализация EscalationPolicy: определяет допустимое действие для перехваченного execve по policy + sandbox_permissions",
+        "attributes": [
+          "policy: Arc<RwLock<Policy>> (execpolicy текущей сессии)",
+          "session: Arc<Session>",
+          "turn: Arc<TurnContext>",
+          "call_id: String",
+          "tool_name: GuardianCommandSource (Shell | UnifiedExec)",
+          "approval_policy: AskForApproval",
+          "sandbox_policy: SandboxPolicy",
+          "file_system_sandbox_policy: FileSystemSandboxPolicy",
+          "network_sandbox_policy: NetworkSandboxPolicy",
+          "sandbox_permissions: SandboxPermissions",
+          "approval_sandbox_permissions: SandboxPermissions (нормализованные для approval)",
+          "prompt_permissions: Option<PermissionProfile>",
+          "stopwatch: Stopwatch"
+        ],
+        "relationships": [
+          {"to": "EscalationPolicy (trait)", "rel": "implements", "card": "N:1"},
+          {"to": "SRC-0018/entity/core-shell-command-executor", "rel": "paired_with", "card": "1:1"},
+          {"to": "guardian", "rel": "delegates_approval_to", "card": "1:1"}
+        ],
+        "enumerations": null,
+        "data_flows": [
+          {"source": "intercepted execve (program, argv, workdir)", "transform": "evaluate_intercepted_exec_policy → decision_driven_by_policy → decision_source (PrefixRule|UnmatchedCommandFallback) → process_decision: Forbidden/Prompt(guardian or session approval)/Allow", "sink": "EscalationDecision (run|escalate|deny)"}
+        ],
+        "config": {
+          "enable_shell_wrapper_parsing": {"value": false, "source": "ENABLE_INTERCEPTED_EXEC_POLICY_SHELL_WRAPPER_PARSING const", "default": false}
+        }
+      }
+    },
+    {
+      "id": "SRC-0018/entity/core-shell-command-executor",
+      "src": "SRC-0018",
+      "composition": "entity",
+      "terms": {
+        "object": "CoreShellCommandExecutor — реализация ShellCommandExecutor: запускает пришедшую команду и готовит escalated exec",
+        "attributes": [
+          "command: Vec<String>",
+          "cwd: AbsolutePathBuf",
+          "sandbox_policy: SandboxPolicy",
+          "file_system_sandbox_policy: FileSystemSandboxPolicy",
+          "network_sandbox_policy: NetworkSandboxPolicy",
+          "sandbox: SandboxType",
+          "env: HashMap<String, String>",
+          "network: Option<NetworkProxy>",
+          "windows_sandbox_level: WindowsSandboxLevel",
+          "arg0: Option<String>",
+          "sandbox_policy_cwd: AbsolutePathBuf",
+          "codex_linux_sandbox_exe: Option<PathBuf>",
+          "use_legacy_landlock: bool",
+          "inherited_env_vars_from_overlay: ['CODEX_ESCALATE_SOCKET','EXEC_WRAPPER']"
+        ],
+        "relationships": [
+          {"to": "ShellCommandExecutor (trait)", "rel": "implements", "card": "N:1"}
+        ],
+        "enumerations": null,
+        "data_flows": [
+          {"source": "escalation env_overlay (CODEX_ESCALATE_SOCKET, EXEC_WRAPPER)", "transform": "merge в self.env → build ExecRequest → execute_exec_request_with_after_spawn", "sink": "ExecResult (exit_code, stdout, stderr, output, duration, timed_out)"},
+          {"source": "EscalationExecution (Unsandboxed / TurnDefault / Permissions(profile|full))", "transform": "prepare_escalated_exec → prepare_sandboxed_exec (SandboxManager.transform) или Unsandboxed branch", "sink": "PreparedExec"}
+        ],
+        "config": {
+          "inherited_env_keys": {"value": ["CODEX_ESCALATE_SOCKET", "EXEC_WRAPPER"], "source": "hardcoded в run()", "default": null}
+        }
+      }
+    },
+    {
+      "id": "SRC-0018/entity/decision-source",
+      "src": "SRC-0018",
+      "composition": "entity",
+      "terms": {
+        "object": "DecisionSource — источник policy-решения для intercepted execve",
+        "attributes": ["variant: PrefixRule | UnmatchedCommandFallback"],
+        "relationships": [
+          {"to": "SRC-0018/entity/core-shell-action-provider", "rel": "used_by", "card": "N:1"}
+        ],
+        "enumerations": {
+          "source": [
+            "PrefixRule — решение определено rule в execpolicy (*.rules)",
+            "UnmatchedCommandFallback — решение из fallback-функции для неподходящих команд"
+          ]
+        },
+        "data_flows": null,
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0018/entity/prompt-decision",
+      "src": "SRC-0018",
+      "composition": "entity",
+      "terms": {
+        "object": "PromptDecision — результат запроса апрува у пользователя для intercepted execve",
+        "attributes": [
+          "decision: ReviewDecision",
+          "guardian_review_id: Option<String> (present если апрув шёл через guardian)"
+        ],
+        "relationships": [
+          {"to": "SRC-0018/entity/core-shell-action-provider", "rel": "returned_by", "card": "N:1"}
+        ],
+        "enumerations": null,
+        "data_flows": null,
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0018/entity/parsed-shell-command",
+      "src": "SRC-0018",
+      "composition": "entity",
+      "terms": {
+        "object": "ParsedShellCommand — распарсенная тройка shell (program, script, login)",
+        "attributes": [
+          "program: String (путь shell-интерпретатора)",
+          "script: String (тело скрипта после -c / -lc)",
+          "login: bool (true если флаг -lc)"
+        ],
+        "relationships": [
+          {"to": "SRC-0018/entity/zsh-fork-backend-adapter", "rel": "consumed_by", "card": "N:1"}
+        ],
+        "enumerations": null,
+        "data_flows": [
+          {"source": "command: &[String]", "transform": "extract_shell_script — поиск первой тройки (program, -c|-lc, script) в argv", "sink": "ParsedShellCommand"}
+        ],
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0018/entity/exec-tool-call-output",
+      "src": "SRC-0018",
+      "composition": "entity",
+      "terms": {
+        "object": "ExecToolCallOutput — унифицированный результат tool-исполнения (shell/apply_patch/zsh-fork)",
+        "attributes": [
+          "exit_code: i32",
+          "stdout: StreamOutput",
+          "stderr: StreamOutput",
+          "aggregated_output: StreamOutput",
+          "duration: Duration",
+          "timed_out: bool"
+        ],
+        "relationships": [
+          {"to": "SRC-0018/entity/apply-patch-runtime", "rel": "produced_by", "card": "N:1"},
+          {"to": "SRC-0018/entity/shell-runtime", "rel": "produced_by", "card": "N:1"},
+          {"to": "SRC-0018/entity/zsh-fork-backend-adapter", "rel": "produced_by", "card": "N:1"}
+        ],
+        "enumerations": null,
+        "data_flows": null,
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0018/entity/sandbox-command-builder",
+      "src": "SRC-0018",
+      "composition": "entity",
+      "terms": {
+        "object": "build_sandbox_command — конструктор SandboxCommand из argv + cwd + env + additional_permissions",
+        "attributes": [
+          "validates: command не пустой (иначе ToolError::Rejected 'command args are empty')",
+          "splits_first: program + args"
+        ],
+        "relationships": [
+          {"to": "SandboxCommand", "rel": "produces", "card": "1:1"},
+          {"to": "SRC-0018/entity/shell-runtime", "rel": "used_by", "card": "N:1"},
+          {"to": "SRC-0018/entity/unified-exec-runtime", "rel": "used_by", "card": "N:1"},
+          {"to": "SRC-0018/entity/zsh-fork-backend-adapter", "rel": "used_by", "card": "N:1"}
+        ],
+        "enumerations": null,
+        "data_flows": null,
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0018/entity/shell-lc-snapshot-wrapper",
+      "src": "SRC-0018",
+      "composition": "entity",
+      "terms": {
+        "object": "maybe_wrap_shell_lc_with_snapshot — POSIX-wrapper, переписывает argv shell -lc в shell -c с сорсингом snapshot перед exec",
+        "attributes": [
+          "platform_gate: no-op на Windows",
+          "snapshot_gate: требует session_shell.shell_snapshot() и что snapshot.path существует",
+          "cwd_gate: snapshot.cwd должен совпадать (after normalization) с command cwd",
+          "argv_gate: длина ≥ 3 и command[1] == '-lc'",
+          "transform_form: 'user_shell -c \". SNAPSHOT (best effort); exec shell -c <script>\"'",
+          "override_handling: explicit_env_overrides + CODEX_THREAD_ID → __CODEX_SNAPSHOT_OVERRIDE_SET_N/__CODEX_SNAPSHOT_OVERRIDE_N capture+restore",
+          "shell_variable_name_validation: первый символ _ или ASCII letter, остальные _ или alphanum",
+          "shell_single_quote: экранирует '",
+          "no_op_fallback: при любом gate-miss возвращает command без изменений"
+        ],
+        "relationships": [
+          {"to": "SRC-0018/entity/shell-runtime", "rel": "used_by", "card": "N:1"},
+          {"to": "SRC-0018/entity/unified-exec-runtime", "rel": "used_by", "card": "N:1"}
+        ],
+        "enumerations": null,
+        "data_flows": [
+          {"source": "command argv[0..3+]", "transform": "build_override_exports (capture+restore для sorted keys) → format wrapper script → вернуть [shell_path, '-c', rewritten_script]", "sink": "wrapped argv"},
+          {"source": "CODEX_THREAD_ID из env", "transform": "merge в override_env", "sink": "override_exports"}
+        ],
+        "config": {
+          "thread_id_env_var": {"value": "CODEX_THREAD_ID", "source": "crate::exec_env::CODEX_THREAD_ID_ENV_VAR", "default": null}
+        }
+      }
+    },
+    {
+      "id": "SRC-0018/entity/code-mode-exec-context",
+      "src": "SRC-0018",
+      "composition": "entity",
+      "terms": {
+        "object": "ExecContext (code_mode) — контекст execution code-mode турна (session + turn)",
+        "attributes": [
+          "session: Arc<Session>",
+          "turn: Arc<TurnContext>"
+        ],
+        "relationships": [
+          {"to": "SRC-0018/entity/code-mode-execute-handler", "rel": "used_by", "card": "1:1"},
+          {"to": "SRC-0018/entity/code-mode-wait-handler", "rel": "used_by", "card": "1:1"},
+          {"to": "SRC-0018/entity/code-mode-service", "rel": "bound_to", "card": "1:1"}
+        ],
+        "enumerations": null,
+        "data_flows": null,
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0018/entity/code-mode-service",
+      "src": "SRC-0018",
+      "composition": "entity",
+      "terms": {
+        "object": "CodeModeService — обёртка над codex_code_mode::CodeModeService для ядра",
+        "attributes": [
+          "inner: codex_code_mode::CodeModeService",
+          "feature_gate_for_worker: Feature::CodeMode (start_turn_worker возвращает None если не включено)"
+        ],
+        "relationships": [
+          {"to": "codex_code_mode::CodeModeService", "rel": "wraps", "card": "1:1"},
+          {"to": "SRC-0018/entity/core-turn-host", "rel": "spawns_via", "card": "1:1"},
+          {"to": "SRC-0018/entity/code-mode-execute-handler", "rel": "invoked_by", "card": "1:1"},
+          {"to": "SRC-0018/entity/code-mode-wait-handler", "rel": "invoked_by", "card": "1:1"}
+        ],
+        "enumerations": null,
+        "data_flows": [
+          {"source": "ExecuteRequest (tool_call_id, enabled_tools, source, stored_values, yield_time_ms, max_output_tokens)", "transform": "inner.execute", "sink": "RuntimeResponse"},
+          {"source": "WaitRequest (cell_id, yield_time_ms, terminate)", "transform": "inner.wait", "sink": "RuntimeResponse"},
+          {"source": "replace_stored_values(values)", "transform": "inner.replace_stored_values", "sink": "stored state"}
+        ],
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0018/entity/core-turn-host",
+      "src": "SRC-0018",
+      "composition": "entity",
+      "terms": {
+        "object": "CoreTurnHost — реализация CodeModeTurnHost для вызова nested tools и notify из runtime",
+        "attributes": [
+          "exec: ExecContext",
+          "tool_runtime: ToolCallRuntime"
+        ],
+        "relationships": [
+          {"to": "CodeModeTurnHost (trait)", "rel": "implements", "card": "N:1"},
+          {"to": "SRC-0018/entity/nested-tool-dispatcher", "rel": "uses", "card": "1:1"}
+        ],
+        "enumerations": null,
+        "data_flows": [
+          {"source": "invoke_tool(tool_name, input, cancellation_token)", "transform": "call_nested_tool", "sink": "JsonValue (or error string)"},
+          {"source": "notify(call_id, cell_id, text)", "transform": "если text.trim().is_empty → Ok; иначе session.inject_response_items([CustomToolCallOutput{call_id, name=PUBLIC_TOOL_NAME, output=text}])", "sink": "injected response item"}
+        ],
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0018/entity/code-mode-execute-handler",
+      "src": "SRC-0018",
+      "composition": "entity",
+      "terms": {
+        "object": "CodeModeExecuteHandler — ToolHandler для code_mode: принимает raw JavaScript source (ToolPayload::Custom) и запускает execute",
+        "attributes": [
+          "tool_kind: ToolKind::Function",
+          "matches_kind: ToolPayload::Custom {..}",
+          "expected_tool_name: PUBLIC_TOOL_NAME (codex_code_mode::PUBLIC_TOOL_NAME)",
+          "namespace: None (только non-namespaced)",
+          "error_on_wrong_payload: 'expects raw JavaScript source text'"
+        ],
+        "relationships": [
+          {"to": "ToolHandler (trait)", "rel": "implements", "card": "N:1"},
+          {"to": "SRC-0018/entity/code-mode-service", "rel": "invokes", "card": "1:1"},
+          {"to": "SRC-0018/entity/code-mode-runtime-response-handler", "rel": "uses", "card": "1:1"}
+        ],
+        "enumerations": null,
+        "data_flows": [
+          {"source": "ToolInvocation{session, turn, call_id, tool_name, payload=Custom{input}}", "transform": "parse_exec_source(input) → args (code, yield_time_ms, max_output_tokens) → build_enabled_tools(exec) → stored_values = service.stored_values() → service.execute(ExecuteRequest) → handle_runtime_response", "sink": "FunctionToolOutput"}
+        ],
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0018/entity/code-mode-wait-handler",
+      "src": "SRC-0018",
+      "composition": "entity",
+      "terms": {
+        "object": "CodeModeWaitHandler — ToolHandler для wait: ждёт завершения ячейки code_mode",
+        "attributes": [
+          "tool_kind: ToolKind::Function",
+          "expected_tool_name: WAIT_TOOL_NAME (codex_code_mode::WAIT_TOOL_NAME)",
+          "namespace: None",
+          "payload: ToolPayload::Function{arguments}",
+          "arg_deserialize: ExecWaitArgs { cell_id, yield_time_ms=default_wait_yield_time_ms, max_tokens=None, terminate=false }",
+          "error_on_wrong_payload: 'expects JSON arguments'"
+        ],
+        "relationships": [
+          {"to": "ToolHandler (trait)", "rel": "implements", "card": "N:1"},
+          {"to": "SRC-0018/entity/code-mode-service", "rel": "invokes", "card": "1:1"},
+          {"to": "SRC-0018/entity/code-mode-runtime-response-handler", "rel": "uses", "card": "1:1"}
+        ],
+        "enumerations": null,
+        "data_flows": [
+          {"source": "ToolInvocation.payload.arguments (JSON)", "transform": "parse_arguments → ExecWaitArgs → service.wait(WaitRequest{cell_id, yield_time_ms, terminate}) → handle_runtime_response", "sink": "FunctionToolOutput"}
+        ],
+        "config": {
+          "default_wait_yield_time_ms": {"value": "codex_code_mode::DEFAULT_WAIT_YIELD_TIME_MS (re-export as super::DEFAULT_WAIT_YIELD_TIME_MS)", "source": "codex_code_mode constant", "default": "DEFAULT_WAIT_YIELD_TIME_MS"}
+        }
+      }
+    },
+    {
+      "id": "SRC-0018/entity/exec-wait-args",
+      "src": "SRC-0018",
+      "composition": "entity",
+      "terms": {
+        "object": "ExecWaitArgs — аргументы wait-tool (code_mode)",
+        "attributes": [
+          "cell_id: String",
+          "yield_time_ms: u64 (default = DEFAULT_WAIT_YIELD_TIME_MS)",
+          "max_tokens: Option<usize> (default None)",
+          "terminate: bool (default false)"
+        ],
+        "relationships": [
+          {"to": "SRC-0018/entity/code-mode-wait-handler", "rel": "consumed_by", "card": "1:1"}
+        ],
+        "enumerations": null,
+        "data_flows": null,
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0018/entity/runtime-response",
+      "src": "SRC-0018",
+      "composition": "entity",
+      "terms": {
+        "object": "RuntimeResponse — ответ code-mode runtime: Yielded / Terminated / Result",
+        "attributes": [
+          "variants: Yielded{cell_id, content_items}, Terminated{content_items}, Result{content_items, stored_values, error_text}",
+          "cell_id присутствует только для Yielded"
+        ],
+        "relationships": [
+          {"to": "SRC-0018/entity/code-mode-runtime-response-handler", "rel": "consumed_by", "card": "1:1"}
+        ],
+        "enumerations": {
+          "variant": [
+            "Yielded — script запустился, получил cell_id, ждёт результата",
+            "Terminated — script терминирован",
+            "Result — script завершился, stored_values + optional error_text"
+          ]
+        },
+        "data_flows": null,
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0018/entity/code-mode-runtime-response-handler",
+      "src": "SRC-0018",
+      "composition": "entity",
+      "terms": {
+        "object": "handle_runtime_response — преобразует RuntimeResponse в FunctionToolOutput: sanitize image detail, truncate, prepend script_status + wall time",
+        "attributes": [
+          "success_flag: Result.error_text.is_none(); Yielded/Terminated → Some(true)",
+          "status_text_yielded: 'Script running with cell ID {cell_id}'",
+          "status_text_terminated: 'Script terminated'",
+          "status_text_completed: 'Script completed'",
+          "status_text_failed: 'Script failed'",
+          "header_format: '{status}\\nWall time {wall_time_seconds:.1} seconds\\nOutput:\\n'",
+          "wall_time_rounding: round to 0.1 second (f32*10.0 round /10.0)",
+          "on_result_with_error: push text content item 'Script error:\\n{error_text}'",
+          "on_result_replaces_stored_values: session.services.code_mode_service.replace_stored_values(stored_values)"
+        ],
+        "relationships": [
+          {"to": "SRC-0018/entity/runtime-response", "rel": "consumes", "card": "1:1"},
+          {"to": "SRC-0018/entity/runtime-output-truncation", "rel": "uses", "card": "1:1"},
+          {"to": "SRC-0018/entity/image-detail-converter", "rel": "uses", "card": "1:1"}
+        ],
+        "enumerations": null,
+        "data_flows": [
+          {"source": "RuntimeResponse content_items (codex_code_mode::FunctionCallOutputContentItem)", "transform": "into_function_call_output_content_items → sanitize_runtime_image_detail (if !can_request_original) → truncate_code_mode_result(max_output_tokens) → prepend_script_status", "sink": "FunctionToolOutput"}
+        ],
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0018/entity/image-detail-converter",
+      "src": "SRC-0018",
+      "composition": "entity",
+      "terms": {
+        "object": "IntoProtocol converter — трейт-адаптер между codex_code_mode content items и codex_protocol::models",
+        "attributes": [
+          "trait: IntoProtocol<T> с методом into_protocol(self)",
+          "impl ImageDetail: Auto→Auto, Low→Low, High→High, Original→Original",
+          "impl FunctionCallOutputContentItem: InputText passthrough; InputImage с map detail через IntoProtocol"
+        ],
+        "relationships": [
+          {"to": "codex_code_mode::FunctionCallOutputContentItem", "rel": "converts_from", "card": "1:1"},
+          {"to": "codex_protocol::models::FunctionCallOutputContentItem", "rel": "converts_to", "card": "1:1"}
+        ],
+        "enumerations": {
+          "image_detail": ["Auto", "Low", "High", "Original"]
+        },
+        "data_flows": [
+          {"source": "Vec<codex_code_mode::FunctionCallOutputContentItem>", "transform": "into_function_call_output_content_items (map IntoProtocol)", "sink": "Vec<codex_protocol::models::FunctionCallOutputContentItem>"}
+        ],
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0018/entity/runtime-output-truncation",
+      "src": "SRC-0018",
+      "composition": "entity",
+      "terms": {
+        "object": "truncate_code_mode_result — обрезает content items code_mode-tool результата по max_output_tokens",
+        "attributes": [
+          "policy: TruncationPolicy::Tokens(resolve_max_tokens(max_output_tokens))",
+          "text_only_branch: если все items = InputText → formatted_truncate_text_content_items_with_policy",
+          "mixed_branch: иначе truncate_function_output_items_with_policy"
+        ],
+        "relationships": [
+          {"to": "SRC-0018/entity/code-mode-runtime-response-handler", "rel": "used_by", "card": "N:1"},
+          {"to": "codex_utils_output_truncation", "rel": "delegates_to", "card": "1:1"}
+        ],
+        "enumerations": null,
+        "data_flows": null,
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0018/entity/nested-tool-dispatcher",
+      "src": "SRC-0018",
+      "composition": "entity",
+      "terms": {
+        "object": "call_nested_tool — диспетчер вложенных tool-вызовов из code_mode JS runtime",
+        "attributes": [
+          "reject_self_invoke: tool_name namespace=None и name=PUBLIC_TOOL_NAME → ошибка '{PUBLIC_TOOL_NAME} cannot invoke itself'",
+          "mcp_branch: если session.resolve_mcp_tool_info(tool_name) найден → canonical_tool_name + ToolPayload::Mcp{server, tool, raw_arguments}",
+          "nested_branch: иначе build_nested_tool_payload",
+          "call_id_format: '{PUBLIC_TOOL_NAME}-{uuid v4}'",
+          "tool_call_source: ToolCallSource::CodeMode"
+        ],
+        "relationships": [
+          {"to": "SRC-0018/entity/core-turn-host", "rel": "used_by", "card": "N:1"},
+          {"to": "ToolCallRuntime", "rel": "delegates_to", "card": "1:1"}
+        ],
+        "enumerations": null,
+        "data_flows": [
+          {"source": "ToolName + Option<JsonValue> input", "transform": "mcp lookup OR tool_kind_for_spec → Function (arguments=serialize_function_tool_arguments) | Freeform (input=String) → ToolCall{name, call_id, payload} → tool_runtime.handle_tool_call_with_source(CodeMode) → result.code_mode_result()", "sink": "JsonValue (to kernel)"}
+        ],
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0018/entity/nested-router-builder",
+      "src": "SRC-0018",
+      "composition": "entity",
+      "terms": {
+        "object": "build_nested_router — строит ToolRouter для code_mode nested tools, используя tools_config.for_code_mode_nested_tools + MCP tools + parallel MCP servers",
+        "attributes": [
+          "tools_config_source: exec.turn.tools_config.for_code_mode_nested_tools()",
+          "mcp_tools_source: session.services.mcp_connection_manager.read().list_all_tools()",
+          "parallel_mcp_filter: config.mcp_servers где supports_parallel_tool_calls",
+          "dynamic_tools: exec.turn.dynamic_tools",
+          "deferred_mcp_tools: None",
+          "unavailable_called_tools: Vec::new()",
+          "discoverable_tools: None"
+        ],
+        "relationships": [
+          {"to": "ToolRouter", "rel": "produces", "card": "1:1"},
+          {"to": "SRC-0018/entity/code-mode-service", "rel": "used_by", "card": "1:1"}
+        ],
+        "enumerations": null,
+        "data_flows": [
+          {"source": "turn config + mcp tools", "transform": "ToolRouter::from_config + collect_code_mode_tool_definitions(specs)", "sink": "Vec<codex_code_mode::ToolDefinition>"}
+        ],
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0018/entity/nested-tool-payload-builder",
+      "src": "SRC-0018",
+      "composition": "entity",
+      "terms": {
+        "object": "build_nested_tool_payload — определяет kind (Function|Freeform) и формирует payload для nested-вызова",
+        "attributes": [
+          "tool_kind_for_spec: Freeform(_) → Freeform; иначе → Function",
+          "tool_kind_for_name_err: 'tool `{tool_name}` is not enabled in {PUBLIC_TOOL_NAME}' если spec=None",
+          "function_payload: serialize_function_tool_arguments → ToolPayload::Function",
+          "freeform_payload: input=String → ToolPayload::Custom; иначе err 'expects a string input'",
+          "serialize_args: None → '{}'; JsonValue::Object → serde_json::to_string; иначе err 'expects a JSON object for arguments'"
+        ],
+        "relationships": [
+          {"to": "SRC-0018/entity/nested-tool-dispatcher", "rel": "used_by", "card": "1:1"}
+        ],
+        "enumerations": {
+          "code_mode_tool_kind": ["Function", "Freeform"]
+        },
+        "data_flows": null,
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0018/entity/js-repl-handle",
+      "src": "SRC-0018",
+      "composition": "entity",
+      "terms": {
+        "object": "JsReplHandle — per-task handle js_repl, lazy-init JsReplManager через OnceCell",
+        "attributes": [
+          "node_path: Option<PathBuf> (override Node)",
+          "node_module_dirs: Vec<PathBuf>",
+          "cell: OnceCell<Arc<JsReplManager>>"
+        ],
+        "relationships": [
+          {"to": "SRC-0018/entity/js-repl-manager", "rel": "owns", "card": "1:1"}
+        ],
+        "enumerations": null,
+        "data_flows": [
+          {"source": "первый manager() call", "transform": "get_or_try_init → JsReplManager::new(node_path, node_module_dirs)", "sink": "Arc<JsReplManager>"}
+        ],
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0018/entity/js-repl-args",
+      "src": "SRC-0018",
+      "composition": "entity",
+      "terms": {
+        "object": "JsReplArgs — аргументы js_repl tool call",
+        "attributes": [
+          "code: String (JS source)",
+          "timeout_ms: Option<u64> (default в execute = 30_000)",
+          "deny_unknown_fields: true (serde)"
+        ],
+        "relationships": [
+          {"to": "SRC-0018/entity/js-repl-manager", "rel": "consumed_by", "card": "1:1"}
+        ],
+        "enumerations": null,
+        "data_flows": null,
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0018/entity/js-exec-result",
+      "src": "SRC-0018",
+      "composition": "entity",
+      "terms": {
+        "object": "JsExecResult — результат выполнения JS в js_repl",
+        "attributes": [
+          "output: String (text preview)",
+          "content_items: Vec<FunctionCallOutputContentItem>"
+        ],
+        "relationships": [
+          {"to": "SRC-0018/entity/js-repl-manager", "rel": "produced_by", "card": "1:1"}
+        ],
+        "enumerations": null,
+        "data_flows": [
+          {"source": "ExecResultMessage::Ok.content_items", "transform": "split_exec_result_content_items — первый InputText → output, остальные → content_items", "sink": "JsExecResult"}
+        ],
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0018/entity/js-repl-manager",
+      "src": "SRC-0018",
+      "composition": "entity",
+      "terms": {
+        "object": "JsReplManager — управляет Node kernel-процессом js_repl, принимает exec-запросы, маршрутизирует nested tool calls, следит за состоянием",
+        "attributes": [
+          "node_path: Option<PathBuf>",
+          "node_module_dirs: Vec<PathBuf>",
+          "tmp_dir: tempfile::TempDir (CODEX_JS_TMP_DIR)",
+          "kernel: Arc<Mutex<Option<KernelState>>>",
+          "exec_lock: Arc<Semaphore(1)> — только одна активная execute за раз",
+          "exec_tool_calls: Arc<Mutex<HashMap<exec_id, ExecToolCalls>>>"
+        ],
+        "relationships": [
+          {"to": "SRC-0018/entity/kernel-state", "rel": "owns", "card": "1:0..1"},
+          {"to": "SRC-0018/entity/top-level-exec-state", "rel": "tracks", "card": "1:1"},
+          {"to": "SRC-0018/entity/exec-tool-calls", "rel": "tracks", "card": "1:N"},
+          {"to": "SRC-0018/entity/kernel-to-host", "rel": "consumes", "card": "1:N"},
+          {"to": "SRC-0018/entity/host-to-kernel", "rel": "produces", "card": "1:N"},
+          {"to": "SRC-0018/entity/node-version", "rel": "validates", "card": "1:1"}
+        ],
+        "enumerations": null,
+        "data_flows": [
+          {"source": "JsReplArgs + Session/TurnContext/tracker", "transform": "exec_lock acquire → ensure kernel started (start_kernel) → register top-level exec + register_exec_tool_calls → HostToKernel::Exec over stdin → mark_submitted → await oneshot.rx with timeout timeout_ms.unwrap_or(30_000) → match ExecResultMessage", "sink": "JsExecResult or FunctionCallError"},
+          {"source": "kernel stdout JSON lines", "transform": "read_stdout: KernelToHost::ExecResult → pending_execs.remove → ExecResultMessage send; KernelToHost::EmitImage → validate_emitted_image_url (data: only) → record_exec_content_item; KernelToHost::RunTool → begin_exec_tool_call → spawn run_tool_request", "sink": "ExecResultMessage / HostToKernel responses"},
+          {"source": "kernel stderr", "transform": "read_stderr: trim, push_stderr_tail_line (bounded 20 lines / 4096 bytes), warn log", "sink": "recent_stderr VecDeque"},
+          {"source": "timeout", "transform": "reset_kernel → clear_all_exec_tool_calls_map → clear_top_level_exec", "sink": "error 'js_repl execution timed out; kernel reset, rerun your request'"},
+          {"source": "turn_interrupt_requires_reset(turn_id)", "transform": "если TopLevelExecState.should_reset_for_interrupt(turn_id) → reset_kernel", "sink": "bool (was_reset)"}
+        ],
+        "config": {
+          "default_exec_timeout_ms": {"value": 30000, "source": "args.timeout_ms.unwrap_or(30_000) в execute()", "default": 30000},
+          "stderr_tail_line_limit": {"value": 20, "source": "JS_REPL_STDERR_TAIL_LINE_LIMIT const", "default": 20},
+          "stderr_tail_line_max_bytes": {"value": 512, "source": "JS_REPL_STDERR_TAIL_LINE_MAX_BYTES const", "default": 512},
+          "stderr_tail_max_bytes": {"value": 4096, "source": "JS_REPL_STDERR_TAIL_MAX_BYTES const", "default": 4096},
+          "stderr_tail_separator": {"value": " | ", "source": "JS_REPL_STDERR_TAIL_SEPARATOR const", "default": " | "},
+          "exec_id_log_limit": {"value": 8, "source": "JS_REPL_EXEC_ID_LOG_LIMIT const", "default": 8},
+          "model_diag_stderr_max_bytes": {"value": 1024, "source": "JS_REPL_MODEL_DIAG_STDERR_MAX_BYTES const", "default": 1024},
+          "model_diag_error_max_bytes": {"value": 256, "source": "JS_REPL_MODEL_DIAG_ERROR_MAX_BYTES const", "default": 256},
+          "tool_response_text_preview_max_bytes": {"value": 512, "source": "JS_REPL_TOOL_RESPONSE_TEXT_PREVIEW_MAX_BYTES const", "default": 512},
+          "kill_wait_timeout_sec": {"value": 2, "source": "hardcoded в kill_kernel_child", "default": 2},
+          "tmp_dir_env_var": {"value": "CODEX_JS_TMP_DIR", "source": "hardcoded env key при start_kernel", "default": null},
+          "node_module_dirs_env_var": {"value": "CODEX_JS_REPL_NODE_MODULE_DIRS", "source": "hardcoded env key при start_kernel", "default": null},
+          "node_path_env_var": {"value": "CODEX_JS_REPL_NODE_PATH", "source": "resolve_node env lookup", "default": null},
+          "kernel_node_args": {"value": ["--experimental-vm-modules", "<kernel.js path>"], "source": "start_kernel hardcoded", "default": null},
+          "pragma_prefix": {"value": "// codex-js-repl:", "source": "JS_REPL_PRAGMA_PREFIX const", "default": null}
+        }
+      }
+    },
+    {
+      "id": "SRC-0018/entity/kernel-state",
+      "src": "SRC-0018",
+      "composition": "entity",
+      "terms": {
+        "object": "KernelState — состояние запущенного Node-kernel js_repl",
+        "attributes": [
+          "child: Arc<Mutex<Child>> (tokio process Child)",
+          "recent_stderr: Arc<Mutex<VecDeque<String>>> (bounded tail)",
+          "stdin: Arc<Mutex<ChildStdin>>",
+          "pending_execs: Arc<Mutex<HashMap<String, oneshot::Sender<ExecResultMessage>>>>",
+          "exec_contexts: Arc<Mutex<HashMap<String, ExecContext>>>",
+          "top_level_exec_state: TopLevelExecState",
+          "shutdown: CancellationToken"
+        ],
+        "relationships": [
+          {"to": "SRC-0018/entity/js-repl-manager", "rel": "owned_by", "card": "1:1"},
+          {"to": "SRC-0018/entity/top-level-exec-state", "rel": "contains", "card": "1:1"}
+        ],
+        "enumerations": null,
+        "data_flows": [
+          {"source": "start_kernel(turn, dependency_env, thread_id)", "transform": "resolve_compatible_node → write_kernel_script (kernel.js + meriyah.umd.min.js в tmp_dir) → create_env + CODEX_JS_TMP_DIR + CODEX_JS_REPL_NODE_MODULE_DIRS → SandboxManager.select_initial + transform → tokio::Command spawn --experimental-vm-modules + kernel.js → pipe stdin/stdout/stderr + kill_on_drop → spawn read_stdout/read_stderr", "sink": "KernelState"}
+        ],
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0018/entity/top-level-exec-state",
+      "src": "SRC-0018",
+      "composition": "entity",
+      "terms": {
+        "object": "TopLevelExecState — стейт-машина top-level js_repl exec на турн",
+        "attributes": [
+          "variant: Idle | FreshKernel{turn_id, exec_id:Option} | ReusedKernelPending{turn_id, exec_id} | Submitted{turn_id, exec_id}",
+          "registered_exec_id: возвращает exec_id для FreshKernel(Some)|ReusedKernelPending|Submitted, иначе None",
+          "should_reset_for_interrupt(turn_id): true для FreshKernel/Submitted с тем же turn_id; ReusedKernelPending → false; Idle → false"
+        ],
+        "relationships": [
+          {"to": "SRC-0018/entity/kernel-state", "rel": "contained_in", "card": "1:1"}
+        ],
+        "enumerations": {
+          "state": [
+            "Idle — нет активного exec",
+            "FreshKernel{turn_id, exec_id:Option} — kernel свежезапущен в этом турне",
+            "ReusedKernelPending{turn_id, exec_id} — exec пошёл на переиспользованный kernel",
+            "Submitted{turn_id, exec_id} — exec уже записан в stdin"
+          ]
+        },
+        "data_flows": [
+          {"source": "register_top_level_exec(exec_id, turn_id)", "transform": "если FreshKernel(active_turn_id==turn_id) → FreshKernel{turn_id, Some(exec_id)}; иначе → ReusedKernelPending{turn_id, exec_id}", "sink": "top_level_exec_state"},
+          {"source": "mark_top_level_exec_submitted(exec_id)", "transform": "если FreshKernel(Some(active))==exec_id или ReusedKernelPending(active==exec_id) → Submitted{turn_id, exec_id}; иначе no-op", "sink": "top_level_exec_state"},
+          {"source": "clear_top_level_exec_if_matches(exec_id)", "transform": "если registered_exec_id==exec_id → Idle", "sink": "top_level_exec_state"}
+        ],
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0018/entity/exec-tool-calls",
+      "src": "SRC-0018",
+      "composition": "entity",
+      "terms": {
+        "object": "ExecToolCalls — учёт in-flight nested-tool calls для одного js_repl exec",
+        "attributes": [
+          "in_flight: usize",
+          "content_items: Vec<FunctionCallOutputContentItem>",
+          "notify: Arc<Notify> (wake-up when счётчик → 0)",
+          "cancel: CancellationToken (отменяет все внутренние задачи при reset/clear)"
+        ],
+        "relationships": [
+          {"to": "SRC-0018/entity/js-repl-manager", "rel": "owned_by", "card": "N:1"}
+        ],
+        "enumerations": null,
+        "data_flows": [
+          {"source": "begin_exec_tool_call", "transform": "in_flight += 1; вернуть cancel.clone()", "sink": "CancellationToken"},
+          {"source": "record_exec_content_item(item)", "transform": "push в content_items", "sink": "state.content_items"},
+          {"source": "finish_exec_tool_call", "transform": "in_flight -= 1; если 0 → notify.notify_waiters()", "sink": "signal"},
+          {"source": "clear_exec_tool_calls(exec_id)", "transform": "remove + state.cancel.cancel() + state.notify.notify_waiters()", "sink": "cancelled tasks"}
+        ],
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0018/entity/kernel-to-host",
+      "src": "SRC-0018",
+      "composition": "entity",
+      "terms": {
+        "object": "KernelToHost — message из Node kernel в host по JSON-over-stdout",
+        "attributes": [
+          "serde_tag: 'type', snake_case",
+          "variants: ExecResult{id, ok, output, error?} | RunTool(RunToolRequest) | EmitImage(EmitImageRequest)"
+        ],
+        "relationships": [
+          {"to": "SRC-0018/entity/js-repl-manager", "rel": "consumed_by", "card": "N:1"}
+        ],
+        "enumerations": {
+          "type": ["exec_result", "run_tool", "emit_image"]
+        },
+        "data_flows": null,
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0018/entity/host-to-kernel",
+      "src": "SRC-0018",
+      "composition": "entity",
+      "terms": {
+        "object": "HostToKernel — message из host в kernel по JSON-over-stdin",
+        "attributes": [
+          "serde_tag: 'type', snake_case",
+          "variants: Exec{id, code, timeout_ms?} | RunToolResult(RunToolResult) | EmitImageResult(EmitImageResult)"
+        ],
+        "relationships": [
+          {"to": "SRC-0018/entity/js-repl-manager", "rel": "produced_by", "card": "N:1"}
+        ],
+        "enumerations": {
+          "type": ["exec", "run_tool_result", "emit_image_result"]
+        },
+        "data_flows": null,
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0018/entity/run-tool-request",
+      "src": "SRC-0018",
+      "composition": "entity",
+      "terms": {
+        "object": "RunToolRequest — kernel просит host выполнить nested tool",
+        "attributes": [
+          "id: String (tool_call_id)",
+          "exec_id: String (родительский js_repl exec)",
+          "tool_name: String",
+          "arguments: String (JSON text)"
+        ],
+        "relationships": [
+          {"to": "SRC-0018/entity/js-repl-manager", "rel": "triggers", "card": "N:1"}
+        ],
+        "enumerations": null,
+        "data_flows": [
+          {"source": "KernelToHost::RunTool", "transform": "run_tool_request: reject self-invoke → ToolRouter::from_config + mcp tools → find spec → Function/Freeform/Mcp payload → router.dispatch_tool_call_with_code_mode_result(JsRepl) → serialize response", "sink": "RunToolResult"}
+        ],
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0018/entity/run-tool-result",
+      "src": "SRC-0018",
+      "composition": "entity",
+      "terms": {
+        "object": "RunToolResult — ответ host на RunToolRequest",
+        "attributes": [
+          "id: String",
+          "ok: bool",
+          "response: Option<JsonValue>",
+          "error: Option<String>"
+        ],
+        "relationships": [
+          {"to": "SRC-0018/entity/run-tool-request", "rel": "responds_to", "card": "1:1"}
+        ],
+        "enumerations": null,
+        "data_flows": null,
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0018/entity/emit-image-request",
+      "src": "SRC-0018",
+      "composition": "entity",
+      "terms": {
+        "object": "EmitImageRequest — kernel просит host добавить image content item к exec результату",
+        "attributes": [
+          "id: String",
+          "exec_id: String",
+          "image_url: String",
+          "detail: Option<ImageDetail>",
+          "validation: image_url начинается с 'data:' (case-insensitive)"
+        ],
+        "relationships": [
+          {"to": "SRC-0018/entity/js-repl-manager", "rel": "processed_by", "card": "N:1"}
+        ],
+        "enumerations": null,
+        "data_flows": [
+          {"source": "KernelToHost::EmitImage", "transform": "validate_emitted_image_url (data: only, иначе 'codex.emitImage only accepts data URLs') → emitted_image_content_item (normalize_output_image_detail) → record_exec_content_item", "sink": "EmitImageResult"}
+        ],
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0018/entity/emit-image-result",
+      "src": "SRC-0018",
+      "composition": "entity",
+      "terms": {
+        "object": "EmitImageResult — ответ host на EmitImageRequest",
+        "attributes": [
+          "id: String",
+          "ok: bool",
+          "error: Option<String>"
+        ],
+        "relationships": [
+          {"to": "SRC-0018/entity/emit-image-request", "rel": "responds_to", "card": "1:1"}
+        ],
+        "enumerations": null,
+        "data_flows": null,
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0018/entity/exec-result-message",
+      "src": "SRC-0018",
+      "composition": "entity",
+      "terms": {
+        "object": "ExecResultMessage — внутренний ответ exec внутри host (Ok или Err)",
+        "attributes": [
+          "variants: Ok{content_items} | Err{message}"
+        ],
+        "relationships": [
+          {"to": "SRC-0018/entity/js-repl-manager", "rel": "delivered_via_oneshot_in", "card": "N:1"}
+        ],
+        "enumerations": {
+          "variant": ["Ok", "Err"]
+        },
+        "data_flows": null,
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0018/entity/js-repl-tool-call-payload-kind",
+      "src": "SRC-0018",
+      "composition": "entity",
+      "terms": {
+        "object": "JsReplToolCallPayloadKind — вид payload для summary логирования nested tool-ответа",
+        "attributes": ["variants по типам ответа"],
+        "relationships": [
+          {"to": "SRC-0018/entity/js-repl-tool-call-response-summary", "rel": "field_of", "card": "N:1"}
+        ],
+        "enumerations": {
+          "kind": [
+            "MessageContent",
+            "FunctionText",
+            "FunctionContentItems",
+            "CustomText",
+            "CustomContentItems",
+            "McpResult",
+            "McpErrorResult",
+            "Error"
+          ]
+        },
+        "data_flows": null,
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0018/entity/js-repl-tool-call-response-summary",
+      "src": "SRC-0018",
+      "composition": "entity",
+      "terms": {
+        "object": "JsReplToolCallResponseSummary — summary вложенного tool-ответа для трейсинга",
+        "attributes": [
+          "response_type: Option<String>",
+          "payload_kind: Option<JsReplToolCallPayloadKind>",
+          "payload_text_preview: Option<String> (обрезается до TOOL_RESPONSE_TEXT_PREVIEW_MAX_BYTES=512)",
+          "payload_text_length: Option<usize>",
+          "payload_item_count: Option<usize>",
+          "text_item_count: Option<usize>",
+          "image_item_count: Option<usize>",
+          "structured_content_present: Option<bool>",
+          "result_is_error: Option<bool>"
+        ],
+        "relationships": [
+          {"to": "SRC-0018/entity/js-repl-manager", "rel": "produced_by", "card": "N:1"}
+        ],
+        "enumerations": null,
+        "data_flows": [
+          {"source": "ResponseInputItem (Message | FunctionCallOutput | CustomToolCallOutput | McpToolCallOutput | ToolSearchOutput)", "transform": "summarize_tool_call_response — branch per variant, count text/image items, preview text truncated by bytes", "sink": "JsReplToolCallResponseSummary"}
+        ],
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0018/entity/kernel-stream-end",
+      "src": "SRC-0018",
+      "composition": "entity",
+      "terms": {
+        "object": "KernelStreamEnd — причина завершения read_stdout loop",
+        "attributes": [
+          "variants: Shutdown | StdoutEof | StdoutReadError(String)",
+          "reason(): 'shutdown' | 'stdout_eof' | 'stdout_read_error'",
+          "error(): Some(err) только для StdoutReadError"
+        ],
+        "relationships": [
+          {"to": "SRC-0018/entity/kernel-debug-snapshot", "rel": "paired_with_for_diagnostics", "card": "1:1"}
+        ],
+        "enumerations": {
+          "reason_code": ["shutdown", "stdout_eof", "stdout_read_error"]
+        },
+        "data_flows": null,
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0018/entity/kernel-debug-snapshot",
+      "src": "SRC-0018",
+      "composition": "entity",
+      "terms": {
+        "object": "KernelDebugSnapshot — снимок состояния kernel для диагностики (pid, status, stderr_tail)",
+        "attributes": [
+          "pid: Option<u32>",
+          "status: String (format: 'running' | 'exited(code=N)' | 'exited(signal=N)' | 'unknown (err)')",
+          "stderr_tail: String (join VecDeque через ' | ')"
+        ],
+        "relationships": [
+          {"to": "SRC-0018/entity/js-repl-manager", "rel": "produced_by", "card": "N:1"}
+        ],
+        "enumerations": null,
+        "data_flows": [
+          {"source": "child.try_wait()", "transform": "Ok(Some(status)) → 'exited({format_exit_status})'; Ok(None) → 'running'; Err → 'unknown ({err})'", "sink": "KernelDebugSnapshot.status"}
+        ],
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0018/entity/node-version",
+      "src": "SRC-0018",
+      "composition": "entity",
+      "terms": {
+        "object": "NodeVersion — версия Node runtime для js_repl (major.minor.patch)",
+        "attributes": [
+          "major: u64",
+          "minor: u64",
+          "patch: u64",
+          "parse_source: trim + strip leading 'v' + split on [. - +] в major/minor/patch",
+          "display_format: '{major}.{minor}.{patch}'"
+        ],
+        "relationships": [
+          {"to": "SRC-0018/entity/js-repl-manager", "rel": "validated_by", "card": "N:1"}
+        ],
+        "enumerations": null,
+        "data_flows": [
+          {"source": "include_str!('../../../../node-version.txt')", "transform": "required_node_version — NodeVersion::parse", "sink": "required NodeVersion"},
+          {"source": "node --version output stdout", "transform": "read_node_version — NodeVersion::parse", "sink": "found NodeVersion"},
+          {"source": "ensure_node_version", "transform": "compare found < required → Err 'Node runtime too old for js_repl (resolved {path}): found v{found}, requires >= v{required}. Install/update Node or set js_repl_node_path to a newer runtime.'", "sink": "Result"}
+        ],
+        "config": {
+          "min_version_source": {"value": "include_str!('node-version.txt')", "source": "JS_REPL_MIN_NODE_VERSION const (compile-time include)", "default": null}
+        }
+      }
+    },
+    {
+      "id": "SRC-0018/entity/node-resolver",
+      "src": "SRC-0018",
+      "composition": "entity",
+      "terms": {
+        "object": "resolve_node / resolve_compatible_node — lookup путь к Node и валидация версии",
+        "attributes": [
+          "priority: CODEX_JS_REPL_NODE_PATH env → config path (если exists) → which::which('node')",
+          "missing_error: 'Node runtime not found; install Node or set CODEX_JS_REPL_NODE_PATH'",
+          "validation: ensure_node_version"
+        ],
+        "relationships": [
+          {"to": "SRC-0018/entity/node-version", "rel": "uses", "card": "1:1"},
+          {"to": "SRC-0018/entity/js-repl-manager", "rel": "used_by", "card": "1:1"}
+        ],
+        "enumerations": null,
+        "data_flows": null,
+        "config": {
+          "codex_js_repl_node_path_env": {"value": "CODEX_JS_REPL_NODE_PATH", "source": "env var lookup в resolve_node", "default": null}
+        }
+      }
+    }
+  ]
+}

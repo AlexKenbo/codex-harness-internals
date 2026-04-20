@@ -1,0 +1,820 @@
+{
+  "src": "SRC-0001",
+  "schema_version": "2.0",
+  "lens": "use_case",
+  "compositions": [
+    {
+      "id": "SRC-0001/uc.sub/convert-turn-item-to-legacy-events",
+      "src": "SRC-0001",
+      "composition": "use_case",
+      "level": "sub",
+      "strategic_domain": null,
+      "terms": {
+        "actor": "Модуль TurnItem (items.rs) — HasLegacyEvent impl для TurnItem",
+        "goal": "Конвертировать turn-item в поток legacy EventMsg для обратной совместимости",
+        "steps": [
+          "1. Модуль TurnItem получает ссылку на self и флаг show_raw_agent_reasoning",
+          "2. Модуль TurnItem сопоставляет вариант: UserMessage → вызывает item.as_legacy_event() и возвращает vec![UserMessage]",
+          "3. Модуль TurnItem для AgentMessage → вызывает item.as_legacy_events() и возвращает Vec<AgentMessage> (по одному на content::Text)",
+          "4. Модуль TurnItem для Reasoning → вызывает item.as_legacy_events(show_raw_agent_reasoning)",
+          "5. Модуль TurnItem для WebSearch → возвращает vec![WebSearchEnd(call_id, query, action)]",
+          "6. Модуль TurnItem для ImageGeneration → возвращает vec![ImageGenerationEnd(call_id, status, revised_prompt, result, saved_path)]",
+          "7. Модуль TurnItem для ContextCompaction → возвращает vec![ContextCompacted]",
+          "8. Модуль TurnItem для HookPrompt и Plan → возвращает Vec::new() (legacy не emit'ит)"
+        ],
+        "extensions (Cockburn)": [
+          {"step": 4, "condition": "show_raw_agent_reasoning = false", "action": "Reasoning emit только AgentReasoning(summary_text); raw_content пропускается"},
+          {"step": 4, "condition": "show_raw_agent_reasoning = true", "action": "Reasoning дополнительно emit AgentReasoningRawContent для каждого raw_content entry"},
+          {"step": 8, "condition": "вариант = HookPrompt или Plan", "action": "legacy event не генерируется — пустой Vec"}
+        ],
+        "edge_cases": [
+          {"condition": "AgentMessageItem.content пуст", "action": "возвращается пустой Vec<EventMsg>"},
+          {"condition": "ReasoningItem.summary_text и raw_content оба пусты", "action": "возвращается пустой Vec<EventMsg>"}
+        ],
+        "lifecycle": null,
+        "ux": null,
+        "result": "Vec<EventMsg> — поток legacy-событий, эквивалентный новому turn-item, либо пустой Vec для вариантов без legacy-маппинга"
+      }
+    },
+    {
+      "id": "SRC-0001/uc.sub/convert-user-input-to-legacy-event",
+      "src": "SRC-0001",
+      "composition": "use_case",
+      "level": "sub",
+      "strategic_domain": null,
+      "terms": {
+        "actor": "Модуль UserMessageItem (items.rs) — метод as_legacy_event",
+        "goal": "Преобразовать пользовательский UserMessageItem в legacy UserMessage событие с уплощением текста",
+        "steps": [
+          "1. Модуль UserMessageItem собирает concatenated message из UserInput::Text (join без разделителя)",
+          "2. Модуль UserMessageItem собирает image_urls из UserInput::Image",
+          "3. Модуль UserMessageItem собирает local_image_paths из UserInput::LocalImage",
+          "4. Модуль UserMessageItem собирает text_elements: для каждого UserInput::Text rebase'ит byte_range (offset + start, offset + end) на concatenated text и добавляет placeholder",
+          "5. Модуль UserMessageItem возвращает EventMsg::UserMessage(UserMessageEvent{message, images: Some, local_images, text_elements})"
+        ],
+        "extensions (Cockburn)": [
+          {"step": 1, "condition": "UserInput варианта, отличного от Text/Image/LocalImage (Skill, Mention)", "action": "не добавляется в message/images/paths (skip через match с _ или конкретный variant)"}
+        ],
+        "edge_cases": [
+          {"condition": "content пуст", "action": "message = пустая строка, images = Some([]), local_images = [], text_elements = []"}
+        ],
+        "lifecycle": null,
+        "ux": null,
+        "result": "EventMsg::UserMessage с плоским текстом и разделёнными image каналами"
+      }
+    },
+    {
+      "id": "SRC-0001/uc.sub/build-hook-prompt-message",
+      "src": "SRC-0001",
+      "composition": "use_case",
+      "level": "sub",
+      "strategic_domain": null,
+      "terms": {
+        "actor": "Модуль hooks (items.rs) — build_hook_prompt_message",
+        "goal": "Собрать ResponseItem::Message с XML-обёрнутыми hook prompt фрагментами для модели",
+        "steps": [
+          "1. Модуль hooks получает &[HookPromptFragment]",
+          "2. Модуль hooks фильтрует фрагменты с пустым hook_run_id (после trim)",
+          "3. Модуль hooks сериализует каждый оставшийся фрагмент в XML <hook_prompt hook_run_id=...>text</hook_prompt> через quick_xml",
+          "4. Модуль hooks оборачивает каждую XML-строку в ContentItem::InputText",
+          "5. Модуль hooks проверяет что content не пуст — если пуст, возвращает None",
+          "6. Модуль hooks возвращает Some(ResponseItem::Message{id: Some(uuid v4), role: \"user\", content, end_turn: None, phase: None})"
+        ],
+        "extensions (Cockburn)": [
+          {"step": 2, "condition": "все фрагменты имеют пустой hook_run_id после trim", "action": "content оказывается пустым → шаг 5 возвращает None"},
+          {"step": 3, "condition": "сериализация XML падает (to_xml_string вернул Err)", "action": "фрагмент пропускается через filter_map (ok())"}
+        ],
+        "edge_cases": [
+          {"condition": "fragments пуст на входе", "action": "content пуст → возвращается None"}
+        ],
+        "lifecycle": null,
+        "ux": null,
+        "result": "Option<ResponseItem::Message> — сообщение в роли user с XML hook prompts, либо None если нет валидных фрагментов"
+      }
+    },
+    {
+      "id": "SRC-0001/uc.sub/parse-hook-prompt-message",
+      "src": "SRC-0001",
+      "composition": "use_case",
+      "level": "sub",
+      "strategic_domain": null,
+      "terms": {
+        "actor": "Модуль hooks (items.rs) — parse_hook_prompt_message и parse_hook_prompt_fragment",
+        "goal": "Восстановить HookPromptItem из Message content ResponseItem",
+        "steps": [
+          "1. Модуль hooks принимает id: Option<&String> и &[ContentItem]",
+          "2. Модуль hooks для каждого ContentItem проверяет вариант InputText",
+          "3. Модуль hooks парсит text как XML HookPromptXml через quick_xml::de::from_str",
+          "4. Модуль hooks проверяет что hook_run_id непуст после trim — иначе отбрасывает фрагмент",
+          "5. Модуль hooks собирает все успешно разобранные фрагменты через collect::<Option<Vec<_>>>()",
+          "6. Модуль hooks если fragments пуст — возвращает None",
+          "7. Модуль hooks иначе вызывает HookPromptItem::from_fragments(id, fragments)"
+        ],
+        "extensions (Cockburn)": [
+          {"step": 2, "condition": "ContentItem не InputText (InputImage или OutputText)", "action": "возвращает None из map, collect прерывает операцию → вся функция вернёт None"},
+          {"step": 3, "condition": "XML парсинг падает", "action": "возвращает None из map → вся функция вернёт None"},
+          {"step": 7, "condition": "id = None", "action": "HookPromptItem::from_fragments генерирует новый UUID v4"}
+        ],
+        "edge_cases": [
+          {"condition": "content массив пуст", "action": "collect возвращает Some(Vec::new()) → шаг 6 возвращает None"}
+        ],
+        "lifecycle": null,
+        "ux": null,
+        "result": "Option<HookPromptItem> — восстановленный hook prompt с id (переданный или новый) и fragments"
+      }
+    },
+    {
+      "id": "SRC-0001/uc.sub/serialize-function-call-output-payload",
+      "src": "SRC-0001",
+      "composition": "use_case",
+      "level": "sub",
+      "strategic_domain": null,
+      "terms": {
+        "actor": "Модуль serde FunctionCallOutputPayload (models.rs) — Serialize impl",
+        "goal": "Сериализовать FunctionCallOutputPayload в wire JSON: либо plain string, либо array content items",
+        "steps": [
+          "1. Модуль serde получает &FunctionCallOutputPayload и Serializer",
+          "2. Модуль serde сопоставляет self.body: Text(content) → serializer.serialize_str(content) (plain JSON string)",
+          "3. Модуль serde для ContentItems(items) → items.serialize(serializer) (JSON array)"
+        ],
+        "extensions (Cockburn)": null,
+        "edge_cases": [
+          {"condition": "body = Text(\"\")", "action": "сериализуется как пустая строка"},
+          {"condition": "body = ContentItems(vec![])", "action": "сериализуется как []"}
+        ],
+        "lifecycle": null,
+        "ux": null,
+        "result": "wire JSON — либо строка, либо массив structured items; success поле не попадает в wire (internal metadata)"
+      }
+    },
+    {
+      "id": "SRC-0001/uc.sub/deserialize-function-call-output-payload",
+      "src": "SRC-0001",
+      "composition": "use_case",
+      "level": "sub",
+      "strategic_domain": null,
+      "terms": {
+        "actor": "Модуль serde FunctionCallOutputPayload (models.rs) — Deserialize impl",
+        "goal": "Восстановить FunctionCallOutputPayload из wire JSON различая Text и ContentItems",
+        "steps": [
+          "1. Модуль serde принимает Deserializer",
+          "2. Модуль serde десериализует body как FunctionCallOutputBody (untagged: либо Text(String), либо ContentItems(Vec<FunctionCallOutputContentItem>))",
+          "3. Модуль serde собирает FunctionCallOutputPayload{body, success: None}"
+        ],
+        "extensions (Cockburn)": [
+          {"step": 2, "condition": "wire value = JSON string", "action": "FunctionCallOutputBody::Text"},
+          {"step": 2, "condition": "wire value = JSON array с корректными content items", "action": "FunctionCallOutputBody::ContentItems"}
+        ],
+        "edge_cases": [
+          {"condition": "wire array содержит элементы не матчащие InputText/InputImage", "action": "десериализация падает с ошибкой (untagged без other variant)"}
+        ],
+        "lifecycle": null,
+        "ux": null,
+        "result": "FunctionCallOutputPayload с корректным body и success=None (success реконструируется получателем отдельно)"
+      }
+    },
+    {
+      "id": "SRC-0001/uc.sub/convert-user-inputs-to-response-input",
+      "src": "SRC-0001",
+      "composition": "use_case",
+      "level": "sub",
+      "strategic_domain": null,
+      "terms": {
+        "actor": "Модуль ResponseInputItem (models.rs) — From<Vec<UserInput>> for ResponseInputItem",
+        "goal": "Преобразовать пользовательский ввод в ResponseInputItem::Message с обёрткой изображений в теги",
+        "steps": [
+          "1. Модуль ResponseInputItem инициализирует image_index = 0",
+          "2. Модуль ResponseInputItem для UserInput::Text → добавляет ContentItem::InputText{text}",
+          "3. Модуль ResponseInputItem для UserInput::Image → image_index++, добавляет [InputText(<image>), InputImage{image_url}, InputText(</image>)]",
+          "4. Модуль ResponseInputItem для UserInput::LocalImage → image_index++, читает файл через std::fs::read; при успехе → local_image_content_items_with_label_number (PromptImageMode::ResizeToFit, label_number=Some(image_index))",
+          "5. Модуль ResponseInputItem для UserInput::Skill и Mention → возвращает Vec::new() (tool bodies injected later in core)",
+          "6. Модуль ResponseInputItem оборачивает собранный content в Message{role: \"user\", content}"
+        ],
+        "extensions (Cockburn)": [
+          {"step": 4, "condition": "std::fs::read падает с IO ошибкой", "action": "добавляется local_image_error_placeholder с текстом «Codex could not read the local image at `{path}`: {err}»"},
+          {"step": 4, "condition": "изображение не декодируется — ImageProcessingError::Decode is_invalid_image", "action": "добавляется invalid_image_error_placeholder («Image located at `{path}` is invalid: {err}»)"},
+          {"step": 4, "condition": "ImageProcessingError::UnsupportedImageFormat", "action": "добавляется unsupported_image_error_placeholder («Codex cannot attach image at `{path}`: unsupported image `{mime}`»)"},
+          {"step": 4, "condition": "ImageProcessingError::Read / Encode / Decode без is_invalid_image", "action": "добавляется local_image_error_placeholder"}
+        ],
+        "edge_cases": [
+          {"condition": "Vec<UserInput> пуст", "action": "content пуст, возвращается Message{role: user, content: []}"}
+        ],
+        "lifecycle": null,
+        "ux": null,
+        "result": "ResponseInputItem::Message{role: user, content} — плоский поток ContentItem с правильно обёрнутыми изображениями и placeholders при ошибках"
+      }
+    },
+    {
+      "id": "SRC-0001/uc.sub/convert-response-input-to-response-item",
+      "src": "SRC-0001",
+      "composition": "use_case",
+      "level": "sub",
+      "strategic_domain": null,
+      "terms": {
+        "actor": "Модуль ResponseItem (models.rs) — From<ResponseInputItem>",
+        "goal": "Преобразовать ResponseInputItem в ResponseItem с специальной обработкой MCP outputs",
+        "steps": [
+          "1. Модуль ResponseItem получает ResponseInputItem",
+          "2. Модуль ResponseItem для Message{role, content} → Message{role, content, id: None, end_turn: None, phase: None}",
+          "3. Модуль ResponseItem для FunctionCallOutput{call_id, output} → FunctionCallOutput{call_id, output}",
+          "4. Модуль ResponseItem для McpToolCallOutput{call_id, output: CallToolResult} → вызывает output.into_function_call_output_payload() и возвращает FunctionCallOutput{call_id, payload}",
+          "5. Модуль ResponseItem для CustomToolCallOutput{call_id, name, output} → CustomToolCallOutput{call_id, name, output}",
+          "6. Модуль ResponseItem для ToolSearchOutput{call_id, status, execution, tools} → ToolSearchOutput{call_id: Some(call_id), status, execution, tools}"
+        ],
+        "extensions (Cockburn)": null,
+        "edge_cases": null,
+        "lifecycle": null,
+        "ux": null,
+        "result": "ResponseItem с эквивалентным содержимым, где MCP output сконвертирован в function call output payload, а ToolSearchOutput получил Some(call_id)"
+      }
+    },
+    {
+      "id": "SRC-0001/uc.sub/convert-mcp-call-tool-result-to-payload",
+      "src": "SRC-0001",
+      "composition": "use_case",
+      "level": "sub",
+      "strategic_domain": null,
+      "terms": {
+        "actor": "Модуль CallToolResult (models.rs) — as_function_call_output_payload",
+        "goal": "Преобразовать MCP CallToolResult в FunctionCallOutputPayload с сохранением structured content или изображений",
+        "steps": [
+          "1. Модуль CallToolResult проверяет наличие structured_content (Some и не null)",
+          "2. Модуль CallToolResult если structured_content есть → serde_json::to_string(structured_content); успех → FunctionCallOutputPayload{body: Text(serialized), success: Some(self.success())}",
+          "3. Модуль CallToolResult если structured_content нет → serde_json::to_string(&self.content); успех → продолжение; ошибка → Text(err), success: Some(false)",
+          "4. Модуль CallToolResult вызывает convert_mcp_content_to_items(&self.content)",
+          "5. Модуль CallToolResult если saw_image=true → body = ContentItems(items), иначе body = Text(serialized_content)",
+          "6. Модуль CallToolResult возвращает FunctionCallOutputPayload{body, success: Some(self.success())}"
+        ],
+        "extensions (Cockburn)": [
+          {"step": 2, "condition": "serde_json::to_string(structured_content) падает", "action": "возврат Text(err.to_string()) c success: Some(false)"},
+          {"step": 3, "condition": "serde_json::to_string(&self.content) падает", "action": "возврат Text(err.to_string()) c success: Some(false)"},
+          {"step": 4, "condition": "MCP Image с data-URL префиксом data:", "action": "используется data as-is"},
+          {"step": 4, "condition": "MCP Image без data: префикса", "action": "формируется data:{mime_type или application/octet-stream};base64,{data}"},
+          {"step": 4, "condition": "MCP Image имеет _meta.codex/imageDetail = \"original\"", "action": "detail = Some(ImageDetail::Original); любые другие значения (high и т.п.) → None"},
+          {"step": 4, "condition": "MCP content имеет неизвестный тип или ошибку deserialize", "action": "оборачивается в InputText с serde_json::to_string(content) либо «<content>» fallback"}
+        ],
+        "edge_cases": [
+          {"condition": "is_error = Some(true)", "action": "success() = false; соответствующий success в payload"},
+          {"condition": "contents пуст", "action": "convert_mcp_content_to_items возвращает None (saw_image=false); используется body = Text(serialized)"}
+        ],
+        "lifecycle": null,
+        "ux": null,
+        "result": "FunctionCallOutputPayload с body (Text или ContentItems), success корректно отражает is_error"
+      }
+    },
+    {
+      "id": "SRC-0001/uc.sub/compute-writable-roots-with-cwd",
+      "src": "SRC-0001",
+      "composition": "use_case",
+      "level": "sub",
+      "strategic_domain": null,
+      "terms": {
+        "actor": "Модуль SandboxPolicy (protocol.rs) — get_writable_roots_with_cwd",
+        "goal": "Вычислить список WritableRoot с per-root read-only subpaths для текущей sandbox policy и cwd",
+        "steps": [
+          "1. Модуль SandboxPolicy сопоставляет self: DangerFullAccess/ExternalSandbox/ReadOnly → возвращает Vec::new()",
+          "2. Модуль SandboxPolicy для WorkspaceWrite{writable_roots, exclude_tmpdir_env_var, exclude_slash_tmp, ...} копирует writable_roots в roots",
+          "3. Модуль SandboxPolicy пытается AbsolutePathBuf::from_absolute_path(cwd); при успехе push; при Err — логирует error и продолжает",
+          "4. Модуль SandboxPolicy если cfg!(unix) && !exclude_slash_tmp → пытается /tmp: если is_dir → push; при Err — логирует",
+          "5. Модуль SandboxPolicy если !exclude_tmpdir_env_var && TMPDIR env var существует и непуст → пытается AbsolutePathBuf::from_absolute_path(TMPDIR); push при успехе",
+          "6. Модуль SandboxPolicy для каждого writable_root вычисляет read_only_subpaths через default_read_only_subpaths_for_writable_root(writable_root, protect_missing_dot_codex=cwd_root.is_some && ==writable_root)",
+          "7. Модуль SandboxPolicy возвращает Vec<WritableRoot>"
+        ],
+        "extensions (Cockburn)": [
+          {"step": 3, "condition": "cwd не абсолютный", "action": "error логируется через tracing::error, cwd не добавляется в roots"},
+          {"step": 4, "condition": "не Unix платформа или exclude_slash_tmp = true", "action": "/tmp пропускается"},
+          {"step": 4, "condition": "/tmp существует, но не является директорией", "action": "/tmp пропускается (is_dir = false)"},
+          {"step": 5, "condition": "exclude_tmpdir_env_var = true", "action": "TMPDIR пропускается даже если установлен"},
+          {"step": 5, "condition": "TMPDIR не установлен или пустой", "action": "TMPDIR пропускается"},
+          {"step": 5, "condition": "TMPDIR содержит невалидный path", "action": "error логируется, TMPDIR пропускается"}
+        ],
+        "edge_cases": [
+          {"condition": "writable_roots пуст и cwd невалиден", "action": "roots включает только /tmp и/или TMPDIR (если доступны)"}
+        ],
+        "lifecycle": null,
+        "ux": null,
+        "result": "Vec<WritableRoot> — все пути в которые можно писать с вложенными read-only subpaths для каждого (.git, .agents, .codex)"
+      }
+    },
+    {
+      "id": "SRC-0001/uc.sub/compute-read-only-subpaths-for-root",
+      "src": "SRC-0001",
+      "composition": "use_case",
+      "level": "sub",
+      "strategic_domain": null,
+      "terms": {
+        "actor": "Модуль SandboxPolicy (protocol.rs) — default_read_only_subpaths_for_writable_root",
+        "goal": "Определить какие поддиректории внутри writable root должны оставаться read-only для защиты агента",
+        "steps": [
+          "1. Модуль SandboxPolicy создаёт пустой subpaths и проверяет top_level .git",
+          "2. Модуль SandboxPolicy если top_level_git is_file (git worktree/submodule pointer) → проверяет is_git_pointer_file → если pointer, вызывает resolve_gitdir_from_file → push'ит gitdir",
+          "3. Модуль SandboxPolicy при наличии .git (file или dir) → push'ит top_level_git в subpaths",
+          "4. Модуль SandboxPolicy проверяет top_level .agents: если is_dir → push",
+          "5. Модуль SandboxPolicy проверяет top_level .codex: если is_dir или protect_missing_dot_codex (когда writable_root == cwd) → push",
+          "6. Модуль SandboxPolicy дедуплицирует subpaths (HashSet по PathBuf) сохраняя порядок",
+          "7. Модуль SandboxPolicy возвращает deduped Vec<AbsolutePathBuf>"
+        ],
+        "extensions (Cockburn)": [
+          {"step": 2, "condition": "файл .git найден, но не pointer (не начинается с gitdir:)", "action": "resolve_gitdir_from_file возвращает None, только .git сам добавляется в subpaths"},
+          {"step": 2, "condition": "pointer ссылается на несуществующий путь", "action": "resolve_gitdir_from_file логирует error и возвращает None"},
+          {"step": 2, "condition": "IO ошибка чтения .git файла", "action": "logs error, возвращает None"},
+          {"step": 5, "condition": "writable_root == cwd но .codex ещё не создан", "action": "protect_missing_dot_codex=true → .codex всё равно добавляется для первичной защиты"}
+        ],
+        "edge_cases": [
+          {"condition": "ни .git, ни .agents, ни .codex не существуют и writable_root != cwd", "action": "возвращается пустой Vec"},
+          {"condition": "gitdir pointer pustoy после `gitdir:`", "action": "logs error, возвращает None"}
+        ],
+        "lifecycle": null,
+        "ux": null,
+        "result": "Vec<AbsolutePathBuf> — защищённые subpaths под writable root: .git (+resolved gitdir при worktree), .agents, .codex"
+      }
+    },
+    {
+      "id": "SRC-0001/uc.sub/compute-readable-roots-with-cwd",
+      "src": "SRC-0001",
+      "composition": "use_case",
+      "level": "sub",
+      "strategic_domain": null,
+      "terms": {
+        "actor": "Модуль SandboxPolicy/ReadOnlyAccess (protocol.rs) — get_readable_roots_with_cwd",
+        "goal": "Вычислить список readable roots для restricted read-access политики",
+        "steps": [
+          "1. Модуль SandboxPolicy сопоставляет self: DangerFullAccess/ExternalSandbox → возвращает Vec::new()",
+          "2. Модуль SandboxPolicy для ReadOnly{access} → вызывает access.get_readable_roots_with_cwd(cwd)",
+          "3. Модуль SandboxPolicy для WorkspaceWrite → получает roots от read_only_access, затем extend'ит получаемыми writable roots (только root-путями)",
+          "4. Модуль SandboxPolicy в ReadOnlyAccess: FullAccess → возвращает Vec::new(); Restricted → копирует readable_roots, пытается добавить cwd (при Err — логирует error)",
+          "5. Модуль SandboxPolicy дедуплицирует через HashSet по PathBuf"
+        ],
+        "extensions (Cockburn)": [
+          {"step": 4, "condition": "cwd не абсолютный", "action": "error логируется, cwd не добавляется в roots"}
+        ],
+        "edge_cases": [
+          {"condition": "FullAccess при любой политике", "action": "возвращается пустой Vec (callers должны давать blanket access)"}
+        ],
+        "lifecycle": null,
+        "ux": null,
+        "result": "Vec<AbsolutePathBuf> — readable roots с учётом cwd и writable roots (для WorkspaceWrite)"
+      }
+    },
+    {
+      "id": "SRC-0001/uc.sub/compute-percent-of-context-window-remaining",
+      "src": "SRC-0001",
+      "composition": "use_case",
+      "level": "sub",
+      "strategic_domain": null,
+      "terms": {
+        "actor": "Модуль TokenUsage (protocol.rs) — percent_of_context_window_remaining",
+        "goal": "Оценить процент оставшегося user-controllable context window для отображения в UI",
+        "steps": [
+          "1. Модуль TokenUsage проверяет context_window <= BASELINE_TOKENS → возврат 0",
+          "2. Модуль TokenUsage вычисляет effective_window = context_window - BASELINE_TOKENS",
+          "3. Модуль TokenUsage вычисляет used = max(tokens_in_context_window() - BASELINE_TOKENS, 0)",
+          "4. Модуль TokenUsage вычисляет remaining = max(effective_window - used, 0)",
+          "5. Модуль TokenUsage возвращает round((remaining / effective_window) * 100.0) clamp 0..100 as i64"
+        ],
+        "extensions (Cockburn)": [
+          {"step": 1, "condition": "context_window == 0 или <= BASELINE_TOKENS (12000)", "action": "возврат 0 (модель не имеет effective user space)"}
+        ],
+        "edge_cases": [
+          {"condition": "total_tokens ниже BASELINE_TOKENS (например сразу после первого prompt)", "action": "used = 0, UI показывает ~100% remaining"},
+          {"condition": "total_tokens превышает context_window", "action": "used > effective_window → remaining = 0, UI показывает 0%"}
+        ],
+        "lifecycle": null,
+        "ux": ["UI показывает процент оставшегося контекста, тренд от 100% к 0% по мере заполнения окна"],
+        "result": "i64 — процент 0..100 оставшегося user-controllable контекста после вычета BASELINE_TOKENS=12000"
+      }
+    },
+    {
+      "id": "SRC-0001/uc.sub/append-token-usage",
+      "src": "SRC-0001",
+      "composition": "use_case",
+      "level": "sub",
+      "strategic_domain": null,
+      "terms": {
+        "actor": "Модуль TokenUsageInfo (protocol.rs) — new_or_append + append_last_usage",
+        "goal": "Аккумулировать usage очередного turn в существующий TokenUsageInfo или инициализировать новый",
+        "steps": [
+          "1. Модуль TokenUsageInfo проверяет info.is_none() && last.is_none() → возвращает None",
+          "2. Модуль TokenUsageInfo если info=Some → клонирует; иначе инициализирует с TokenUsage::default и model_context_window",
+          "3. Модуль TokenUsageInfo если last=Some → append_last_usage: total_token_usage.add_assign(last) (element-wise suma всех 5 полей), last_token_usage = last.clone()",
+          "4. Модуль TokenUsageInfo если model_context_window=Some → перезаписывает поле",
+          "5. Модуль TokenUsageInfo возвращает Some(info)"
+        ],
+        "extensions (Cockburn)": [
+          {"step": 1, "condition": "оба аргумента None", "action": "возвращается None — нет данных для агрегации"}
+        ],
+        "edge_cases": [
+          {"condition": "существующий info без model_context_window и новый тоже None", "action": "model_context_window остаётся None"}
+        ],
+        "lifecycle": null,
+        "ux": null,
+        "result": "Option<TokenUsageInfo> — агрегированный usage для сессии или None если нет входных данных"
+      }
+    },
+    {
+      "id": "SRC-0001/uc.sub/fill-token-usage-to-context-window",
+      "src": "SRC-0001",
+      "composition": "use_case",
+      "level": "sub",
+      "strategic_domain": null,
+      "terms": {
+        "actor": "Модуль TokenUsageInfo (protocol.rs) — fill_to_context_window",
+        "goal": "После компакции заполнить usage так, чтобы отражать использование всего context_window",
+        "steps": [
+          "1. Модуль TokenUsageInfo фиксирует previous_total = self.total_token_usage.total_tokens",
+          "2. Модуль TokenUsageInfo вычисляет delta = max(context_window - previous_total, 0)",
+          "3. Модуль TokenUsageInfo перезаписывает model_context_window = Some(context_window)",
+          "4. Модуль TokenUsageInfo устанавливает total_token_usage = TokenUsage{total_tokens: context_window, остальные 0}",
+          "5. Модуль TokenUsageInfo устанавливает last_token_usage = TokenUsage{total_tokens: delta, остальные 0}"
+        ],
+        "extensions (Cockburn)": [
+          {"step": 2, "condition": "previous_total > context_window", "action": "delta = 0 (защищено max)"}
+        ],
+        "edge_cases": [
+          {"condition": "первый вызов при total_token_usage = default", "action": "delta = context_window, last_token_usage.total_tokens = context_window"}
+        ],
+        "lifecycle": null,
+        "ux": null,
+        "result": "TokenUsageInfo с total_tokens = context_window, отражающий заполненность окна после компакции"
+      }
+    },
+    {
+      "id": "SRC-0001/uc.sub/parse-session-source-from-arg",
+      "src": "SRC-0001",
+      "composition": "use_case",
+      "level": "sub",
+      "strategic_domain": null,
+      "terms": {
+        "actor": "Модуль SessionSource (protocol.rs) — from_startup_arg",
+        "goal": "Распознать источник сессии из аргумента CLI/startup с поддержкой алиасов",
+        "steps": [
+          "1. Модуль SessionSource trim'ит value; если пусто → Err('session source must not be empty')",
+          "2. Модуль SessionSource приводит к ascii lowercase",
+          "3. Модуль SessionSource сопоставляет: cli → Cli; vscode → VSCode; exec → Exec; mcp/appserver/app-server/app_server → Mcp; unknown → Unknown",
+          "4. Модуль SessionSource иначе возвращает Custom(normalized)"
+        ],
+        "extensions (Cockburn)": [
+          {"step": 1, "condition": "value состоит только из whitespace", "action": "trim даёт empty → Err"},
+          {"step": 4, "condition": "unknown string", "action": "сохраняется как SessionSource::Custom с нормализованным lowercase именем"}
+        ],
+        "edge_cases": [
+          {"condition": "value=' Atlas '", "action": "после trim и lowercase → Custom('atlas')"}
+        ],
+        "lifecycle": null,
+        "ux": null,
+        "result": "Result<SessionSource, &'static str> — Ok(enum variant) или Err сообщения об ошибке пустого входа"
+      }
+    },
+    {
+      "id": "SRC-0001/uc.sub/match-session-to-product-restriction",
+      "src": "SRC-0001",
+      "composition": "use_case",
+      "level": "sub",
+      "strategic_domain": null,
+      "terms": {
+        "actor": "Модуль SessionSource (protocol.rs) — restriction_product + matches_product_restriction",
+        "goal": "Определить может ли сессия исполнять ограниченные продуктом возможности",
+        "steps": [
+          "1. Модуль SessionSource вычисляет restriction_product: Custom → Product::from_session_source_name; Cli/VSCode/Exec/Mcp/Unknown → Some(Product::Codex); SubAgent → None",
+          "2. Модуль SessionSource если products.is_empty() → возвращает true (нет ограничений)",
+          "3. Модуль SessionSource иначе вызывает product.matches_product_restriction(products): products.is_empty() || products.contains(self)",
+          "4. Модуль SessionSource если restriction_product = None → возвращает false"
+        ],
+        "extensions (Cockburn)": [
+          {"step": 1, "condition": "Custom('atlas-dev')", "action": "from_session_source_name возвращает None (только chatgpt/codex/atlas распознаются), соответствует ограничениям только для products.is_empty()"},
+          {"step": 4, "condition": "SubAgent source", "action": "restriction_product = None — не подлежит product-ограничениям (false для непустого списка)"}
+        ],
+        "edge_cases": [
+          {"condition": "products = [] (пустой список ограничений)", "action": "matches всегда true для любого SessionSource"}
+        ],
+        "lifecycle": null,
+        "ux": null,
+        "result": "bool — разрешено ли использование данной сессии при указанных продуктовых ограничениях"
+      }
+    },
+    {
+      "id": "SRC-0001/uc.sub/build-developer-instructions-from-policy",
+      "src": "SRC-0001",
+      "composition": "use_case",
+      "level": "sub",
+      "strategic_domain": null,
+      "terms": {
+        "actor": "Модуль DeveloperInstructions (models.rs) — from_policy + from_permissions_with_network",
+        "goal": "Сгенерировать DeveloperInstructions текст для инъекции в turn исходя из sandbox/network/approval политик",
+        "steps": [
+          "1. Модуль DeveloperInstructions определяет network_access: если sandbox_policy.has_full_network_access() → Enabled, иначе Restricted",
+          "2. Модуль DeveloperInstructions определяет sandbox_mode и writable_roots: DangerFullAccess → DangerFullAccess, None; ReadOnly → ReadOnly, None; ExternalSandbox → DangerFullAccess, None; WorkspaceWrite → WorkspaceWrite, Some(get_writable_roots_with_cwd)",
+          "3. Модуль DeveloperInstructions вызывает from_permissions_with_network(sandbox_mode, network_access, config, writable_roots)",
+          "4. Модуль DeveloperInstructions собирает текст через concat: <permissions instructions> + sandbox_text(template rendered) + approval instructions + writable_roots suffix + </permissions instructions>",
+          "5. Модуль DeveloperInstructions возвращает DeveloperInstructions{text}"
+        ],
+        "extensions (Cockburn)": [
+          {"step": 4, "condition": "approval_policy = Never", "action": "используется APPROVAL_POLICY_NEVER include_str"},
+          {"step": 4, "condition": "approval_policy = UnlessTrusted", "action": "APPROVAL_POLICY_UNLESS_TRUSTED + request_permissions_tool_prompt_section если request_permissions_tool_enabled"},
+          {"step": 4, "condition": "approval_policy = OnFailure", "action": "APPROVAL_POLICY_ON_FAILURE + request_permissions section"},
+          {"step": 4, "condition": "approval_policy = OnRequest", "action": "APPROVAL_POLICY_ON_REQUEST_RULE или APPROVAL_POLICY_ON_REQUEST_RULE_REQUEST_PERMISSION (если exec_permission_approvals_enabled) + request_permissions section + approved command prefixes"},
+          {"step": 4, "condition": "approval_policy = Granular", "action": "granular_instructions: intro + prompted/rejected categories (по GranularApprovalConfig) + command_permission instructions (если shell_permission_requests_available) + request_permissions_tool_prompt (если request_permissions_tool_prompts_allowed) + approved command prefixes"},
+          {"step": 4, "condition": "approvals_reviewer=GuardianSubagent && approval_policy != Never", "action": "append GUARDIAN_SUBAGENT_APPROVAL_SUFFIX ('materially safer alternative')"},
+          {"step": 3, "condition": "writable_roots=None", "action": "from_writable_roots возвращает пустую DeveloperInstructions — secция roots не добавляется"},
+          {"step": 3, "condition": "writable_roots=Some(empty)", "action": "возвращается пустая инструкция"},
+          {"step": 3, "condition": "writable_roots.len() == 1", "action": "' The writable root is `{path}`.'"},
+          {"step": 3, "condition": "writable_roots.len() > 1", "action": "' The writable roots are `{path1}`, `{path2}`, ...'"}
+        ],
+        "edge_cases": [
+          {"condition": "exec_policy пустой (нет prefix rules)", "action": "approved_command_prefixes_text возвращает None, секция 'Approved command prefixes' не добавляется"},
+          {"condition": "rendered prefix text превышает MAX_ALLOW_PREFIX_TEXT_BYTES (5000)", "action": "список truncates до последнего UTF-8 char с добавлением TRUNCATED_MARKER '...[Some commands were truncated]'"},
+          {"condition": "> MAX_RENDERED_PREFIXES (100)", "action": "берутся первые 100 после sort (len, combined_str_len, alphabetical); добавляется TRUNCATED_MARKER"}
+        ],
+        "lifecycle": null,
+        "ux": null,
+        "result": "DeveloperInstructions{text} — обёрнутое <permissions instructions> тело с sandbox/approval/writable_roots/prefix секциями; ConvertTo'ed в ResponseItem::Message{role: developer}"
+      }
+    },
+    {
+      "id": "SRC-0001/uc.sub/sandbox-text-from-mode",
+      "src": "SRC-0001",
+      "composition": "use_case",
+      "level": "sub",
+      "strategic_domain": null,
+      "terms": {
+        "actor": "Модуль DeveloperInstructions (models.rs) — sandbox_text",
+        "goal": "Отрендерить шаблон sandbox-инструкции под конкретный режим с подстановкой network access",
+        "steps": [
+          "1. Модуль DeveloperInstructions выбирает template: DangerFullAccess → SANDBOX_MODE_DANGER_FULL_ACCESS_TEMPLATE; WorkspaceWrite → SANDBOX_MODE_WORKSPACE_WRITE_TEMPLATE; ReadOnly → SANDBOX_MODE_READ_ONLY_TEMPLATE",
+          "2. Модуль DeveloperInstructions берёт network_access.to_string() (kebab-case: 'enabled' или 'restricted')",
+          "3. Модуль DeveloperInstructions рендерит template с переменной network_access (Template::render)",
+          "4. Модуль DeveloperInstructions возвращает DeveloperInstructions::new(text)"
+        ],
+        "extensions (Cockburn)": [
+          {"step": 3, "condition": "Template::render возвращает Err", "action": "panic! с сообщением 'sandbox template must render' — fail-fast на invalid static template"}
+        ],
+        "edge_cases": null,
+        "lifecycle": null,
+        "ux": null,
+        "result": "DeveloperInstructions с текстом соответствующего sandbox template и подставленным network_access"
+      }
+    },
+    {
+      "id": "SRC-0001/uc.sub/convert-compacted-item-to-response-item",
+      "src": "SRC-0001",
+      "composition": "use_case",
+      "level": "sub",
+      "strategic_domain": null,
+      "terms": {
+        "actor": "Модуль CompactedItem (protocol.rs) — From<CompactedItem> for ResponseItem",
+        "goal": "Преобразовать компактифицированный элемент в Message от assistant для replay в history",
+        "steps": [
+          "1. Модуль CompactedItem берёт message из CompactedItem",
+          "2. Модуль CompactedItem создаёт ResponseItem::Message{id: None, role: 'assistant', content: [OutputText{text: message}], end_turn: None, phase: None}"
+        ],
+        "extensions (Cockburn)": null,
+        "edge_cases": [
+          {"condition": "message пуст", "action": "OutputText с пустой строкой"}
+        ],
+        "lifecycle": null,
+        "ux": null,
+        "result": "ResponseItem::Message с assistant ролью и OutputText содержимым компакции"
+      }
+    },
+    {
+      "id": "SRC-0001/uc.sub/scan-initial-history",
+      "src": "SRC-0001",
+      "composition": "use_case",
+      "level": "sub",
+      "strategic_domain": null,
+      "terms": {
+        "actor": "Модуль InitialHistory (protocol.rs) — scan_rollout_items / forked_from_id / session_cwd / get_event_msgs / get_base_instructions / get_dynamic_tools",
+        "goal": "Извлекать метаданные из истории thread для resume/fork восстановления",
+        "steps": [
+          "1. Модуль InitialHistory обрабатывает варианты: New/Cleared → возвращает пустой результат (false/None/Vec::new())",
+          "2. Модуль InitialHistory для Resumed(resumed) → итерирует resumed.history",
+          "3. Модуль InitialHistory для Forked(items) → итерирует items",
+          "4. Модуль InitialHistory применяет аккуратную операцию: any предикат (scan), find_map на SessionMeta (forked_from_id/session_cwd/base_instructions/dynamic_tools), filter_map на EventMsg (get_event_msgs), clone (get_rollout_items)"
+        ],
+        "extensions (Cockburn)": [
+          {"step": 4, "condition": "forked_from_id: Resumed → из SessionMeta.forked_from_id; Forked → из SessionMeta.id (собственный id)", "action": "для Forked возвращается id сессии-источника, не .forked_from_id"}
+        ],
+        "edge_cases": [
+          {"condition": "history не содержит SessionMeta", "action": "forked_from_id/session_cwd/base_instructions/dynamic_tools возвращают None"},
+          {"condition": "history не содержит EventMsg", "action": "get_event_msgs возвращает Some(Vec::new())"}
+        ],
+        "lifecycle": {
+          "entity": "SRC-0001/entity/initial-history",
+          "states": ["New", "Cleared", "Resumed", "Forked"],
+          "transition": null
+        },
+        "ux": null,
+        "result": "Запрошенный срез метаданных (id, cwd, instructions, dynamic_tools, event messages) или пустой результат для New/Cleared"
+      }
+    },
+    {
+      "id": "SRC-0001/uc.sub/serialize-thread-id",
+      "src": "SRC-0001",
+      "composition": "use_case",
+      "level": "sub",
+      "strategic_domain": null,
+      "terms": {
+        "actor": "Модуль ThreadId (thread_id.rs) — Serialize + Deserialize + JsonSchema + TryFrom",
+        "goal": "Обеспечить wire-представление ThreadId как UUID-строки при сохранении типобезопасности",
+        "steps": [
+          "1. Модуль ThreadId: Serialize → serializer.collect_str(&self.uuid) (строка)",
+          "2. Модуль ThreadId: Deserialize → String::deserialize; Uuid::parse_str; при Err → serde::de::Error::custom",
+          "3. Модуль ThreadId: JsonSchema → schema_name='ThreadId', json_schema = <String>::json_schema",
+          "4. Модуль ThreadId: TryFrom<&str>/TryFrom<String> → from_string через Uuid::parse_str",
+          "5. Модуль ThreadId: Default → new() → Uuid::now_v7() (time-ordered UUID)",
+          "6. Модуль ThreadId: Display → делегирует на uuid"
+        ],
+        "extensions (Cockburn)": [
+          {"step": 2, "condition": "невалидная UUID строка на wire", "action": "возвращается serde::de::Error::custom с сообщением parse error"},
+          {"step": 4, "condition": "невалидный UUID в try_from", "action": "возвращается uuid::Error"}
+        ],
+        "edge_cases": [
+          {"condition": "Default создан и не был переопределён", "action": "Uuid::now_v7() гарантированно не zero (test: ThreadId::default().uuid != Uuid::nil())"}
+        ],
+        "lifecycle": null,
+        "ux": null,
+        "result": "Thread-safe UUID v7 идентификатор с bidirectional wire мэппингом на строку и JsonSchema как String"
+      }
+    },
+    {
+      "id": "SRC-0001/uc.sub/display-tool-name",
+      "src": "SRC-0001",
+      "composition": "use_case",
+      "level": "sub",
+      "strategic_domain": null,
+      "terms": {
+        "actor": "Модуль ToolName (tool_name.rs) — display + fmt::Display + From<String>/<&str>",
+        "goal": "Предоставить представление tool name с опциональным namespace-префиксом",
+        "steps": [
+          "1. Модуль ToolName: display/fmt::Display — match self.namespace",
+          "2. Модуль ToolName: если Some(namespace) → format!(\"{namespace}{name}\")",
+          "3. Модуль ToolName: если None → вывести только name",
+          "4. Модуль ToolName: From<String> и From<&str> → plain(name) с namespace=None",
+          "5. Модуль ToolName: конструкторы plain/namespaced/new явно задают namespace"
+        ],
+        "extensions (Cockburn)": null,
+        "edge_cases": [
+          {"condition": "namespace=Some('')", "action": "отображается как namespace (пустая строка) + name — без разделителя"},
+          {"condition": "name=''", "action": "отображается только namespace"}
+        ],
+        "lifecycle": null,
+        "ux": null,
+        "result": "Строковое представление инструмента (namespace+name или только name) через Display"
+      }
+    },
+    {
+      "id": "SRC-0001/uc.sub/compute-codex-error-affects-turn-status",
+      "src": "SRC-0001",
+      "composition": "use_case",
+      "level": "sub",
+      "strategic_domain": null,
+      "terms": {
+        "actor": "Модуль CodexErrorInfo + ErrorEvent (protocol.rs) — affects_turn_status",
+        "goal": "Определить следует ли помечать turn как failed при replay истории с ошибкой",
+        "steps": [
+          "1. Модуль CodexErrorInfo в affects_turn_status: сопоставляет self",
+          "2. Модуль CodexErrorInfo для ThreadRollbackFailed и ActiveTurnNotSteerable → возвращает false",
+          "3. Модуль CodexErrorInfo для всех остальных вариантов → true",
+          "4. Модуль ErrorEvent в affects_turn_status: codex_error_info.is_none_or(CodexErrorInfo::affects_turn_status) — если info None → true (default)"
+        ],
+        "extensions (Cockburn)": [
+          {"step": 4, "condition": "codex_error_info = None (legacy error без классификации)", "action": "is_none_or → true (default: affects turn)"}
+        ],
+        "edge_cases": [
+          {"condition": "ActiveTurnNotSteerable{turn_kind: Review или Compact}", "action": "не affects turn status — ошибка касается невозможности вмешательства, а не провала turn"}
+        ],
+        "lifecycle": null,
+        "ux": null,
+        "result": "bool — true если эту ошибку нужно учитывать как failed turn при replay; false для infrastructural rollback/steer отказов"
+      }
+    },
+    {
+      "id": "SRC-0001/uc.sub/determine-mcp-tool-call-success",
+      "src": "SRC-0001",
+      "composition": "use_case",
+      "level": "sub",
+      "strategic_domain": null,
+      "terms": {
+        "actor": "Модуль McpToolCallEndEvent (protocol.rs) — is_success",
+        "goal": "Определить успешность завершения MCP tool call на основе результата",
+        "steps": [
+          "1. Модуль McpToolCallEndEvent матчит self.result",
+          "2. Модуль McpToolCallEndEvent для Ok(result) → возвращает !result.is_error.unwrap_or(false)",
+          "3. Модуль McpToolCallEndEvent для Err(_) → возвращает false"
+        ],
+        "extensions (Cockburn)": [
+          {"step": 2, "condition": "result.is_error = None", "action": "unwrap_or(false) даёт false → возвращается true (success)"},
+          {"step": 2, "condition": "result.is_error = Some(true)", "action": "возвращается false"}
+        ],
+        "edge_cases": null,
+        "lifecycle": null,
+        "ux": null,
+        "result": "bool — true если tool call успешен, false при ошибке транспорта или is_error=true в CallToolResult"
+      }
+    },
+    {
+      "id": "SRC-0001/uc.sub/convert-collab-event-to-event-msg",
+      "src": "SRC-0001",
+      "composition": "use_case",
+      "level": "sub",
+      "strategic_domain": null,
+      "terms": {
+        "actor": "Модуль protocol (protocol.rs) — From<Collab*Event> for EventMsg (10 impls)",
+        "goal": "Автоматически конвертировать отдельные типы событий collab lifecycle в соответствующие варианты EventMsg",
+        "steps": [
+          "1. Модуль protocol предоставляет 10 impl From: для CollabAgentSpawnBeginEvent, CollabAgentSpawnEndEvent, CollabAgentInteractionBeginEvent, CollabAgentInteractionEndEvent, CollabWaitingBeginEvent, CollabWaitingEndEvent, CollabCloseBeginEvent, CollabCloseEndEvent, CollabResumeBeginEvent, CollabResumeEndEvent",
+          "2. Модуль protocol каждый impl оборачивает event в соответствующий EventMsg variant"
+        ],
+        "extensions (Cockburn)": null,
+        "edge_cases": null,
+        "lifecycle": null,
+        "ux": null,
+        "result": "EventMsg соответствующего collab variant — удобное преобразование без ручного матчинга"
+      }
+    },
+    {
+      "id": "SRC-0001/uc.sub/derive-truncation-budget",
+      "src": "SRC-0001",
+      "composition": "use_case",
+      "level": "sub",
+      "strategic_domain": null,
+      "terms": {
+        "actor": "Модуль TruncationPolicy (protocol.rs) — token_budget, byte_budget, Mul<f64>, From<TruncationPolicyConfig>",
+        "goal": "Предоставить бюджет в токенах или байтах для применения truncation независимо от исходной единицы",
+        "steps": [
+          "1. Модуль TruncationPolicy token_budget: Bytes(b) → approx_tokens_from_byte_count(b) (usize fallback MAX); Tokens(t) → t",
+          "2. Модуль TruncationPolicy byte_budget: Bytes(b) → b; Tokens(t) → approx_bytes_for_tokens(t)",
+          "3. Модуль TruncationPolicy Mul<f64>: каждая ветка умножает значение на multiplier и берёт ceil",
+          "4. Модуль TruncationPolicy From<TruncationPolicyConfig>: config.mode=Bytes → Self::Bytes(config.limit as usize); mode=Tokens → Self::Tokens(config.limit as usize)"
+        ],
+        "extensions (Cockburn)": [
+          {"step": 1, "condition": "approx_tokens_from_byte_count возвращает значение > usize::MAX", "action": "usize::try_from fallback на usize::MAX"}
+        ],
+        "edge_cases": [
+          {"condition": "multiplier < 0 в Mul", "action": "ceil отрицательного float может быть 0 (float to usize — защита в исходнике через ceil как usize)"}
+        ],
+        "lifecycle": null,
+        "ux": null,
+        "result": "usize бюджет в запрошенной единице; масштабируется через Mul; конструируется из config"
+      }
+    },
+    {
+      "id": "SRC-0001/uc.sub/render-writable-root-path",
+      "src": "SRC-0001",
+      "composition": "use_case",
+      "level": "sub",
+      "strategic_domain": null,
+      "terms": {
+        "actor": "Модуль WritableRoot (protocol.rs) — is_path_writable",
+        "goal": "Определить можно ли писать по указанному пути при данном writable root",
+        "steps": [
+          "1. Модуль WritableRoot проверяет path.starts_with(&self.root); если нет → false",
+          "2. Модуль WritableRoot итерирует read_only_subpaths",
+          "3. Модуль WritableRoot если path.starts_with(subpath) → возвращает false",
+          "4. Модуль WritableRoot иначе возвращает true"
+        ],
+        "extensions (Cockburn)": null,
+        "edge_cases": [
+          {"condition": "path == self.root", "action": "starts_with=true, subpaths проверяются; если root не в read_only_subpaths → true"},
+          {"condition": "path под read_only subpath .git/.codex/.agents", "action": "возвращает false — запись блокируется"}
+        ],
+        "lifecycle": null,
+        "ux": null,
+        "result": "bool — разрешает ли агенту запись по указанному пути с учётом read-only subpaths"
+      }
+    },
+    {
+      "id": "SRC-0001/uc.sub/resolve-gitdir-pointer",
+      "src": "SRC-0001",
+      "composition": "use_case",
+      "level": "sub",
+      "strategic_domain": null,
+      "terms": {
+        "actor": "Модуль SandboxPolicy (protocol.rs) — resolve_gitdir_from_file + is_git_pointer_file",
+        "goal": "Разрешить реальный gitdir для worktree/submodule когда .git — файл-указатель",
+        "steps": [
+          "1. Модуль SandboxPolicy is_git_pointer_file: path.as_path().is_file() && file_name == '.git'",
+          "2. Модуль SandboxPolicy читает файл через std::fs::read_to_string",
+          "3. Модуль SandboxPolicy trim'ит содержимое",
+          "4. Модуль SandboxPolicy split_once(':') → проверяет префикс 'gitdir'",
+          "5. Модуль SandboxPolicy trim'ит правую часть (gitdir path)",
+          "6. Модуль SandboxPolicy вычисляет base = .git.parent()",
+          "7. Модуль SandboxPolicy AbsolutePathBuf::resolve_path_against_base(gitdir_raw, base)",
+          "8. Модуль SandboxPolicy проверяет gitdir_path.exists() → если нет, логирует error, возвращает None",
+          "9. Модуль SandboxPolicy возвращает Some(gitdir_path)"
+        ],
+        "extensions (Cockburn)": [
+          {"step": 2, "condition": "IO ошибка чтения .git файла", "action": "логирует error с путём, возвращает None"},
+          {"step": 4, "condition": "содержимое не содержит ':' (не матчит 'gitdir: <path>')", "action": "логирует error, возвращает None"},
+          {"step": 5, "condition": "gitdir_raw пустая строка после trim", "action": "логирует error, возвращает None"},
+          {"step": 6, "condition": "у .git нет parent (корневой путь)", "action": "логирует error, возвращает None"},
+          {"step": 8, "condition": "resolved path не существует", "action": "логирует error, возвращает None"}
+        ],
+        "edge_cases": null,
+        "lifecycle": null,
+        "ux": null,
+        "result": "Option<AbsolutePathBuf> — resolved gitdir path или None с error log для нестандартных/повреждённых pointer файлов"
+      }
+    }
+  ]
+}

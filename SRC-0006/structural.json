@@ -1,0 +1,614 @@
+{
+  "src": "SRC-0006",
+  "schema_version": "2.0",
+  "lens": "structural",
+  "compositions": [
+    {
+      "id": "SRC-0006/entity/thread-metadata",
+      "src": "SRC-0006",
+      "composition": "entity",
+      "terms": {
+        "object": "ThreadMetadata — каноническая метаданные thread (сессии Codex), извлекаемые из rollout файлов и отражаемые в SQLite",
+        "attributes": [
+          "id: ThreadId — идентификатор thread",
+          "rollout_path: PathBuf — абсолютный путь к rollout-файлу на диске",
+          "created_at: DateTime<Utc> — время создания thread",
+          "updated_at: DateTime<Utc> — время последнего обновления",
+          "source: String — session source (stringified enum: cli и др.)",
+          "agent_nickname: Option<String> — random unique nickname для AgentControl-spawned sub-agent",
+          "agent_role: Option<String> — agent_role для AgentControl-spawned sub-agent",
+          "agent_path: Option<String> — canonical agent path для AgentControl-spawned sub-agent",
+          "model_provider: String — идентификатор провайдера модели (например, 'openai')",
+          "model: Option<String> — последняя наблюдаемая модель (например, 'gpt-5')",
+          "reasoning_effort: Option<ReasoningEffort> — последний наблюдаемый уровень reasoning",
+          "cwd: PathBuf — рабочая директория thread",
+          "cli_version: String — версия CLI, создавшего thread",
+          "title: String — best-effort заголовок thread",
+          "sandbox_policy: String — sandbox policy (stringified enum)",
+          "approval_mode: String — approval mode (stringified enum: 'never', 'on-request' и др.)",
+          "tokens_used: i64 — последнее наблюдаемое использование токенов",
+          "first_user_message: Option<String> — первое user-сообщение (preview)",
+          "archived_at: Option<DateTime<Utc>> — время архивирования, если thread архивирован",
+          "git_sha: Option<String> — git commit SHA, если известен",
+          "git_branch: Option<String> — имя git branch",
+          "git_origin_url: Option<String> — URL git origin"
+        ],
+        "relationships": [
+          {"to": "SRC-0006/entity/stage1-output", "rel": "referenced_by", "card": "1:N", "note": "Stage1Output ссылается на ThreadMetadata через thread_id"},
+          {"to": "SRC-0006/entity/log-entry", "rel": "associated_with", "card": "1:N", "note": "LogEntry содержит thread_id для группировки логов по сессии"},
+          {"to": "SRC-0006/entity/agent-job-item", "rel": "assigned_to", "card": "1:N", "note": "AgentJobItem.assigned_thread_id указывает на ThreadMetadata"}
+        ],
+        "enumerations": {
+          "source": ["cli", "<остальные значения SessionSource — внешний enum codex_protocol>"],
+          "approval_mode": ["never", "on-request", "<остальные значения AskForApproval — внешний enum codex_protocol>"],
+          "sandbox_policy": ["read-only", "danger-full-access", "<остальные значения SandboxPolicy — внешний enum codex_protocol>"]
+        },
+        "data_flows": [
+          {"source": "rollout JSONL файл (RolloutItem)", "transform": "apply_rollout_item: SessionMeta → meta поля; TurnContext → cwd/model/reasoning_effort/sandbox_policy/approval_mode; EventMsg::TokenCount → tokens_used; EventMsg::UserMessage → first_user_message + title; EventMsg::ThreadNameUpdated → title", "sink": "ThreadMetadata"},
+          {"source": "ThreadMetadataBuilder (заполненный из rollout)", "transform": "build(default_provider): canonicalize timestamps, fill defaults, stringify enums", "sink": "ThreadMetadata"},
+          {"source": "SQLite строка (ThreadRow)", "transform": "TryFrom<ThreadRow>: epoch_millis_to_datetime, parse ReasoningEffort (unknown → None)", "sink": "ThreadMetadata"}
+        ],
+        "config": {
+          "default_provider": {"value": "передаётся параметром в apply_rollout_item и ThreadMetadataBuilder.build", "source": "argument default_provider: &str", "default": "если model_provider пуст — заполняется default_provider"},
+          "first_user_message_image_placeholder": {"value": "[Image]", "source": "hardcoded const IMAGE_ONLY_USER_MESSAGE_PLACEHOLDER в extract.rs", "default": "[Image]"}
+        }
+      }
+    },
+    {
+      "id": "SRC-0006/entity/agent-job",
+      "src": "SRC-0006",
+      "composition": "entity",
+      "terms": {
+        "object": "AgentJob — задание агента: партия инструкций, исполняемая по строкам входного CSV, с экспортом результатов",
+        "attributes": [
+          "id: String — идентификатор задания",
+          "name: String — имя задания",
+          "status: AgentJobStatus — текущий lifecycle status",
+          "instruction: String — инструкция, исполняемая агентом для каждой строки",
+          "auto_export: bool — автоматический экспорт результатов",
+          "max_runtime_seconds: Option<u64> — максимальное время исполнения",
+          "output_schema_json: Option<Value> — схема для structured outputs (TODO: JSON Schema)",
+          "input_headers: Vec<String> — заголовки входного CSV",
+          "input_csv_path: String — путь к входному CSV",
+          "output_csv_path: String — путь к выходному CSV",
+          "created_at: DateTime<Utc> — время создания",
+          "updated_at: DateTime<Utc> — время последнего обновления",
+          "started_at: Option<DateTime<Utc>> — время старта",
+          "completed_at: Option<DateTime<Utc>> — время завершения",
+          "last_error: Option<String> — последняя ошибка"
+        ],
+        "relationships": [
+          {"to": "SRC-0006/entity/agent-job-item", "rel": "contains", "card": "1:N", "note": "AgentJobItem.job_id ссылается на AgentJob.id"},
+          {"to": "SRC-0006/entity/agent-job-progress", "rel": "produces", "card": "1:1", "note": "Progress агрегируется по job_id"}
+        ],
+        "enumerations": {
+          "status": ["pending", "running", "completed", "failed", "cancelled"]
+        },
+        "data_flows": [
+          {"source": "AgentJobCreateParams", "transform": "создание новой записи AgentJob", "sink": "SQLite (AgentJobRow)"},
+          {"source": "SQLite (AgentJobRow)", "transform": "TryFrom<AgentJobRow>: parse status, parse output_schema_json, parse input_headers_json, epoch_seconds_to_datetime, auto_export = (i64 != 0), validate max_runtime_seconds", "sink": "AgentJob"}
+        ],
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0006/entity/agent-job-item",
+      "src": "SRC-0006",
+      "composition": "entity",
+      "terms": {
+        "object": "AgentJobItem — единичный элемент (строка входного CSV) задания агента, исполняемый ассигнованным thread",
+        "attributes": [
+          "job_id: String — идентификатор родительского AgentJob",
+          "item_id: String — идентификатор элемента",
+          "row_index: i64 — индекс строки во входном CSV",
+          "source_id: Option<String> — внешний идентификатор строки",
+          "row_json: Value — данные строки в JSON",
+          "status: AgentJobItemStatus — текущий lifecycle status элемента",
+          "assigned_thread_id: Option<String> — thread, которому ассигнован элемент",
+          "attempt_count: i64 — количество попыток",
+          "result_json: Option<Value> — результат исполнения в JSON",
+          "last_error: Option<String> — последняя ошибка",
+          "created_at: DateTime<Utc> — время создания",
+          "updated_at: DateTime<Utc> — время последнего обновления",
+          "completed_at: Option<DateTime<Utc>> — время завершения",
+          "reported_at: Option<DateTime<Utc>> — время репорта"
+        ],
+        "relationships": [
+          {"to": "SRC-0006/entity/agent-job", "rel": "belongs_to", "card": "N:1", "note": "AgentJobItem.job_id → AgentJob.id"},
+          {"to": "SRC-0006/entity/thread-metadata", "rel": "assigned_to", "card": "N:1", "note": "assigned_thread_id указывает на ThreadMetadata"}
+        ],
+        "enumerations": {
+          "status": ["pending", "running", "completed", "failed"]
+        },
+        "data_flows": [
+          {"source": "AgentJobItemCreateParams", "transform": "создание новой записи", "sink": "SQLite (AgentJobItemRow)"},
+          {"source": "SQLite (AgentJobItemRow)", "transform": "TryFrom: parse status, parse row_json и result_json, epoch_seconds_to_datetime", "sink": "AgentJobItem"}
+        ],
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0006/entity/agent-job-progress",
+      "src": "SRC-0006",
+      "composition": "entity",
+      "terms": {
+        "object": "AgentJobProgress — агрегированная сводка прогресса по элементам AgentJob",
+        "attributes": [
+          "total_items: usize — общее количество элементов",
+          "pending_items: usize — количество элементов в статусе pending",
+          "running_items: usize — количество элементов в статусе running",
+          "completed_items: usize — количество элементов в статусе completed",
+          "failed_items: usize — количество элементов в статусе failed"
+        ],
+        "relationships": [
+          {"to": "SRC-0006/entity/agent-job", "rel": "summarizes", "card": "1:1", "note": "Progress агрегирует AgentJobItem статусы для AgentJob"}
+        ],
+        "enumerations": null,
+        "data_flows": [
+          {"source": "AgentJobItem.status (по всем элементам job_id)", "transform": "счёт по статусам", "sink": "AgentJobProgress"}
+        ],
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0006/entity/backfill-state",
+      "src": "SRC-0006",
+      "composition": "entity",
+      "terms": {
+        "object": "BackfillState — персистированное lifecycle состояние процесса backfill метаданных rollout'ов",
+        "attributes": [
+          "status: BackfillStatus — текущий lifecycle status",
+          "last_watermark: Option<String> — последний обработанный rollout watermark",
+          "last_success_at: Option<DateTime<Utc>> — время последнего успешного завершения"
+        ],
+        "relationships": null,
+        "enumerations": {
+          "status": ["pending", "running", "complete"]
+        },
+        "data_flows": [
+          {"source": "SQLite строка (status, last_watermark, last_success_at)", "transform": "try_from_row: parse BackfillStatus, epoch_seconds_to_datetime", "sink": "BackfillState"}
+        ],
+        "config": {
+          "default_status": {"value": "Pending", "source": "impl Default for BackfillState", "default": "BackfillStatus::Pending"},
+          "default_watermark": {"value": "None", "source": "impl Default for BackfillState", "default": "None"},
+          "default_last_success_at": {"value": "None", "source": "impl Default for BackfillState", "default": "None"}
+        }
+      }
+    },
+    {
+      "id": "SRC-0006/entity/backfill-stats",
+      "src": "SRC-0006",
+      "composition": "entity",
+      "terms": {
+        "object": "BackfillStats — статистика операции backfill (счётчики)",
+        "attributes": [
+          "scanned: usize — количество отсканированных rollout файлов",
+          "upserted: usize — количество успешно upserted строк",
+          "failed: usize — количество строк, не прошедших upsert"
+        ],
+        "relationships": [
+          {"to": "SRC-0006/entity/backfill-state", "rel": "produced_during", "card": "N:1", "note": "Stats формируются в ходе backfill, состояние которого фиксируется в BackfillState"}
+        ],
+        "enumerations": null,
+        "data_flows": [
+          {"source": "процесс backfill (сканирование rollout файлов)", "transform": "счёт scanned/upserted/failed", "sink": "BackfillStats"}
+        ],
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0006/entity/stage1-output",
+      "src": "SRC-0006",
+      "composition": "entity",
+      "terms": {
+        "object": "Stage1Output — сохранённый выход stage-1 экстракции памяти (memory) для одного thread",
+        "attributes": [
+          "thread_id: ThreadId — идентификатор thread",
+          "rollout_path: PathBuf — путь к rollout-файлу источника",
+          "source_updated_at: DateTime<Utc> — время последнего обновления источника",
+          "raw_memory: String — сырой текст извлечённой памяти",
+          "rollout_summary: String — сводка по rollout",
+          "rollout_slug: Option<String> — slug rollout",
+          "cwd: PathBuf — рабочая директория thread на момент экстракции",
+          "git_branch: Option<String> — git branch на момент экстракции",
+          "generated_at: DateTime<Utc> — время генерации stage-1 output"
+        ],
+        "relationships": [
+          {"to": "SRC-0006/entity/thread-metadata", "rel": "extracted_from", "card": "N:1", "note": "Stage1Output ссылается на ThreadMetadata через thread_id"},
+          {"to": "SRC-0006/entity/stage1-output-ref", "rel": "summarized_as", "card": "1:1", "note": "Stage1OutputRef — лёгкая ссылка на Stage1Output"},
+          {"to": "SRC-0006/entity/phase2-input-selection", "rel": "feeds", "card": "N:1", "note": "Phase2InputSelection.selected/previous_selected содержат Stage1Output"}
+        ],
+        "enumerations": null,
+        "data_flows": [
+          {"source": "SQLite (Stage1OutputRow)", "transform": "TryFrom: ThreadId::try_from, PathBuf конверсия, epoch_seconds_to_datetime", "sink": "Stage1Output"}
+        ],
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0006/entity/stage1-output-ref",
+      "src": "SRC-0006",
+      "composition": "entity",
+      "terms": {
+        "object": "Stage1OutputRef — лёгкая ссылка на Stage1Output (минимальный набор для дедупликации/отслеживания)",
+        "attributes": [
+          "thread_id: ThreadId",
+          "source_updated_at: DateTime<Utc>",
+          "rollout_slug: Option<String>"
+        ],
+        "relationships": [
+          {"to": "SRC-0006/entity/stage1-output", "rel": "references", "card": "1:1"},
+          {"to": "SRC-0006/entity/phase2-input-selection", "rel": "removed_from", "card": "N:1", "note": "Phase2InputSelection.removed: Vec<Stage1OutputRef>"}
+        ],
+        "enumerations": null,
+        "data_flows": [
+          {"source": "(thread_id, source_updated_at, rollout_slug)", "transform": "stage1_output_ref_from_parts: ThreadId::try_from, epoch_seconds_to_datetime", "sink": "Stage1OutputRef"}
+        ],
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0006/entity/phase2-input-selection",
+      "src": "SRC-0006",
+      "composition": "entity",
+      "terms": {
+        "object": "Phase2InputSelection — выборка входных данных для phase-2 консолидации (selected/previous/retained/removed)",
+        "attributes": [
+          "selected: Vec<Stage1Output> — выбранные на текущей итерации stage-1 outputs",
+          "previous_selected: Vec<Stage1Output> — выбранные на предыдущей итерации",
+          "retained_thread_ids: Vec<ThreadId> — thread_ids, удержанные из предыдущей выборки",
+          "removed: Vec<Stage1OutputRef> — удалённые из выборки stage-1 outputs"
+        ],
+        "relationships": [
+          {"to": "SRC-0006/entity/stage1-output", "rel": "contains", "card": "1:N"},
+          {"to": "SRC-0006/entity/stage1-output-ref", "rel": "tracks_removed", "card": "1:N"}
+        ],
+        "enumerations": null,
+        "data_flows": null,
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0006/entity/stage1-job-claim",
+      "src": "SRC-0006",
+      "composition": "entity",
+      "terms": {
+        "object": "Stage1JobClaim — захваченное stage-1 задание извлечения памяти с привязкой к thread метаданным",
+        "attributes": [
+          "thread: ThreadMetadata — метаданные thread, для которого выполняется extraction",
+          "ownership_token: String — токен владения для предотвращения конкурентного исполнения"
+        ],
+        "relationships": [
+          {"to": "SRC-0006/entity/thread-metadata", "rel": "owns_metadata_of", "card": "1:1"},
+          {"to": "SRC-0006/entity/stage1-job-claim-outcome", "rel": "result_of", "card": "1:1", "note": "Successful claim возвращает Stage1JobClaim, иначе Stage1JobClaimOutcome::Skipped*"}
+        ],
+        "enumerations": null,
+        "data_flows": null,
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0006/entity/stage1-job-claim-outcome",
+      "src": "SRC-0006",
+      "composition": "entity",
+      "terms": {
+        "object": "Stage1JobClaimOutcome — результат попытки захвата stage-1 задания извлечения памяти",
+        "attributes": [
+          "Claimed { ownership_token: String } — caller владеет заданием, продолжает extraction",
+          "SkippedUpToDate — существующий output уже свежее или равен исходному rollout",
+          "SkippedRunning — другой worker удерживает свежий lease на это задание",
+          "SkippedRetryBackoff — задание в backoff и не должно повторяться сейчас",
+          "SkippedRetryExhausted — задание исчерпало retries и не должно повторяться автоматически"
+        ],
+        "relationships": [
+          {"to": "SRC-0006/entity/stage1-job-claim", "rel": "produces_on_claimed", "card": "1:1"}
+        ],
+        "enumerations": {
+          "outcome": ["Claimed", "SkippedUpToDate", "SkippedRunning", "SkippedRetryBackoff", "SkippedRetryExhausted"]
+        },
+        "data_flows": null,
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0006/entity/stage1-startup-claim-params",
+      "src": "SRC-0006",
+      "composition": "entity",
+      "terms": {
+        "object": "Stage1StartupClaimParams — параметры захвата stage-1 заданий при старте процесса",
+        "attributes": [
+          "scan_limit: usize — лимит сканирования",
+          "max_claimed: usize — максимум одновременно захваченных заданий",
+          "max_age_days: i64 — максимальный возраст rollout в днях",
+          "min_rollout_idle_hours: i64 — минимальное время простоя rollout в часах",
+          "allowed_sources: &[String] — разрешённые session sources",
+          "lease_seconds: i64 — длительность lease в секундах"
+        ],
+        "relationships": [
+          {"to": "SRC-0006/entity/stage1-job-claim-outcome", "rel": "drives_claim", "card": "1:N"}
+        ],
+        "enumerations": null,
+        "data_flows": null,
+        "config": {
+          "scan_limit": {"value": "<задаётся вызывающей стороной>", "source": "параметр Stage1StartupClaimParams", "default": null},
+          "max_claimed": {"value": "<задаётся вызывающей стороной>", "source": "параметр Stage1StartupClaimParams", "default": null},
+          "max_age_days": {"value": "<задаётся вызывающей стороной>", "source": "параметр Stage1StartupClaimParams", "default": null},
+          "min_rollout_idle_hours": {"value": "<задаётся вызывающей стороной>", "source": "параметр Stage1StartupClaimParams", "default": null},
+          "lease_seconds": {"value": "<задаётся вызывающей стороной>", "source": "параметр Stage1StartupClaimParams", "default": null}
+        }
+      }
+    },
+    {
+      "id": "SRC-0006/entity/phase2-job-claim-outcome",
+      "src": "SRC-0006",
+      "composition": "entity",
+      "terms": {
+        "object": "Phase2JobClaimOutcome — результат попытки захвата global phase-2 consolidation задания",
+        "attributes": [
+          "Claimed { ownership_token: String, input_watermark: i64 } — caller владеет global lock; input_watermark — снимок на момент claim",
+          "SkippedNotDirty — global job не ожидает консолидации (или уже актуален)",
+          "SkippedRunning — другой worker удерживает свежий global consolidation lease"
+        ],
+        "relationships": null,
+        "enumerations": {
+          "outcome": ["Claimed", "SkippedNotDirty", "SkippedRunning"]
+        },
+        "data_flows": null,
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0006/entity/log-entry",
+      "src": "SRC-0006",
+      "composition": "entity",
+      "terms": {
+        "object": "LogEntry — запись лога tracing-события для записи в SQLite logs DB",
+        "attributes": [
+          "ts: i64 — Unix-секунды времени события",
+          "ts_nanos: i64 — наносекундная часть времени",
+          "level: String — уровень лога (TRACE/DEBUG/INFO/WARN/ERROR)",
+          "target: String — target tracing-события",
+          "message: Option<String> — текст сообщения",
+          "feedback_log_body: Option<String> — отформатированное тело лога с контекстом span'ов",
+          "thread_id: Option<String> — thread id (из span scope или event field)",
+          "process_uuid: Option<String> — uuid процесса 'pid:<pid>:<uuid>'",
+          "module_path: Option<String> — путь модуля",
+          "file: Option<String> — файл источника",
+          "line: Option<i64> — номер строки источника"
+        ],
+        "relationships": [
+          {"to": "SRC-0006/entity/log-row", "rel": "persisted_as", "card": "1:1", "note": "LogEntry → SQLite → LogRow при выборке"},
+          {"to": "SRC-0006/entity/thread-metadata", "rel": "tagged_with", "card": "N:1", "note": "thread_id связывает LogEntry с ThreadMetadata"}
+        ],
+        "enumerations": {
+          "level": ["TRACE", "DEBUG", "INFO", "WARN", "ERROR"]
+        },
+        "data_flows": [
+          {"source": "tracing::Event (через LogDbLayer.on_event)", "transform": "MessageVisitor извлекает message и thread_id; event_thread_id обходит span scope; format_feedback_log_body конкатенирует контекст span'ов; SystemTime::now → ts/ts_nanos", "sink": "LogEntry"},
+          {"source": "LogEntry (через mpsc channel)", "transform": "run_inserter батчирует до LOG_BATCH_SIZE или по тику LOG_FLUSH_INTERVAL → flush → state_db.insert_logs", "sink": "SQLite logs DB"}
+        ],
+        "config": {
+          "log_queue_capacity": {"value": 512, "source": "hardcoded const LOG_QUEUE_CAPACITY", "default": 512},
+          "log_batch_size": {"value": 128, "source": "hardcoded const LOG_BATCH_SIZE", "default": 128},
+          "log_flush_interval": {"value": "Duration::from_secs(2)", "source": "hardcoded const LOG_FLUSH_INTERVAL", "default": "2 seconds"}
+        }
+      }
+    },
+    {
+      "id": "SRC-0006/entity/log-row",
+      "src": "SRC-0006",
+      "composition": "entity",
+      "terms": {
+        "object": "LogRow — строка лога, прочитанная из SQLite logs DB (для tail/выборки)",
+        "attributes": [
+          "id: i64 — идентификатор строки",
+          "ts: i64 — Unix-секунды",
+          "ts_nanos: i64 — наносекунды",
+          "level: String — уровень лога",
+          "target: String — target",
+          "message: Option<String> — сообщение",
+          "thread_id: Option<String> — thread id",
+          "process_uuid: Option<String> — uuid процесса",
+          "file: Option<String> — файл источника",
+          "line: Option<i64> — номер строки источника"
+        ],
+        "relationships": [
+          {"to": "SRC-0006/entity/log-entry", "rel": "derived_from", "card": "1:1"},
+          {"to": "SRC-0006/entity/log-query", "rel": "filtered_by", "card": "N:1", "note": "LogQuery определяет, какие LogRow выбираются"}
+        ],
+        "enumerations": null,
+        "data_flows": [
+          {"source": "SQLite logs DB", "transform": "FromRow: десериализация строки", "sink": "LogRow"}
+        ],
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0006/entity/log-query",
+      "src": "SRC-0006",
+      "composition": "entity",
+      "terms": {
+        "object": "LogQuery — критерий выборки логов из SQLite logs DB (фильтры, сортировка, пагинация по id)",
+        "attributes": [
+          "level_upper: Option<String> — фильтр по уровню (case-insensitive, передаётся uppercase)",
+          "from_ts: Option<i64> — нижняя граница ts (Unix секунды)",
+          "to_ts: Option<i64> — верхняя граница ts (Unix секунды)",
+          "module_like: Vec<String> — substring-фильтры по module_path",
+          "file_like: Vec<String> — substring-фильтры по file path",
+          "thread_ids: Vec<String> — список thread id для матчинга",
+          "search: Option<String> — substring-фильтр по rendered log body",
+          "include_threadless: bool — включать ли логи без thread_id",
+          "after_id: Option<i64> — пагинация: только id > after_id",
+          "limit: Option<usize> — лимит выборки",
+          "descending: bool — сортировка по id desc"
+        ],
+        "relationships": [
+          {"to": "SRC-0006/entity/log-row", "rel": "selects", "card": "1:N"}
+        ],
+        "enumerations": null,
+        "data_flows": [
+          {"source": "CLI Args (logs_client) или вызывающий код", "transform": "build_filter → LogFilter → to_log_query: копирование полей, выставление after_id/limit/descending", "sink": "LogQuery"}
+        ],
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0006/entity/directional-thread-spawn-edge-status",
+      "src": "SRC-0006",
+      "composition": "entity",
+      "terms": {
+        "object": "DirectionalThreadSpawnEdgeStatus — статус, прикреплённый к directional thread-spawn edge (граф порождения thread'ов)",
+        "attributes": [
+          "value: enum — Open или Closed (snake_case при сериализации)"
+        ],
+        "relationships": null,
+        "enumerations": {
+          "status": ["open", "closed"]
+        },
+        "data_flows": null,
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0006/entity/threads-page",
+      "src": "SRC-0006",
+      "composition": "entity",
+      "terms": {
+        "object": "ThreadsPage — страница результата keyset-пагинации списка thread'ов",
+        "attributes": [
+          "items: Vec<ThreadMetadata> — элементы страницы",
+          "next_anchor: Option<Anchor> — следующий anchor для пагинации (None если нет дальше)",
+          "num_scanned_rows: usize — количество строк, отсканированных для формирования страницы"
+        ],
+        "relationships": [
+          {"to": "SRC-0006/entity/thread-metadata", "rel": "contains", "card": "1:N"},
+          {"to": "SRC-0006/entity/anchor", "rel": "carries_next", "card": "1:0..1"}
+        ],
+        "enumerations": null,
+        "data_flows": [
+          {"source": "ThreadMetadata + sort_key (CreatedAt/UpdatedAt)", "transform": "anchor_from_item: извлекает ts (created_at или updated_at) и Uuid::parse_str(id)", "sink": "Anchor для next_anchor"}
+        ],
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0006/entity/anchor",
+      "src": "SRC-0006",
+      "composition": "entity",
+      "terms": {
+        "object": "Anchor — пагинационный anchor для keyset-пагинации thread'ов (ts, id)",
+        "attributes": [
+          "ts: DateTime<Utc> — временной компонент anchor",
+          "id: Uuid — UUID компонент anchor"
+        ],
+        "relationships": [
+          {"to": "SRC-0006/entity/threads-page", "rel": "anchors", "card": "1:1"},
+          {"to": "SRC-0006/entity/sort-key", "rel": "depends_on", "card": "N:1", "note": "ts берётся из created_at или updated_at в зависимости от SortKey"}
+        ],
+        "enumerations": null,
+        "data_flows": null,
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0006/entity/sort-key",
+      "src": "SRC-0006",
+      "composition": "entity",
+      "terms": {
+        "object": "SortKey — ключ сортировки для листинга thread'ов",
+        "attributes": [
+          "value: enum — CreatedAt или UpdatedAt"
+        ],
+        "relationships": [
+          {"to": "SRC-0006/entity/anchor", "rel": "selects_ts_for", "card": "1:N"}
+        ],
+        "enumerations": {
+          "sort_key": ["CreatedAt", "UpdatedAt"]
+        },
+        "data_flows": null,
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0006/entity/extraction-outcome",
+      "src": "SRC-0006",
+      "composition": "entity",
+      "terms": {
+        "object": "ExtractionOutcome — результат извлечения метаданных из rollout файла",
+        "attributes": [
+          "metadata: ThreadMetadata — извлечённые метаданные thread",
+          "memory_mode: Option<String> — explicit thread memory mode из rollout метаданных",
+          "parse_errors: usize — количество rollout строк, которые не удалось распарсить"
+        ],
+        "relationships": [
+          {"to": "SRC-0006/entity/thread-metadata", "rel": "wraps", "card": "1:1"}
+        ],
+        "enumerations": null,
+        "data_flows": [
+          {"source": "rollout файл (последовательность RolloutItem)", "transform": "apply_rollout_item для каждой строки + счёт parse_errors + чтение memory_mode", "sink": "ExtractionOutcome"}
+        ],
+        "config": null
+      }
+    },
+    {
+      "id": "SRC-0006/entity/state-databases",
+      "src": "SRC-0006",
+      "composition": "entity",
+      "terms": {
+        "object": "State Databases — две локальные SQLite базы данных Codex: state DB (метаданные rollout'ов, jobs, memory) и logs DB (логи tracing)",
+        "attributes": [
+          "logs_db_filename: 'logs' — имя файла logs DB",
+          "logs_db_version: 2 — версия миграций logs DB",
+          "state_db_filename: 'state' — имя файла state DB",
+          "state_db_version: 5 — версия миграций state DB",
+          "STATE_MIGRATOR — встроенный набор миграций './migrations' для state DB",
+          "LOGS_MIGRATOR — встроенный набор миграций './logs_migrations' для logs DB",
+          "ignore_missing: true — runtime migrator игнорирует миграции, появившиеся в БД позже встроенных (для одновременной работы старых и новых бинарников)"
+        ],
+        "relationships": [
+          {"to": "SRC-0006/entity/log-entry", "rel": "stores", "card": "1:N", "note": "logs DB хранит LogEntry"},
+          {"to": "SRC-0006/entity/thread-metadata", "rel": "stores", "card": "1:N", "note": "state DB хранит ThreadMetadata, AgentJob, Stage1Output, BackfillState"},
+          {"to": "SRC-0006/entity/agent-job", "rel": "stores", "card": "1:N"},
+          {"to": "SRC-0006/entity/stage1-output", "rel": "stores", "card": "1:N"},
+          {"to": "SRC-0006/entity/backfill-state", "rel": "stores", "card": "1:1"}
+        ],
+        "enumerations": null,
+        "data_flows": [
+          {"source": "CODEX_HOME (env var или ~/.codex)", "transform": "logs_db_path/state_db_path вычисление пути; runtime_state_migrator/runtime_logs_migrator применение миграций с ignore_missing=true", "sink": "локальные SQLite файлы 'state' и 'logs' в CODEX_HOME"}
+        ],
+        "config": {
+          "CODEX_HOME": {"value": "$CODEX_HOME или ~/.codex", "source": "env var CODEX_HOME (logs_client.rs Args), default — home_dir().join('.codex')", "default": "~/.codex"},
+          "CODEX_SQLITE_HOME": {"value": "путь для override SQLite state database home", "source": "env var через const SQLITE_HOME_ENV = 'CODEX_SQLITE_HOME'", "default": null},
+          "LOGS_DB_FILENAME": {"value": "logs", "source": "hardcoded const LOGS_DB_FILENAME", "default": "logs"},
+          "LOGS_DB_VERSION": {"value": 2, "source": "hardcoded const LOGS_DB_VERSION", "default": 2},
+          "STATE_DB_FILENAME": {"value": "state", "source": "hardcoded const STATE_DB_FILENAME", "default": "state"},
+          "STATE_DB_VERSION": {"value": 5, "source": "hardcoded const STATE_DB_VERSION", "default": 5}
+        }
+      }
+    },
+    {
+      "id": "SRC-0006/entity/db-metrics",
+      "src": "SRC-0006",
+      "composition": "entity",
+      "terms": {
+        "object": "DB Metrics — стандартизованные метрики, эмитируемые при операциях с БД (теги для фильтрации в системе метрик)",
+        "attributes": [
+          "DB_ERROR_METRIC = 'codex.db.error' (теги: [stage]) — ошибки в ходе DB операций",
+          "DB_METRIC_BACKFILL = 'codex.db.backfill' (теги: [status]) — метрики процесса backfill",
+          "DB_METRIC_BACKFILL_DURATION_MS = 'codex.db.backfill.duration_ms' (теги: [status]) — длительность backfill"
+        ],
+        "relationships": [
+          {"to": "SRC-0006/entity/backfill-state", "rel": "measures", "card": "1:1"}
+        ],
+        "enumerations": {
+          "metric_names": ["codex.db.error", "codex.db.backfill", "codex.db.backfill.duration_ms"],
+          "tags_db_error": ["stage"],
+          "tags_db_backfill": ["status"],
+          "tags_db_backfill_duration_ms": ["status"]
+        },
+        "data_flows": null,
+        "config": null
+      }
+    }
+  ]
+}

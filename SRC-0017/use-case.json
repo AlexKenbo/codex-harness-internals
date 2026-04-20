@@ -1,0 +1,1198 @@
+{
+  "src": "SRC-0017",
+  "schema_version": "2.0",
+  "lens": "use_case",
+  "compositions": [
+    {
+      "id": "SRC-0017/uc.user/spawn-agent-v1",
+      "src": "SRC-0017",
+      "composition": "use_case",
+      "level": "user",
+      "strategic_domain": "multi-agent оркестрация — делегирование задач дочерним агентам (v1)",
+      "terms": {
+        "actor": "Родительский агент (инициатор spawn_agent v1)",
+        "goal": "Запустить дочернего сабагента с заданной задачей, опционально со своей ролью/моделью или с форком родительской истории",
+        "steps": [
+          "1. Родительский агент вызывает spawn_agent с аргументами (message|items, agent_type?, model?, reasoning_effort?, fork_context?)",
+          "2. Обработчик spawn v1 парсит SpawnAgentArgs и проверяет роль (trim, отбросить пустую)",
+          "3. Обработчик spawn v1 парсит collab input (ровно одно из message/items) и рендерит preview",
+          "4. Обработчик spawn v1 вычисляет child_depth = next_thread_spawn_depth(parent.session_source) и сверяет с agent_max_depth →triggers SRC-0017/uc.sub/enforce-spawn-depth-limit",
+          "5. Обработчик spawn v1 эмитит CollabAgentSpawnBeginEvent в сессионный поток событий",
+          "6. Обработчик spawn v1 строит базовый Config сабагента через build_agent_spawn_config (base_instructions + turn runtime) →triggers SRC-0017/uc.sub/assemble-spawn-config",
+          "7. Обработчик spawn v1: если fork_context=true — отклоняет любые overrides (agent_type/model/reasoning_effort); иначе применяет model/reasoning_effort overrides и роль к конфигу →triggers SRC-0017/uc.sub/apply-spawn-overrides",
+          "8. Обработчик spawn v1 накладывает runtime overrides (approval/sandbox/cwd) и spawn overrides (depth-capped feature flags)",
+          "9. Обработчик spawn v1 вызывает agent_control.spawn_agent_with_metadata с SpawnAgentOptions (fork_parent_spawn_call_id + fork_mode=FullHistory если fork_context)",
+          "10. Обработчик spawn v1 получает snapshot спавн-конфига, определяет effective model/reasoning_effort/nickname/role",
+          "11. Обработчик spawn v1 эмитит CollabAgentSpawnEndEvent (new_thread_id, prompt, effective_model, effective_reasoning_effort, status)",
+          "12. Обработчик spawn v1 инкрементит счётчик телеметрии 'codex.multi_agent.spawn' с тегом role",
+          "13. Родительский агент получает SpawnAgentResult { agent_id (ThreadId), nickname }"
+        ],
+        "extensions (Cockburn)": [
+          {"step": 2, "condition": "payload не Function (ToolPayload variant mismatch)", "action": "ответить модели 'collab handler received unsupported payload'"},
+          {"step": 3, "condition": "заданы и message и items", "action": "ответить 'Provide either message or items, but not both'"},
+          {"step": 3, "condition": "ни message, ни items", "action": "ответить 'Provide one of: message or items'"},
+          {"step": 3, "condition": "message пустой после trim", "action": "ответить 'Empty message can't be sent to an agent'"},
+          {"step": 3, "condition": "items пустой", "action": "ответить 'Items can't be empty'"},
+          {"step": 4, "condition": "child_depth превышает agent_max_depth", "action": "ответить 'Agent depth limit reached. Solve the task yourself.'"},
+          {"step": 7, "condition": "fork_context=true и заданы agent_type/model/reasoning_effort", "action": "ответить что full-history fork наследует родительские параметры, overrides нужно убрать"},
+          {"step": 7, "condition": "model не найден среди available_models", "action": "ответить 'Unknown model `{requested_model}` for spawn_agent. Available models: {list}'"},
+          {"step": 7, "condition": "reasoning_effort не поддерживается моделью", "action": "ответить 'Reasoning effort `{x}` is not supported for model `{m}`. Supported: {list}'"},
+          {"step": 7, "condition": "apply_role_to_config вернул ошибку", "action": "ответить с текстом ошибки от модуля ролей"},
+          {"step": 8, "condition": "approval_policy/sandbox_policy invalid", "action": "ответить 'approval_policy is invalid: ...' / 'sandbox_policy is invalid: ...'"},
+          {"step": 9, "condition": "CodexErr::UnsupportedOperation('thread manager dropped')", "action": "ответить 'collab manager unavailable'"},
+          {"step": 9, "condition": "другой CodexErr", "action": "ответить 'collab spawn failed: {err}'"}
+        ],
+        "edge_cases": [
+          {"condition": "spawn_agent_with_metadata возвращает Err", "action": "new_thread_id=None, status=AgentStatus::NotFound в событии CollabAgentSpawnEndEvent; затем пробросить ошибку наверх"},
+          {"condition": "agent_control.get_agent_config_snapshot вернул None", "action": "фоллбек на metadata из spawn результата; если и та отсутствует — (None, None, None); effective_model = args.model.unwrap_or_default()"},
+          {"condition": "role_name=None", "action": "telemetry тег role = DEFAULT_ROLE_NAME"}
+        ],
+        "lifecycle": {
+          "entity": "SRC-0017/entity/spawned-agent",
+          "states": ["(absent)", "live (spawned, active session)"],
+          "transition": {
+            "from": "(absent)",
+            "to": "live",
+            "guard": "child_depth <= agent_max_depth && spawn_agent_with_metadata Ok",
+            "side_effect": "CollabAgentSpawnBegin/EndEvent emitted; session_telemetry counter +1"
+          }
+        },
+        "ux": null,
+        "result": "Новый сабагент создан в agent_control; его ThreadId возвращён родителю; запись в сессионном event stream (CollabAgentSpawnBegin/End); телеметрия обновлена"
+      }
+    },
+    {
+      "id": "SRC-0017/uc.user/spawn-agent-v2",
+      "src": "SRC-0017",
+      "composition": "use_case",
+      "level": "user",
+      "strategic_domain": "multi-agent оркестрация v2 — именованные задачи и гибкий форк истории",
+      "terms": {
+        "actor": "Родительский агент (инициатор spawn_agent v2)",
+        "goal": "Запустить именованного сабагента (task_name) с заданной задачей и опционально форкнуть последние N ходов или всю историю",
+        "steps": [
+          "1. Родительский агент вызывает spawn_agent v2 с {message, task_name, agent_type?, model?, reasoning_effort?, fork_turns?, fork_context? (rejected)}",
+          "2. Обработчик spawn v2 парсит SpawnAgentArgs (deny_unknown_fields) и вычисляет fork_mode из fork_turns →triggers SRC-0017/uc.sub/resolve-fork-turns",
+          "3. Обработчик spawn v2 формирует initial_operation из message (без items) и рендерит preview",
+          "4. Обработчик spawn v2 проверяет child_depth vs agent_max_depth →triggers SRC-0017/uc.sub/enforce-spawn-depth-limit",
+          "5. Обработчик spawn v2 эмитит CollabAgentSpawnBeginEvent",
+          "6. Обработчик spawn v2 собирает Config: build_agent_spawn_config, затем (если fork_mode=FullHistory) отклоняет overrides, иначе apply_requested_spawn_agent_model_overrides + apply_role_to_config →triggers SRC-0017/uc.sub/assemble-spawn-config",
+          "7. Обработчик spawn v2 применяет runtime overrides и spawn overrides; конкатенирует developer_instructions с SPAWN_AGENT_DEVELOPER_INSTRUCTIONS (<spawned_agent_context>)",
+          "8. Обработчик spawn v2 строит SessionSource::SubAgent(ThreadSpawn { agent_path = parent_path.join(task_name), role, depth }) →triggers SRC-0017/uc.sub/derive-thread-spawn-source",
+          "9. Обработчик spawn v2: если recipient agent_path известен и initial_operation — Op::UserInput с только текстовыми items — переделывает в Op::InterAgentCommunication (sender_path → recipient, empty attachments, prompt, trigger_turn=true); иначе оставляет исходный Op",
+          "10. Обработчик spawn v2 вызывает agent_control.spawn_agent_with_metadata с SpawnAgentOptions (fork_parent_spawn_call_id if fork_mode, fork_mode)",
+          "11. Обработчик spawn v2 получает agent_config_snapshot, определяет effective model/reasoning_effort и agent_path нового агента",
+          "12. Обработчик spawn v2 эмитит CollabAgentSpawnEndEvent с new_thread_id, агент-метаданными, prompt, model, reasoning_effort, status",
+          "13. Обработчик spawn v2 инкрементит телеметрию 'codex.multi_agent.spawn' с тегом role",
+          "14. Обработчик spawn v2: если multi_agent_v2.hide_spawn_agent_metadata=true → возвращает SpawnAgentResult::HiddenMetadata { task_name }; иначе WithNickname { task_name, nickname }"
+        ],
+        "extensions (Cockburn)": [
+          {"step": 2, "condition": "fork_context задан (в v2 не поддерживается)", "action": "ответить 'fork_context is not supported in MultiAgentV2; use fork_turns instead'"},
+          {"step": 2, "condition": "fork_turns не 'none'/'all' и не валидное положительное целое", "action": "ответить 'fork_turns must be `none`, `all`, or a positive integer string'"},
+          {"step": 2, "condition": "fork_turns = 0", "action": "та же ошибка — 0 запрещён"},
+          {"step": 3, "condition": "message пустой после trim", "action": "ответить 'Empty message can't be sent to an agent'"},
+          {"step": 4, "condition": "child_depth превышает agent_max_depth", "action": "ответить 'Agent depth limit reached. Solve the task yourself.'"},
+          {"step": 6, "condition": "fork_mode=FullHistory и заданы agent_type/model/reasoning_effort", "action": "ответить сообщение о наследовании параметров, убрать overrides"},
+          {"step": 6, "condition": "model не найден / reasoning_effort не поддерживается / apply_role_to_config ошибся", "action": "соответствующие сообщения (см. spawn v1 extensions)"},
+          {"step": 8, "condition": "parent_path.join(task_name) возвращает ошибку", "action": "ответить с сообщением ошибки от AgentPath::join"},
+          {"step": 11, "condition": "spawned agent без agent_path (new_agent_path=None)", "action": "ответить 'spawned agent is missing a canonical task name'"}
+        ],
+        "edge_cases": [
+          {"condition": "agent_config_snapshot=None и metadata=None", "action": "(None, None, None); effective_model = args.model.unwrap_or_default()"},
+          {"condition": "fork_turns='none' или пустая строка", "action": "fork_mode=None (без форка)"},
+          {"condition": "initial_operation содержит non-text items", "action": "Op остаётся UserInput (не переделывается в InterAgentCommunication)"},
+          {"condition": "hide_spawn_agent_metadata=true", "action": "ответ без nickname — только task_name"}
+        ],
+        "lifecycle": {
+          "entity": "SRC-0017/entity/spawned-agent",
+          "states": ["(absent)", "live (ThreadSpawn with agent_path)"],
+          "transition": {
+            "from": "(absent)",
+            "to": "live",
+            "guard": "depth ok && fork_mode valid && spawn_agent_with_metadata Ok",
+            "side_effect": "developer_instructions prepend SPAWN_AGENT_DEVELOPER_INSTRUCTIONS; телеметрия +1; initial Op переводится в InterAgentCommunication если путь известен"
+          }
+        },
+        "ux": null,
+        "result": "Сабагент создан с каноническим task_name (agent_path); возвращается либо HiddenMetadata либо WithNickname в зависимости от настройки multi_agent_v2.hide_spawn_agent_metadata"
+      }
+    },
+    {
+      "id": "SRC-0017/uc.user/wait-on-agents-v1",
+      "src": "SRC-0017",
+      "composition": "use_case",
+      "level": "user",
+      "strategic_domain": "синхронизация между агентами v1",
+      "terms": {
+        "actor": "Родительский агент (инициатор wait v1)",
+        "goal": "Дождаться финального статуса одного или нескольких дочерних агентов или истечения таймаута",
+        "steps": [
+          "1. Родительский агент вызывает wait_agent v1 с { targets: Vec<String>, timeout_ms? }",
+          "2. Обработчик wait v1 парсит WaitArgs, проверяет targets не пуст",
+          "3. Обработчик wait v1 конвертирует каждый target в ThreadId и собирает метаданные (agent_nickname, agent_role, agent_path); формирует map ThreadId → отображаемый target (agent_path или thread_id)",
+          "4. Обработчик wait v1 нормализует timeout_ms: clamp в [MIN_WAIT_TIMEOUT_MS=10000, MAX_WAIT_TIMEOUT_MS=3600000]; если <=0 — ошибка",
+          "5. Обработчик wait v1 эмитит CollabWaitingBeginEvent (receiver_thread_ids, receiver_agents, call_id)",
+          "6. Обработчик wait v1 подписывается на статус каждого агента (subscribe_status); если статус уже финальный — кладёт в initial_final_statuses",
+          "7. Если все initial_final_statuses — использует их как результат; иначе для каждого подписанного rx запускает wait_for_final_status внутри FuturesUnordered",
+          "8. Обработчик wait v1 ждёт первый финальный результат с timeout_at(deadline); после первого собирает все уже готовые (now_or_never)",
+          "9. Обработчик wait v1 формирует agent_statuses через build_wait_agent_statuses (ordered by receiver_agents, extras sorted by thread_id string)",
+          "10. Обработчик wait v1 эмитит CollabWaitingEndEvent с statuses и agent_statuses",
+          "11. Родительский агент получает WaitAgentResult { status: HashMap<target_display, AgentStatus>, timed_out: bool }"
+        ],
+        "extensions (Cockburn)": [
+          {"step": 2, "condition": "targets пуст", "action": "ответить 'agent ids must be non-empty'"},
+          {"step": 3, "condition": "target не валидный ThreadId", "action": "ответить 'invalid agent id {target}: ...'"},
+          {"step": 4, "condition": "timeout_ms <= 0", "action": "ответить 'timeout_ms must be greater than zero'"},
+          {"step": 6, "condition": "CodexErr::ThreadNotFound при subscribe_status", "action": "добавить (id, AgentStatus::NotFound) в initial_final_statuses (не fatal)"},
+          {"step": 6, "condition": "другая ошибка subscribe_status", "action": "эмитить CollabWaitingEndEvent со snapshot статуса и вернуть collab_agent_error"}
+        ],
+        "edge_cases": [
+          {"condition": "никто не дошёл до финала до deadline", "action": "timed_out=true, status={} (пустой map)"},
+          {"condition": "status_rx.changed вернул Err (sender dropped)", "action": "get_status(thread_id) один раз; если финальный — добавить в результаты, иначе None"},
+          {"condition": "status изначально финальный у части агентов", "action": "возвращаются только они — wait не ждёт остальных"}
+        ],
+        "lifecycle": {
+          "entity": "SRC-0017/entity/spawned-agent",
+          "states": ["non-final", "final (is_final)"],
+          "transition": {
+            "from": "non-final",
+            "to": "final",
+            "guard": "is_final(status) = true — наблюдается по watch-каналу или через get_status",
+            "side_effect": "wait возвращает target → status"
+          }
+        },
+        "ux": null,
+        "result": "Карта target (agent_path или ThreadId) → AgentStatus; флаг timed_out; события CollabWaitingBegin/End в стриме"
+      }
+    },
+    {
+      "id": "SRC-0017/uc.user/wait-on-mailbox-v2",
+      "src": "SRC-0017",
+      "composition": "use_case",
+      "level": "user",
+      "strategic_domain": "синхронизация через почтовый ящик сессии v2",
+      "terms": {
+        "actor": "Родительский агент (инициатор wait_agent v2)",
+        "goal": "Дождаться любого изменения mailbox текущей сессии или истечения таймаута (без указания конкретных агентов)",
+        "steps": [
+          "1. Родительский агент вызывает wait_agent v2 с { timeout_ms? }",
+          "2. Обработчик wait v2 нормализует timeout_ms: clamp в [MIN_WAIT_TIMEOUT_MS, MAX_WAIT_TIMEOUT_MS]; если <=0 — ошибка",
+          "3. Обработчик wait v2 подписывается на session.subscribe_mailbox_seq() (watch<u64>)",
+          "4. Обработчик wait v2 эмитит CollabWaitingBeginEvent с пустыми receiver списками",
+          "5. Обработчик wait v2 ждёт mailbox_seq_rx.changed() до deadline (wait_for_mailbox_change)",
+          "6. Обработчик wait v2 эмитит CollabWaitingEndEvent с пустыми statuses",
+          "7. Родительский агент получает WaitAgentResult { message: 'Wait timed out.'|'Wait completed.', timed_out: bool }"
+        ],
+        "extensions (Cockburn)": [
+          {"step": 2, "condition": "timeout_ms <= 0", "action": "ответить 'timeout_ms must be greater than zero'"}
+        ],
+        "edge_cases": [
+          {"condition": "timeout достиг deadline до изменения mailbox", "action": "timed_out=true, message='Wait timed out.'"},
+          {"condition": "watch sender закрыт (Err от changed)", "action": "trat как не-успешное — timed_out=true"}
+        ],
+        "lifecycle": null,
+        "ux": null,
+        "result": "Бинарный исход: сообщение и флаг timed_out; событие CollabWaitingBegin/End для всей сессии без per-thread информации"
+      }
+    },
+    {
+      "id": "SRC-0017/uc.user/close-agent-v1",
+      "src": "SRC-0017",
+      "composition": "use_case",
+      "level": "user",
+      "strategic_domain": "управление жизненным циклом сабагентов v1",
+      "terms": {
+        "actor": "Родительский агент (инициатор close_agent v1)",
+        "goal": "Завершить (закрыть) указанного сабагента, вернуть его последний статус",
+        "steps": [
+          "1. Родительский агент вызывает close_agent v1 с { target: ThreadId-string }",
+          "2. Обработчик close v1 парсит аргументы и конвертирует target в ThreadId (parse_agent_id_target)",
+          "3. Обработчик close v1 получает метаданные агента (agent_nickname, agent_role)",
+          "4. Обработчик close v1 эмитит CollabCloseBeginEvent",
+          "5. Обработчик close v1 подписывается на статус и фиксирует previous_status через borrow_and_update; при ошибке subscribe — эмитит Close End с текущим статусом и возвращает collab_agent_error",
+          "6. Обработчик close v1 вызывает agent_control.close_agent(agent_id)",
+          "7. Обработчик close v1 эмитит CollabCloseEndEvent (с previous_status)",
+          "8. Родительский агент получает CloseAgentResult { previous_status }"
+        ],
+        "extensions (Cockburn)": [
+          {"step": 2, "condition": "target не валидный ThreadId", "action": "ответить 'invalid agent id {target}: ...'"},
+          {"step": 5, "condition": "subscribe_status Err (например, ThreadNotFound)", "action": "эмитить CollabCloseEndEvent с текущим статусом и вернуть collab_agent_error (ThreadNotFound → 'agent with id {id} not found', InternalAgentDied → 'agent with id {id} is closed', UnsupportedOperation → 'collab manager unavailable', иное → 'collab tool failed: {err}')"},
+          {"step": 6, "condition": "close_agent Err", "action": "эмитить End-событие и вернуть ту же классификацию ошибок"}
+        ],
+        "edge_cases": [
+          {"condition": "агент уже в финальном статусе", "action": "close всё равно выполняется; previous_status — текущий финальный статус"}
+        ],
+        "lifecycle": {
+          "entity": "SRC-0017/entity/spawned-agent",
+          "states": ["live", "closed"],
+          "transition": {
+            "from": "live",
+            "to": "closed",
+            "guard": "subscribe_status Ok и close_agent Ok",
+            "side_effect": "CollabCloseBegin/End events; агент больше не доступен (resume_agent вернёт NotFound)"
+          }
+        },
+        "ux": null,
+        "result": "Сабагент закрыт; родителю возвращён его предыдущий статус; два события в стриме (Begin/End)"
+      }
+    },
+    {
+      "id": "SRC-0017/uc.user/close-agent-v2",
+      "src": "SRC-0017",
+      "composition": "use_case",
+      "level": "user",
+      "strategic_domain": "управление жизненным циклом сабагентов v2",
+      "terms": {
+        "actor": "Родительский агент (инициатор close_agent v2)",
+        "goal": "Завершить указанного сабагента по path или thread_id с защитой от закрытия root-агента",
+        "steps": [
+          "1. Родительский агент вызывает close_agent v2 с { target: path-или-thread-id }",
+          "2. Обработчик close v2 парсит CloseAgentArgs (deny_unknown_fields)",
+          "3. Обработчик close v2 разрешает target через resolve_agent_target(session, turn, target) →triggers SRC-0017/uc.sub/resolve-agent-target",
+          "4. Обработчик close v2 получает метаданные; если agent_path является root — отклоняет",
+          "5. Обработчик close v2 эмитит CollabCloseBeginEvent",
+          "6. Обработчик close v2 получает previous_status через subscribe_status.borrow_and_update (при Err — эмит End и collab_agent_error)",
+          "7. Обработчик close v2 вызывает agent_control.close_agent",
+          "8. Обработчик close v2 эмитит CollabCloseEndEvent",
+          "9. Родительский агент получает CloseAgentResult { previous_status }"
+        ],
+        "extensions (Cockburn)": [
+          {"step": 3, "condition": "resolve_agent_target не нашёл агента", "action": "ошибка от resolve_agent_target проброшена наверх"},
+          {"step": 4, "condition": "receiver_agent.agent_path.is_root", "action": "ответить 'root is not a spawned agent'"},
+          {"step": 6, "condition": "subscribe_status Err (ThreadNotFound/InternalAgentDied/UnsupportedOperation/...)", "action": "эмитить End и вернуть collab_agent_error с соответствующим сообщением"},
+          {"step": 7, "condition": "close_agent Err", "action": "вернуть collab_agent_error"}
+        ],
+        "edge_cases": [
+          {"condition": "unknown field в args", "action": "parse_arguments отклоняет (deny_unknown_fields)"}
+        ],
+        "lifecycle": {
+          "entity": "SRC-0017/entity/spawned-agent",
+          "states": ["live", "closed"],
+          "transition": {
+            "from": "live",
+            "to": "closed",
+            "guard": "!is_root && subscribe_status Ok && close_agent Ok",
+            "side_effect": "CollabClose events"
+          }
+        },
+        "ux": null,
+        "result": "Сабагент закрыт (если не root); возвращён previous_status"
+      }
+    },
+    {
+      "id": "SRC-0017/uc.user/resume-agent-v1",
+      "src": "SRC-0017",
+      "composition": "use_case",
+      "level": "user",
+      "strategic_domain": "возобновление закрытого сабагента v1",
+      "terms": {
+        "actor": "Родительский агент (инициатор resume_agent v1)",
+        "goal": "Продолжить работу ранее закрытого сабагента (поднять из rollout) или получить текущий статус живого",
+        "steps": [
+          "1. Родительский агент вызывает resume_agent v1 с { id: ThreadId-string }",
+          "2. Обработчик resume v1 парсит ResumeAgentArgs и конвертирует id через ThreadId::from_string",
+          "3. Обработчик resume v1 получает метаданные агента-получателя",
+          "4. Обработчик resume v1 проверяет child_depth vs agent_max_depth →triggers SRC-0017/uc.sub/enforce-spawn-depth-limit",
+          "5. Обработчик resume v1 эмитит CollabResumeBeginEvent",
+          "6. Обработчик resume v1 получает текущий статус агента",
+          "7. Если статус == AgentStatus::NotFound → try_resume_closed_agent: build_agent_resume_config + agent_control.resume_agent_from_rollout с thread_spawn_source(agent_role=None, task_name=None)",
+          "8. Обработчик resume v1 перечитывает статус после resume (или сохраняет ошибку)",
+          "9. Обработчик resume v1 эмитит CollabResumeEndEvent",
+          "10. Если был error в try_resume — вернуть его",
+          "11. Обработчик resume v1 инкрементит телеметрию 'codex.multi_agent.resume' +1",
+          "12. Родительский агент получает ResumeAgentResult { status }"
+        ],
+        "extensions (Cockburn)": [
+          {"step": 2, "condition": "id не валидный ThreadId", "action": "ответить 'invalid agent id {id}: ...'"},
+          {"step": 4, "condition": "child_depth превышает agent_max_depth", "action": "ответить 'Agent depth limit reached. Solve the task yourself.'"},
+          {"step": 7, "condition": "resume_agent_from_rollout Err", "action": "вернуть collab_agent_error (ThreadNotFound/InternalAgentDied/...) через путь emit End → return Err"}
+        ],
+        "edge_cases": [
+          {"condition": "статус уже не NotFound", "action": "resume не вызывается, возвращается текущий статус (effectively noop)"},
+          {"condition": "build_agent_resume_config ошибка", "action": "проброс ошибки"}
+        ],
+        "lifecycle": {
+          "entity": "SRC-0017/entity/spawned-agent",
+          "states": ["closed (NotFound)", "resumed/live"],
+          "transition": {
+            "from": "closed",
+            "to": "live",
+            "guard": "depth ok && resume_agent_from_rollout Ok",
+            "side_effect": "telemetry counter 'codex.multi_agent.resume' +1; base_instructions берутся из rollout/metadata (None в build_agent_resume_config)"
+          }
+        },
+        "ux": null,
+        "result": "Сабагент снова жив (status отражает это); Resume Begin/End эвенты; телеметрия обновлена"
+      }
+    },
+    {
+      "id": "SRC-0017/uc.user/send-input-v1",
+      "src": "SRC-0017",
+      "composition": "use_case",
+      "level": "user",
+      "strategic_domain": "двусторонняя коммуникация с сабагентом v1 (богатый input с прерыванием)",
+      "terms": {
+        "actor": "Родительский агент (инициатор send_input v1)",
+        "goal": "Отправить сабагенту сообщение или input-items, опционально прервав его текущий turn",
+        "steps": [
+          "1. Родительский агент вызывает send_input v1 с { target, message?, items?, interrupt? }",
+          "2. Обработчик send_input v1 парсит SendInputArgs и конвертирует target в ThreadId",
+          "3. Обработчик send_input v1 парсит collab input (ровно одно из message/items) →triggers SRC-0017/uc.sub/parse-collab-input",
+          "4. Обработчик send_input v1 рендерит preview через render_input_preview",
+          "5. Обработчик send_input v1 получает метаданные агента",
+          "6. Если args.interrupt=true → agent_control.interrupt_agent(receiver_thread_id)",
+          "7. Обработчик send_input v1 эмитит CollabAgentInteractionBeginEvent с prompt",
+          "8. Обработчик send_input v1 вызывает agent_control.send_input(receiver_thread_id, input_items) и получает submission_id",
+          "9. Обработчик send_input v1 получает статус после отправки",
+          "10. Обработчик send_input v1 эмитит CollabAgentInteractionEndEvent (prompt, status)",
+          "11. Обработчик send_input v1 пробрасывает ошибку send_input или возвращает SendInputResult { submission_id }"
+        ],
+        "extensions (Cockburn)": [
+          {"step": 2, "condition": "target не валидный ThreadId", "action": "ответить 'invalid agent id {target}: ...'"},
+          {"step": 3, "condition": "оба/ни одного из message/items", "action": "ошибки 'Provide either message or items, but not both' / 'Provide one of: message or items'"},
+          {"step": 3, "condition": "message пустой", "action": "'Empty message can't be sent to an agent'"},
+          {"step": 3, "condition": "items пустой", "action": "'Items can't be empty'"},
+          {"step": 6, "condition": "interrupt_agent Err", "action": "collab_agent_error (без Interaction End emit — ранний возврат)"},
+          {"step": 8, "condition": "send_input Err", "action": "эмитнуть Interaction End со snapshot статуса, затем вернуть collab_agent_error"}
+        ],
+        "edge_cases": [
+          {"condition": "interrupt=false", "action": "прерывание не выполняется"}
+        ],
+        "lifecycle": null,
+        "ux": null,
+        "result": "submission_id возвращён родителю; два события CollabAgentInteractionBegin/End эмитированы; сабагент получил входящее"
+      }
+    },
+    {
+      "id": "SRC-0017/uc.user/send-message-v2",
+      "src": "SRC-0017",
+      "composition": "use_case",
+      "level": "user",
+      "strategic_domain": "text-only messaging между агентами v2 (очередь)",
+      "terms": {
+        "actor": "Родительский агент (инициатор send_message v2)",
+        "goal": "Доставить текстовое сообщение сабагенту, положив его в очередь без запуска нового turn",
+        "steps": [
+          "1. Родительский агент вызывает send_message с { target, message }",
+          "2. Обработчик send_message парсит SendMessageArgs (deny_unknown_fields)",
+          "3. Обработчик send_message вызывает handle_message_string_tool(invocation, MessageDeliveryMode::QueueOnly, target, message, interrupt=false) →triggers SRC-0017/uc.sub/handle-message-submission"
+        ],
+        "extensions (Cockburn)": [
+          {"step": 2, "condition": "unknown field", "action": "parse_arguments отклоняет"},
+          {"step": 3, "condition": "message пустой после trim", "action": "ответить 'Empty message can't be sent to an agent'"}
+        ],
+        "edge_cases": null,
+        "lifecycle": null,
+        "ux": null,
+        "result": "Сообщение доставлено в mailbox сабагента как InterAgentCommunication с trigger_turn=false; возвращается пустой FunctionToolOutput с success=true"
+      }
+    },
+    {
+      "id": "SRC-0017/uc.user/followup-task-v2",
+      "src": "SRC-0017",
+      "composition": "use_case",
+      "level": "user",
+      "strategic_domain": "text-only messaging v2 с немедленным turn",
+      "terms": {
+        "actor": "Родительский агент (инициатор followup_task v2)",
+        "goal": "Отправить follow-up задачу сабагенту с немедленным запуском его нового turn, опционально прервав текущий",
+        "steps": [
+          "1. Родительский агент вызывает followup_task с { target, message, interrupt? }",
+          "2. Обработчик followup_task парсит FollowupTaskArgs (deny_unknown_fields)",
+          "3. Обработчик followup_task вызывает handle_message_string_tool(invocation, MessageDeliveryMode::TriggerTurn, target, message, interrupt) →triggers SRC-0017/uc.sub/handle-message-submission"
+        ],
+        "extensions (Cockburn)": [
+          {"step": 3, "condition": "receiver — root agent и mode=TriggerTurn", "action": "ответить 'Tasks can't be assigned to the root agent'"},
+          {"step": 3, "condition": "interrupt=true и interrupt_agent Err", "action": "collab_agent_error"},
+          {"step": 3, "condition": "message пустой", "action": "'Empty message can't be sent to an agent'"},
+          {"step": 3, "condition": "receiver без agent_path", "action": "ответить 'target agent is missing an agent_path'"}
+        ],
+        "edge_cases": null,
+        "lifecycle": null,
+        "ux": null,
+        "result": "Follow-up задача доставлена в mailbox с trigger_turn=true → сабагент запустит новый turn; два события Interaction Begin/End в стриме"
+      }
+    },
+    {
+      "id": "SRC-0017/uc.user/list-agents-v2",
+      "src": "SRC-0017",
+      "composition": "use_case",
+      "level": "user",
+      "strategic_domain": "обзор текущих сабагентов v2",
+      "terms": {
+        "actor": "Родительский агент (инициатор list_agents v2)",
+        "goal": "Получить список всех сабагентов сессии, опционально отфильтрованный по префиксу agent_path",
+        "steps": [
+          "1. Родительский агент вызывает list_agents с { path_prefix? }",
+          "2. Обработчик list_agents парсит ListAgentsArgs (deny_unknown_fields)",
+          "3. Обработчик list_agents регистрирует session root через agent_control.register_session_root(conversation_id, session_source)",
+          "4. Обработчик list_agents запрашивает agent_control.list_agents(session_source, path_prefix?) →получает Vec<ListedAgent>",
+          "5. Родительский агент получает ListAgentsResult { agents: Vec<ListedAgent> }"
+        ],
+        "extensions (Cockburn)": [
+          {"step": 4, "condition": "list_agents Err (CodexErr)", "action": "collab_spawn_error — UnsupportedOperation 'thread manager dropped' → 'collab manager unavailable'; иной UnsupportedOperation → message; иное → 'collab spawn failed: {err}'"}
+        ],
+        "edge_cases": [
+          {"condition": "path_prefix=None", "action": "возвращаются все агенты сессии"},
+          {"condition": "сабагентов нет", "action": "agents = []"}
+        ],
+        "lifecycle": null,
+        "ux": null,
+        "result": "Список дочерних агентов (ListedAgent) возвращён родителю"
+      }
+    },
+    {
+      "id": "SRC-0017/uc.user/run-csv-agent-job",
+      "src": "SRC-0017",
+      "composition": "use_case",
+      "level": "user",
+      "strategic_domain": "пакетная обработка данных через многопоточный рой сабагентов",
+      "terms": {
+        "actor": "Родительский агент (инициатор spawn_agents_on_csv)",
+        "goal": "Запустить batch job: создать AgentJob из CSV, обработать каждую строку через одного worker-сабагента, собрать результаты и экспортировать их в выходной CSV",
+        "steps": [
+          "1. Родительский агент вызывает spawn_agents_on_csv с { csv_path, instruction, id_column?, output_csv_path?, output_schema?, max_concurrency?|max_workers?, max_runtime_seconds? }",
+          "2. Обработчик spawn_agents_on_csv парсит SpawnAgentsOnCsvArgs и проверяет что instruction не пуст после trim",
+          "3. Обработчик spawn_agents_on_csv требует state_db (session.state_db) — иначе Fatal",
+          "4. Обработчик spawn_agents_on_csv резолвит csv_path через turn.resolve_path и читает файл tokio::fs",
+          "5. Обработчик spawn_agents_on_csv парсит CSV через parse_csv (ReaderBuilder has_headers=true flexible=true; первая хедер-колонка триммит BOM; пустые строки пропускаются) →triggers SRC-0017/uc.sub/parse-csv-input",
+          "6. Обработчик spawn_agents_on_csv валидирует: headers не пустые, все хедеры уникальны →triggers SRC-0017/uc.sub/ensure-unique-headers",
+          "7. Обработчик spawn_agents_on_csv: если задан id_column — находит его индекс в хедерах; иначе None",
+          "8. Обработчик spawn_agents_on_csv для каждой строки: проверяет совпадение количества полей с хедером; извлекает source_id из id_column (если задан и ячейка непуста); строит base_item_id = source_id или 'row-<row_index+1>'; гарантирует уникальность через суффиксы -2, -3, ...; собирает row_json (header→value); добавляет AgentJobItemCreateParams",
+          "9. Обработчик spawn_agents_on_csv генерирует job_id (Uuid::new_v4) и job_name = 'agent-job-<first 8>'; вычисляет output_csv_path (из args или default: '<stem>.agent-job-<first8>.csv' рядом с input)",
+          "10. Обработчик spawn_agents_on_csv нормализует max_runtime_seconds (>=1 или None) и создаёт AgentJob в state_db с полным списком items и auto_export=true",
+          "11. Обработчик spawn_agents_on_csv строит JobRunnerOptions: проверяет depth limit, нормализует concurrency (default 16, max 64, capped by agent_max_threads), строит spawn_config через build_agent_spawn_config →triggers SRC-0017/uc.sub/build-runner-options",
+          "12. При ошибке build_runner_options — db.mark_agent_job_failed и проброс ошибки",
+          "13. Обработчик spawn_agents_on_csv вызывает db.mark_agent_job_running и эмитит background event с параметрами concurrency",
+          "14. Обработчик spawn_agents_on_csv запускает run_agent_job_loop →triggers SRC-0017/uc.sub/run-agent-job-loop",
+          "15. После завершения цикла: если файл output не существует — экспортирует snapshot через export_job_csv_snapshot",
+          "16. Обработчик spawn_agents_on_csv загружает финальный прогресс и up-to-5 failed items; формирует failed_item_errors (фильтруя пустые last_error); при наличии failed_items без деталей — job_error fallback 'agent job has failed items but no error details were recorded'",
+          "17. Обработчик spawn_agents_on_csv сериализует SpawnAgentsOnCsvResult { job_id, status, output_csv_path, total/completed/failed, job_error, failed_item_errors } и возвращает FunctionToolOutput с success=true"
+        ],
+        "extensions (Cockburn)": [
+          {"step": 2, "condition": "instruction пуст после trim", "action": "ответить 'instruction must be non-empty'"},
+          {"step": 3, "condition": "state_db недоступен", "action": "Fatal 'sqlite state db is unavailable for this session'"},
+          {"step": 4, "condition": "чтение файла Err", "action": "ответить 'failed to read csv input {path}: {err}'"},
+          {"step": 5, "condition": "parse_csv Err", "action": "ответить 'failed to parse csv input: {err}'"},
+          {"step": 6, "condition": "headers пустые", "action": "ответить 'csv input must include a header row'"},
+          {"step": 6, "condition": "дубликат хедера", "action": "ответить 'csv header {h} is duplicated'"},
+          {"step": 7, "condition": "id_column не найден в headers", "action": "ответить 'id_column {name} was not found in csv headers'"},
+          {"step": 8, "condition": "число полей строки не равно числу хедеров", "action": "ответить 'csv row {row_index+2} has {X} fields but header has {Y}'"},
+          {"step": 10, "condition": "max_runtime_seconds=0", "action": "ответить 'max_runtime_seconds must be >= 1'"},
+          {"step": 10, "condition": "create_agent_job Err", "action": "ответить 'failed to create agent job: {err}'"},
+          {"step": 11, "condition": "depth limit превышен", "action": "db.mark_agent_job_failed; ответить 'agent depth limit reached; this session cannot spawn more subagents'"},
+          {"step": 13, "condition": "mark_agent_job_running Err", "action": "ответить 'failed to transition agent job {id} to running: {err}'"},
+          {"step": 14, "condition": "run_agent_job_loop Err", "action": "db.mark_agent_job_failed(error_message); ответить 'agent job {id} failed: {err}'"},
+          {"step": 15, "condition": "export_job_csv_snapshot Err (в финализации)", "action": "ответить 'failed to export output csv {id}: {err}'"},
+          {"step": 16, "condition": "list_agent_job_items(Failed, limit=5) Err", "action": "unwrap_or_default — пустой список failure summaries"}
+        ],
+        "edge_cases": [
+          {"condition": "id_column задан, но ячейка пуста/только пробелы", "action": "source_id=None, item_id = 'row-<idx+1>'"},
+          {"condition": "два item_id совпадают", "action": "второму добавляется суффикс '-2', '-3', ... (saturating_add)"},
+          {"condition": "output_csv_path не указан в args", "action": "default: '<input_stem>.agent-job-<first8>.csv' в директории input (или сам input если parent отсутствует)"},
+          {"condition": "все строки пустые", "action": "parse_csv пропускает полностью пустые строки"},
+          {"condition": "BOM в первом хедере", "action": "trim_start_matches('\\u{feff}')"},
+          {"condition": "auto_export=true и файл уже создан циклом", "action": "повторный экспорт не делается (try_exists check)"}
+        ],
+        "lifecycle": {
+          "entity": "SRC-0017/entity/agent-job",
+          "states": ["created", "running", "cancelled", "completed", "failed"],
+          "transition": {
+            "from": "created",
+            "to": "running",
+            "guard": "runner options построены успешно",
+            "side_effect": "background event с параметрами concurrency; ожидание завершения worker loop; автоэкспорт CSV; progress emit force=true на финале"
+          }
+        },
+        "ux": null,
+        "result": "JSON с job_id, status, output_csv_path, total/completed/failed_items, job_error, failed_item_errors (up to 5); выходной CSV на диске; набор background events agent_job_progress:<payload>"
+      }
+    },
+    {
+      "id": "SRC-0017/uc.user/report-agent-job-result",
+      "src": "SRC-0017",
+      "composition": "use_case",
+      "level": "user",
+      "strategic_domain": "worker сабагент сообщает результат своей строки",
+      "terms": {
+        "actor": "Worker сабагент (CSV job item processor)",
+        "goal": "Зафиксировать свой per-item результат в БД и опционально попросить отмену всего job",
+        "steps": [
+          "1. Worker сабагент вызывает report_agent_job_result с { job_id, item_id, result: JSON object, stop? }",
+          "2. Обработчик report_agent_job_result парсит ReportAgentJobResultArgs",
+          "3. Обработчик report_agent_job_result проверяет result.is_object",
+          "4. Обработчик report_agent_job_result получает state_db",
+          "5. Обработчик report_agent_job_result берёт reporting_thread_id = session.conversation_id.to_string() (worker-сабагент)",
+          "6. Обработчик report_agent_job_result вызывает db.report_agent_job_item_result(job_id, item_id, reporting_thread_id, &result) и получает accepted: bool",
+          "7. Если accepted && stop==true → db.mark_agent_job_cancelled(job_id, 'cancelled by worker request')",
+          "8. Обработчик report_agent_job_result сериализует ReportAgentJobResultToolResult { accepted } и возвращает FunctionToolOutput(success=true)"
+        ],
+        "extensions (Cockburn)": [
+          {"step": 3, "condition": "result не JSON object", "action": "ответить 'result must be a JSON object'"},
+          {"step": 4, "condition": "state_db недоступен", "action": "Fatal 'sqlite state db is unavailable for this session'"},
+          {"step": 6, "condition": "report_agent_job_item_result Err", "action": "ответить 'failed to record agent job result for {job_id} / {item_id}: {err}'"},
+          {"step": 7, "condition": "mark_agent_job_cancelled Err", "action": "ошибка игнорируется (let _ =)"}
+        ],
+        "edge_cases": [
+          {"condition": "accepted=false", "action": "cancel не применяется даже если stop=true; результат accepted:false возвращается"},
+          {"condition": "stop не задан", "action": "по умолчанию false — cancel не делается"}
+        ],
+        "lifecycle": {
+          "entity": "SRC-0017/entity/agent-job-item",
+          "states": ["Running", "Completed", "Failed", "Pending (re-queued)"],
+          "transition": {
+            "from": "Running",
+            "to": "Completed (accepted=true, result_json сохранён) или осталось Running (runner сам переведёт в Completed на финализации)",
+            "guard": "report_agent_job_item_result db Ok && accepted",
+            "side_effect": "если stop=true и accepted → весь Job переводится в Cancelled"
+          }
+        },
+        "ux": null,
+        "result": "{ accepted: bool } возвращён worker-сабагенту; per-item result_json/reported_at зафиксированы; возможно весь Job отмечен как отменённый"
+      }
+    },
+    {
+      "id": "SRC-0017/uc.sub/enforce-spawn-depth-limit",
+      "src": "SRC-0017",
+      "composition": "use_case",
+      "level": "sub",
+      "strategic_domain": null,
+      "terms": {
+        "actor": "Модуль проверки глубины спавна",
+        "goal": "Не допустить создания дочернего агента сверх конфигурированной иерархической глубины",
+        "steps": [
+          "1. Модуль проверки глубины получает parent.session_source",
+          "2. Модуль проверки глубины вычисляет child_depth = next_thread_spawn_depth(session_source)",
+          "3. Модуль проверки глубины читает turn.config.agent_max_depth",
+          "4. Модуль проверки глубины вызывает exceeds_thread_spawn_depth_limit(child_depth, max_depth)",
+          "5. Если превышен — возвращает ошибку 'Agent depth limit reached. Solve the task yourself.' (resume/spawn handlers) или 'agent depth limit reached; this session cannot spawn more subagents' (agent_jobs)"
+        ],
+        "extensions (Cockburn)": null,
+        "edge_cases": [
+          {"condition": "max_depth=None", "action": "поведение определяется в exceeds_thread_spawn_depth_limit (вне SRC)"},
+          {"condition": "MultiAgentV2 feature enabled и child_depth >= max_depth", "action": "apply_spawn_agent_overrides НЕ отключает feature flags SpawnCsv/Collab (см. sub/apply-spawn-overrides)"}
+        ],
+        "lifecycle": null,
+        "ux": null,
+        "result": "Либо разрешение продолжить spawn, либо функциональная ошибка с понятным сообщением"
+      }
+    },
+    {
+      "id": "SRC-0017/uc.sub/assemble-spawn-config",
+      "src": "SRC-0017",
+      "composition": "use_case",
+      "level": "sub",
+      "strategic_domain": null,
+      "terms": {
+        "actor": "Модуль сборки spawn-конфига",
+        "goal": "Собрать базовый Config для нового сабагента из родительского turn-контекста и session base instructions",
+        "steps": [
+          "1. Модуль сборки spawn-конфига клонирует turn.config как базу",
+          "2. Модуль сборки spawn-конфига выставляет model = turn.model_info.slug",
+          "3. Модуль сборки spawn-конфига копирует model_provider из turn.provider",
+          "4. Модуль сборки spawn-конфига выставляет model_reasoning_effort = turn.reasoning_effort ?? model_info.default_reasoning_level",
+          "5. Модуль сборки spawn-конфига копирует reasoning_summary, developer_instructions, compact_prompt из turn",
+          "6. Модуль сборки spawn-конфига применяет apply_spawn_agent_runtime_overrides (approval, shell_env, linux_sandbox_exe, cwd, sandbox, file_system/network sandbox policies)",
+          "7. Для spawn: выставляет base_instructions = session.get_base_instructions().text; для resume: base_instructions = None (берутся из rollout)"
+        ],
+        "extensions (Cockburn)": [
+          {"step": 6, "condition": "approval_policy.set Err", "action": "ответить 'approval_policy is invalid: {err}'"},
+          {"step": 6, "condition": "sandbox_policy.set Err", "action": "ответить 'sandbox_policy is invalid: {err}'"}
+        ],
+        "edge_cases": null,
+        "lifecycle": null,
+        "ux": null,
+        "result": "Готовый Config (base_instructions задан для spawn или пуст для resume) для передачи в agent_control"
+      }
+    },
+    {
+      "id": "SRC-0017/uc.sub/apply-spawn-overrides",
+      "src": "SRC-0017",
+      "composition": "use_case",
+      "level": "sub",
+      "strategic_domain": null,
+      "terms": {
+        "actor": "Модуль применения spawn-overrides (модель, эффорт, роль, runtime, depth)",
+        "goal": "Наложить на spawn-конфиг пользовательские переопределения модели/эффорта/роли и служебные overrides, контролируя несовместимые комбинации",
+        "steps": [
+          "1. Модуль overrides: если fork (FullHistory или v1 fork_context=true) и заданы agent_type/model/reasoning_effort — reject_full_fork_spawn_overrides",
+          "2. Модуль overrides (если не fork): apply_requested_spawn_agent_model_overrides — ищет модель среди session.services.models_manager.list_models(Offline) →triggers SRC-0017/uc.sub/select-spawn-model",
+          "3. Модуль overrides (если модель задана): получает selected_model_info и либо валидирует переданный reasoning_effort, либо берёт model_info.default_reasoning_level",
+          "4. Модуль overrides (если только reasoning_effort задан): валидирует для turn.model_info →triggers SRC-0017/uc.sub/validate-reasoning-effort",
+          "5. Модуль overrides: apply_role_to_config(config, role_name) — если роль задана, накладывает её (иначе no-op)",
+          "6. Модуль overrides: apply_spawn_agent_overrides(config, child_depth) — если child_depth >= agent_max_depth и feature MultiAgentV2 не включён, отключает feature flags SpawnCsv и Collab"
+        ],
+        "extensions (Cockburn)": [
+          {"step": 1, "condition": "fork + любой override", "action": "'Full-history forked agents inherit ...; omit agent_type, model, and reasoning_effort, or spawn without fork_context/fork_turns=all.'"},
+          {"step": 5, "condition": "apply_role_to_config Err", "action": "сообщение от модуля ролей пробрасывается как RespondToModel"}
+        ],
+        "edge_cases": [
+          {"condition": "ни model, ни reasoning_effort не заданы", "action": "apply_requested_spawn_agent_model_overrides — no-op early return"},
+          {"condition": "MultiAgentV2 feature включён", "action": "SpawnCsv/Collab не отключаются даже при достижении глубины"}
+        ],
+        "lifecycle": null,
+        "ux": null,
+        "result": "Модифицированный Config, готовый для spawn_agent_with_metadata; все несовместимые комбинации уже отклонены"
+      }
+    },
+    {
+      "id": "SRC-0017/uc.sub/select-spawn-model",
+      "src": "SRC-0017",
+      "composition": "use_case",
+      "level": "sub",
+      "strategic_domain": null,
+      "terms": {
+        "actor": "Модуль выбора модели для спавна",
+        "goal": "Убедиться, что запрошенная модель присутствует в списке доступных и вернуть её каноническое имя",
+        "steps": [
+          "1. Модуль выбора модели читает session.services.models_manager.list_models(RefreshStrategy::Offline)",
+          "2. Модуль выбора модели ищет ModelPreset где model == requested_model",
+          "3. Модуль выбора модели возвращает найденное имя либо ошибку со списком доступных моделей"
+        ],
+        "extensions (Cockburn)": [
+          {"step": 2, "condition": "модель не найдена", "action": "ответить 'Unknown model `{requested_model}` for spawn_agent. Available models: {list}'"}
+        ],
+        "edge_cases": null,
+        "lifecycle": null,
+        "ux": null,
+        "result": "Имя выбранной модели, гарантированно существующей в manager"
+      }
+    },
+    {
+      "id": "SRC-0017/uc.sub/validate-reasoning-effort",
+      "src": "SRC-0017",
+      "composition": "use_case",
+      "level": "sub",
+      "strategic_domain": null,
+      "terms": {
+        "actor": "Модуль валидации reasoning effort",
+        "goal": "Проверить, что запрошенный ReasoningEffort поддерживается для целевой модели",
+        "steps": [
+          "1. Модуль валидации проверяет наличие preset с preset.effort == requested_reasoning_effort в supported_reasoning_levels",
+          "2. Если есть — Ok; если нет — возвращает ошибку со списком supported"
+        ],
+        "extensions (Cockburn)": [
+          {"step": 2, "condition": "effort не поддерживается", "action": "ответить 'Reasoning effort `{x}` is not supported for model `{m}`. Supported reasoning efforts: {list}'"}
+        ],
+        "edge_cases": null,
+        "lifecycle": null,
+        "ux": null,
+        "result": "Подтверждена совместимость модель+эффорт, иначе понятная ошибка"
+      }
+    },
+    {
+      "id": "SRC-0017/uc.sub/resolve-fork-turns",
+      "src": "SRC-0017",
+      "composition": "use_case",
+      "level": "sub",
+      "strategic_domain": null,
+      "terms": {
+        "actor": "Парсер аргумента fork_turns (v2)",
+        "goal": "Преобразовать строковой параметр fork_turns в SpawnAgentForkMode или None",
+        "steps": [
+          "1. Парсер fork_turns отклоняет fork_context в v2 (не поддерживается)",
+          "2. Парсер fork_turns берёт trimmed непустое значение; пустое/отсутствует → None (без форка)",
+          "3. Парсер fork_turns: 'none' (case-insensitive) → None; 'all' → FullHistory",
+          "4. Парсер fork_turns: иначе parse как usize; 0 — ошибка; n>0 → LastNTurns(n)"
+        ],
+        "extensions (Cockburn)": [
+          {"step": 1, "condition": "fork_context задан", "action": "ответить 'fork_context is not supported in MultiAgentV2; use fork_turns instead'"},
+          {"step": 4, "condition": "не парсится в usize", "action": "ответить 'fork_turns must be `none`, `all`, or a positive integer string'"},
+          {"step": 4, "condition": "=0", "action": "та же ошибка"}
+        ],
+        "edge_cases": null,
+        "lifecycle": null,
+        "ux": null,
+        "result": "Option<SpawnAgentForkMode>: None | FullHistory | LastNTurns(n>=1)"
+      }
+    },
+    {
+      "id": "SRC-0017/uc.sub/derive-thread-spawn-source",
+      "src": "SRC-0017",
+      "composition": "use_case",
+      "level": "sub",
+      "strategic_domain": null,
+      "terms": {
+        "actor": "Модуль построения SessionSource сабагента",
+        "goal": "Построить SessionSource::SubAgent(ThreadSpawn { ... }) из родительского контекста, глубины, роли и имени задачи",
+        "steps": [
+          "1. Модуль построения источника: если task_name задан — agent_path = parent.get_agent_path().unwrap_or(AgentPath::root).join(task_name); иначе agent_path = None",
+          "2. Модуль построения источника оборачивает результат в SessionSource::SubAgent(SubAgentSource::ThreadSpawn { parent_thread_id, depth, agent_path, agent_nickname=None, agent_role: role_name })"
+        ],
+        "extensions (Cockburn)": [
+          {"step": 1, "condition": "AgentPath::join вернул Err", "action": "ответить текстом ошибки"}
+        ],
+        "edge_cases": [
+          {"condition": "task_name=None", "action": "agent_path=None — используется в resume и CSV-воркерах"}
+        ],
+        "lifecycle": null,
+        "ux": null,
+        "result": "SessionSource, который однозначно позиционирует нового агента в иерархии parent→child"
+      }
+    },
+    {
+      "id": "SRC-0017/uc.sub/resolve-agent-target",
+      "src": "SRC-0017",
+      "composition": "use_case",
+      "level": "sub",
+      "strategic_domain": null,
+      "terms": {
+        "actor": "Резолвер target сабагента (v2)",
+        "goal": "Преобразовать пользовательскую строку target (path или thread_id) в ThreadId через внешний helper resolve_agent_target",
+        "steps": [
+          "1. Резолвер target вызывает resolve_agent_target(session, turn, target) (импорт из crate::agent::agent_resolver)",
+          "2. Резолвер target возвращает ThreadId при успехе или пробрасывает FunctionCallError при неудаче"
+        ],
+        "extensions (Cockburn)": null,
+        "edge_cases": null,
+        "lifecycle": null,
+        "ux": null,
+        "result": "ThreadId конкретного сабагента либо ошибка, пригодная для ответа модели"
+      }
+    },
+    {
+      "id": "SRC-0017/uc.sub/parse-collab-input",
+      "src": "SRC-0017",
+      "composition": "use_case",
+      "level": "sub",
+      "strategic_domain": null,
+      "terms": {
+        "actor": "Модуль парсинга collab input (message vs items)",
+        "goal": "Нормализовать входные аргументы send_input/spawn v1 к Op::UserInput, гарантируя ровно один из источников и непустоту",
+        "steps": [
+          "1. Модуль парсинга collab input: если (message, items) = (Some, Some) — отклоняет",
+          "2. Модуль парсинга collab input: если (None, None) — отклоняет",
+          "3. Модуль парсинга collab input: при Some(message) trim и проверка непустоты, затем оборачивает в vec![UserInput::Text { text, text_elements: [] }]",
+          "4. Модуль парсинга collab input: при Some(items) проверяет не пуст, затем возвращает items как Op"
+        ],
+        "extensions (Cockburn)": [
+          {"step": 1, "condition": "оба заданы", "action": "'Provide either message or items, but not both'"},
+          {"step": 2, "condition": "оба None", "action": "'Provide one of: message or items'"},
+          {"step": 3, "condition": "message пустой", "action": "'Empty message can't be sent to an agent'"},
+          {"step": 4, "condition": "items пустой", "action": "'Items can't be empty'"}
+        ],
+        "edge_cases": null,
+        "lifecycle": null,
+        "ux": null,
+        "result": "Op::UserInput с валидным набором input items"
+      }
+    },
+    {
+      "id": "SRC-0017/uc.sub/handle-message-submission",
+      "src": "SRC-0017",
+      "composition": "use_case",
+      "level": "sub",
+      "strategic_domain": null,
+      "terms": {
+        "actor": "Модуль отправки inter-agent сообщения (v2)",
+        "goal": "Доставить plain-text prompt сабагенту через InterAgentCommunication с учётом MessageDeliveryMode и защитой root-агента",
+        "steps": [
+          "1. Модуль отправки сообщения: message_content(message) — проверка trim непустоты",
+          "2. Модуль отправки сообщения: resolve_agent_target(session, turn, target) →triggers SRC-0017/uc.sub/resolve-agent-target",
+          "3. Модуль отправки сообщения получает метаданные receiver_agent",
+          "4. Модуль отправки сообщения: если mode=TriggerTurn и receiver.agent_path is_root → отклоняет",
+          "5. Модуль отправки сообщения: если interrupt=true → agent_control.interrupt_agent(receiver_thread_id)",
+          "6. Модуль отправки сообщения эмитит CollabAgentInteractionBeginEvent",
+          "7. Модуль отправки сообщения: требует receiver_agent_path (ok_or 'target agent is missing an agent_path')",
+          "8. Модуль отправки сообщения строит InterAgentCommunication::new(sender_path, receiver_path, [], prompt, trigger_turn=true)",
+          "9. Модуль отправки сообщения применяет mode.apply (QueueOnly → trigger_turn=false, TriggerTurn → trigger_turn=true)",
+          "10. Модуль отправки сообщения вызывает agent_control.send_inter_agent_communication(receiver_thread_id, communication)",
+          "11. Модуль отправки сообщения читает текущий статус и эмитит CollabAgentInteractionEndEvent",
+          "12. Модуль отправки сообщения пробрасывает ошибку send или возвращает пустой FunctionToolOutput(success=true)"
+        ],
+        "extensions (Cockburn)": [
+          {"step": 1, "condition": "message пустой после trim", "action": "'Empty message can't be sent to an agent'"},
+          {"step": 4, "condition": "root + TriggerTurn", "action": "'Tasks can't be assigned to the root agent'"},
+          {"step": 5, "condition": "interrupt_agent Err", "action": "collab_agent_error"},
+          {"step": 7, "condition": "agent_path отсутствует", "action": "'target agent is missing an agent_path'"},
+          {"step": 10, "condition": "send_inter_agent_communication Err", "action": "эмитится Interaction End со статусом, затем возвращается collab_agent_error"}
+        ],
+        "edge_cases": [
+          {"condition": "sender session_source без agent_path", "action": "fallback на AgentPath::root"}
+        ],
+        "lifecycle": null,
+        "ux": null,
+        "result": "Сообщение доставлено в mailbox (trigger_turn зависит от mode); events Interaction Begin/End; пустой success payload"
+      }
+    },
+    {
+      "id": "SRC-0017/uc.sub/parse-csv-input",
+      "src": "SRC-0017",
+      "composition": "use_case",
+      "level": "sub",
+      "strategic_domain": null,
+      "terms": {
+        "actor": "Парсер CSV входа",
+        "goal": "Превратить содержимое CSV файла в пару (headers, rows) с очисткой BOM и пропуском полностью пустых строк",
+        "steps": [
+          "1. Парсер CSV строит ReaderBuilder(has_headers=true, flexible=true)",
+          "2. Парсер CSV читает хедер-запись и превращает в Vec<String>; первый хедер — trim_start_matches('\\u{feff}')",
+          "3. Парсер CSV для каждой записи: превращает в Vec<String>; если все ячейки пустые — пропускает; иначе добавляет в rows"
+        ],
+        "extensions (Cockburn)": [
+          {"step": 2, "condition": "reader.headers Err", "action": "возвращает err.to_string()"},
+          {"step": 3, "condition": "record Err", "action": "возвращает err.to_string()"}
+        ],
+        "edge_cases": [
+          {"condition": "flexible=true", "action": "разное число полей допустимо на уровне парсера; проверка на равенство хедеру выполняется позже в run-csv-agent-job"}
+        ],
+        "lifecycle": null,
+        "ux": null,
+        "result": "(headers: Vec<String> без BOM, rows: Vec<Vec<String>> без полностью пустых строк)"
+      }
+    },
+    {
+      "id": "SRC-0017/uc.sub/ensure-unique-headers",
+      "src": "SRC-0017",
+      "composition": "use_case",
+      "level": "sub",
+      "strategic_domain": null,
+      "terms": {
+        "actor": "Валидатор уникальности хедеров",
+        "goal": "Проверить, что в списке хедеров нет дубликатов",
+        "steps": [
+          "1. Валидатор уникальности проходит хедеры, вставляя в HashSet",
+          "2. Если insert вернул false — ошибка с именем дубликата"
+        ],
+        "extensions (Cockburn)": [
+          {"step": 2, "condition": "дубликат", "action": "'csv header {header} is duplicated'"}
+        ],
+        "edge_cases": null,
+        "lifecycle": null,
+        "ux": null,
+        "result": "Ok(()) или RespondToModel ошибка с конкретным дублирующимся хедером"
+      }
+    },
+    {
+      "id": "SRC-0017/uc.sub/build-runner-options",
+      "src": "SRC-0017",
+      "composition": "use_case",
+      "level": "sub",
+      "strategic_domain": null,
+      "terms": {
+        "actor": "Модуль сборки JobRunnerOptions",
+        "goal": "Подготовить параметры исполнения AgentJob: max_concurrency и spawn_config — с учётом depth limit и кэпов",
+        "steps": [
+          "1. Модуль сборки опций вычисляет child_depth и проверяет agent_max_depth →triggers SRC-0017/uc.sub/enforce-spawn-depth-limit",
+          "2. Модуль сборки опций нормализует concurrency →triggers SRC-0017/uc.sub/normalize-concurrency",
+          "3. Модуль сборки опций получает session.get_base_instructions()",
+          "4. Модуль сборки опций строит spawn_config через build_agent_spawn_config →triggers SRC-0017/uc.sub/assemble-spawn-config",
+          "5. Модуль сборки опций возвращает JobRunnerOptions { max_concurrency, spawn_config }"
+        ],
+        "extensions (Cockburn)": [
+          {"step": 1, "condition": "depth превышен", "action": "'agent depth limit reached; this session cannot spawn more subagents'"}
+        ],
+        "edge_cases": null,
+        "lifecycle": null,
+        "ux": null,
+        "result": "JobRunnerOptions готовы к передаче в run_agent_job_loop"
+      }
+    },
+    {
+      "id": "SRC-0017/uc.sub/normalize-concurrency",
+      "src": "SRC-0017",
+      "composition": "use_case",
+      "level": "sub",
+      "strategic_domain": null,
+      "terms": {
+        "actor": "Нормализатор concurrency",
+        "goal": "Привести запрошенный параллелизм к безопасному диапазону с учётом hardcoded кэпов и agent_max_threads",
+        "steps": [
+          "1. Нормализатор берёт requested.unwrap_or(DEFAULT_AGENT_JOB_CONCURRENCY=16), затем max(1)",
+          "2. Нормализатор ограничивает результат min(MAX_AGENT_JOB_CONCURRENCY=64)",
+          "3. Нормализатор (если max_threads задан): ограничивает min(max_threads.max(1))"
+        ],
+        "extensions (Cockburn)": null,
+        "edge_cases": [
+          {"condition": "requested=0", "action": ".max(1) → минимум 1"},
+          {"condition": "max_threads=Some(0)", "action": ".max(1) → минимум 1"}
+        ],
+        "lifecycle": null,
+        "ux": null,
+        "result": "usize в диапазоне [1, min(64, agent_max_threads или 64)]"
+      }
+    },
+    {
+      "id": "SRC-0017/uc.sub/run-agent-job-loop",
+      "src": "SRC-0017",
+      "composition": "use_case",
+      "level": "sub",
+      "strategic_domain": null,
+      "terms": {
+        "actor": "Раннер CSV-job цикла",
+        "goal": "Прогнать AgentJob до завершения или отмены: рекавер, спавн, наблюдение, финализация, прогресс, авто-экспорт",
+        "steps": [
+          "1. Раннер загружает AgentJob и определяет runtime_timeout = max_runtime_seconds или DEFAULT_AGENT_JOB_ITEM_TIMEOUT (30 min)",
+          "2. Раннер инициализирует active_items: HashMap<ThreadId, ActiveJobItem> и JobProgressEmitter",
+          "3. Раннер восстанавливает Running items через recover_running_items →triggers SRC-0017/uc.sub/recover-running-items",
+          "4. Раннер эмитит инициальный прогресс с force=true",
+          "5. Раннер читает флаг cancel_requested (db.is_agent_job_cancelled)",
+          "6. Раннер входит в loop: снова проверяет cancellation; если новая — эмитит background event 'agent job {id} cancellation requested; stopping new workers'",
+          "7. Раннер (если не отменён и active_items.len() < max_concurrency): выбирает slots, читает pending_items (limit=slots) и спавнит worker для каждого →triggers SRC-0017/uc.sub/spawn-csv-worker",
+          "8. Раннер проверяет stale items через reap_stale_active_items →triggers SRC-0017/uc.sub/reap-stale-items",
+          "9. Раннер находит finished threads через find_finished_threads (is_final по status_rx или get_status)",
+          "10. Раннер: если никто не завершился: если cancel_requested и running_items=0 и active=empty — break; иначе если не cancel и pending=0 и running=0 и active=empty — break; если не было progress — wait_for_status_change (FuturesUnordered.next или sleep STATUS_POLL_INTERVAL=250ms) и continue",
+          "11. Раннер для каждого finished: finalize_finished_item →triggers SRC-0017/uc.sub/finalize-finished-item; удаляет из active_items; эмитит прогресс",
+          "12. По выходу из loop: читает progress, export_job_csv_snapshot (при ошибке — mark_agent_job_failed и ранний return Ok)",
+          "13. Раннер: если cancelled — эмитит 'agent job {id} cancelled with {pending} unprocessed items' и принудительный прогресс; return Ok",
+          "14. Раннер: если failed_items>0 — эмитит background event 'agent job completed with {n} failed items'",
+          "15. Раннер: db.mark_agent_job_completed и эмитит финальный прогресс (force=true)"
+        ],
+        "extensions (Cockburn)": [
+          {"step": 1, "condition": "get_agent_job None", "action": "anyhow!('agent job {id} was not found')"},
+          {"step": 12, "condition": "export_job_csv_snapshot Err", "action": "db.mark_agent_job_failed('auto-export failed: {err}') и return Ok (ошибка снаружи уже обработана)"}
+        ],
+        "edge_cases": [
+          {"condition": "fsync/create_dir_all parent failure", "action": "пробрасывается из export_job_csv_snapshot"},
+          {"condition": "initial cancel уже true", "action": "слоты не выделяются; loop сразу ждёт финализации текущих"}
+        ],
+        "lifecycle": {
+          "entity": "SRC-0017/entity/agent-job",
+          "states": ["running", "cancelled", "completed", "failed"],
+          "transition": {
+            "from": "running",
+            "to": "cancelled|completed|failed",
+            "guard": "cancelled ⇐ is_agent_job_cancelled true; failed ⇐ run loop Err (ранее); completed ⇐ нормальный выход",
+            "side_effect": "auto-export CSV; background events; финальный progress emit с force=true"
+          }
+        },
+        "ux": null,
+        "result": "AgentJob в терминальном статусе; файл output_csv_path обновлён; подписчики прогресса получили финальный update"
+      }
+    },
+    {
+      "id": "SRC-0017/uc.sub/recover-running-items",
+      "src": "SRC-0017",
+      "composition": "use_case",
+      "level": "sub",
+      "strategic_domain": null,
+      "terms": {
+        "actor": "Модуль восстановления Running items",
+        "goal": "Приподнять ранее стартовавшие items после перезапуска: либо повесить в active_items, либо отметить как finished/failed",
+        "steps": [
+          "1. Модуль восстановления items читает db.list_agent_job_items(job_id, Running)",
+          "2. Для каждого item: если is_item_stale(item, runtime_timeout) — отметить failed ('worker exceeded max runtime of {rt:?}'), shutdown_live_agent и перейти к следующему",
+          "3. Модуль восстановления items (если не stale): требует assigned_thread_id; если None — mark_failed('running item is missing assigned_thread_id')",
+          "4. Модуль восстановления items: конвертирует assigned_thread_id в ThreadId; если Err — mark_failed('invalid assigned_thread_id: {err}')",
+          "5. Модуль восстановления items: если is_final(get_status(thread_id)) — finalize_finished_item →triggers SRC-0017/uc.sub/finalize-finished-item",
+          "6. Модуль восстановления items (иначе): вставляет в active_items ActiveJobItem { item_id, started_at: started_at_from_item, status_rx: subscribe_status.ok() }"
+        ],
+        "extensions (Cockburn)": null,
+        "edge_cases": [
+          {"condition": "updated_at в будущем (signed_duration.to_std Err)", "action": "started_at = Instant::now(); is_item_stale = false"},
+          {"condition": "instant::now().checked_sub(age) не удался", "action": "started_at = Instant::now()"}
+        ],
+        "lifecycle": null,
+        "ux": null,
+        "result": "active_items синхронизирован с БД — каждому ещё-живому агенту соответствует запись, остальные переведены в Failed/Completed"
+      }
+    },
+    {
+      "id": "SRC-0017/uc.sub/spawn-csv-worker",
+      "src": "SRC-0017",
+      "composition": "use_case",
+      "level": "sub",
+      "strategic_domain": null,
+      "terms": {
+        "actor": "Модуль спавна CSV-worker сабагента",
+        "goal": "Запустить по одному сабагенту-воркеру на каждый pending item, зарегистрировать его в active_items",
+        "steps": [
+          "1. Модуль спавна worker строит worker prompt через build_worker_prompt(job, item) →triggers SRC-0017/uc.sub/build-worker-prompt",
+          "2. Модуль спавна worker оборачивает prompt в UserInput::Text",
+          "3. Модуль спавна worker вызывает agent_control.spawn_agent(spawn_config, items, Some(SessionSource::SubAgent(SubAgentSource::Other('agent_job:{job_id}'))))",
+          "4. Модуль спавна worker: при CodexErr::AgentLimitReached — mark_agent_job_item_pending(error=None) и break из цикла слотов (поставить в очередь на следующую итерацию)",
+          "5. Модуль спавна worker: при другой ошибке — mark_agent_job_item_failed('failed to spawn worker: {err}') и progressed=true, continue",
+          "6. Модуль спавна worker (успех): db.mark_agent_job_item_running_with_thread(job_id, item_id, thread_id.to_string()); если !assigned — shutdown_live_agent и continue (гонка с другим спавном)",
+          "7. Модуль спавна worker вставляет active_items[thread_id] = ActiveJobItem { item_id, started_at: Instant::now(), status_rx: subscribe_status.ok() }; progressed=true"
+        ],
+        "extensions (Cockburn)": [
+          {"step": 4, "condition": "глобальный лимит агентов достигнут", "action": "item возвращается в Pending без error; цикл слотов прерывается до следующей итерации"},
+          {"step": 5, "condition": "прочая spawn ошибка", "action": "item → Failed; item_id освобождён навсегда (повтора нет)"}
+        ],
+        "edge_cases": [
+          {"condition": "двойное assignment thread_id", "action": "второй mark вернёт !assigned → shutdown_live_agent убирает дубль"}
+        ],
+        "lifecycle": {
+          "entity": "SRC-0017/entity/agent-job-item",
+          "states": ["Pending", "Running", "Failed"],
+          "transition": {
+            "from": "Pending",
+            "to": "Running или Failed или снова Pending",
+            "guard": "см. extensions выше",
+            "side_effect": "spawn worker agent; assigned_thread_id фиксируется в БД"
+          }
+        },
+        "ux": null,
+        "result": "Новые ActiveJobItem entries в памяти; соответствующие AgentJobItem в Running с thread_id"
+      }
+    },
+    {
+      "id": "SRC-0017/uc.sub/build-worker-prompt",
+      "src": "SRC-0017",
+      "composition": "use_case",
+      "level": "sub",
+      "strategic_domain": null,
+      "terms": {
+        "actor": "Билдер worker prompt",
+        "goal": "Сгенерировать инструкцию для worker-сабагента с рендерингом шаблона и описанием обязательного tool-контракта",
+        "steps": [
+          "1. Билдер prompt: render_instruction_template(instruction, row_json) — экранирует {{ и }} в sentinel'ы, заменяет {column} значениями из row (string или to_string для non-string), восстанавливает literal {}",
+          "2. Билдер prompt: output_schema — serde_json::to_string_pretty(output_schema_json) или '{}' если None",
+          "3. Билдер prompt: row_json pretty",
+          "4. Билдер prompt: собирает итоговый текст: 'You are processing one item... Job ID: {job_id}, Item ID: {item_id}, Task instruction, Input row JSON, Expected result schema... You MUST call report_agent_job_result tool exactly once with job_id, item_id, result; stop=true если нужно; after the tool call succeeds, stop.'"
+        ],
+        "extensions (Cockburn)": [
+          {"step": 2, "condition": "to_string_pretty Err", "action": "проброс anyhow ошибки"}
+        ],
+        "edge_cases": [
+          {"condition": "row_json не object", "action": "render_instruction_template возвращает строку без подстановок, но с восстановленными {} (guard в .as_object())"},
+          {"condition": "в instruction есть literal {{ или }}", "action": "сохраняются как { и } после рендеринга"}
+        ],
+        "lifecycle": null,
+        "ux": null,
+        "result": "Строка-prompt с контекстом задачи и явным tool-контрактом report_agent_job_result"
+      }
+    },
+    {
+      "id": "SRC-0017/uc.sub/reap-stale-items",
+      "src": "SRC-0017",
+      "composition": "use_case",
+      "level": "sub",
+      "strategic_domain": null,
+      "terms": {
+        "actor": "Риппер stale items",
+        "goal": "Остановить воркеров, превысивших runtime_timeout, и освободить слоты",
+        "steps": [
+          "1. Риппер собирает stale: все (thread_id, item_id) где item.started_at.elapsed() >= runtime_timeout",
+          "2. Если пусто — возвращает false (нет прогресса)",
+          "3. Риппер для каждого stale: db.mark_agent_job_item_failed('worker exceeded max runtime of {runtime_timeout:?}'), shutdown_live_agent, active_items.remove(&thread_id)",
+          "4. Возвращает true (был прогресс)"
+        ],
+        "extensions (Cockburn)": null,
+        "edge_cases": null,
+        "lifecycle": null,
+        "ux": null,
+        "result": "Stale агенты остановлены; соответствующие items помечены Failed; цикл получает сигнал progressed=true"
+      }
+    },
+    {
+      "id": "SRC-0017/uc.sub/finalize-finished-item",
+      "src": "SRC-0017",
+      "composition": "use_case",
+      "level": "sub",
+      "strategic_domain": null,
+      "terms": {
+        "actor": "Финализатор завершённого item",
+        "goal": "Закрыть item по факту завершения worker'а: перевести в Completed если есть результат, иначе в Failed",
+        "steps": [
+          "1. Финализатор читает item через db.get_agent_job_item (anyhow если None)",
+          "2. Финализатор: если status == Running — если result_json.is_some() → mark_agent_job_item_completed; иначе → mark_agent_job_item_failed('worker finished without calling report_agent_job_result')",
+          "3. Финализатор вызывает agent_control.shutdown_live_agent(thread_id)"
+        ],
+        "extensions (Cockburn)": [
+          {"step": 1, "condition": "item не найден", "action": "anyhow!('job item not found for finalization: {job_id}/{item_id}')"}
+        ],
+        "edge_cases": [
+          {"condition": "status != Running (уже Completed/Failed)", "action": "никаких изменений в БД, но shutdown_live_agent всё равно вызывается"}
+        ],
+        "lifecycle": {
+          "entity": "SRC-0017/entity/agent-job-item",
+          "states": ["Running", "Completed", "Failed"],
+          "transition": {
+            "from": "Running",
+            "to": "Completed или Failed",
+            "guard": "result_json is_some? да → Completed; нет → Failed",
+            "side_effect": "shutdown_live_agent — worker thread удалён"
+          }
+        },
+        "ux": null,
+        "result": "AgentJobItem в Completed/Failed; worker thread shutdown"
+      }
+    },
+    {
+      "id": "SRC-0017/uc.sub/emit-agent-job-progress",
+      "src": "SRC-0017",
+      "composition": "use_case",
+      "level": "sub",
+      "strategic_domain": null,
+      "terms": {
+        "actor": "Эмиттер прогресса AgentJob (JobProgressEmitter)",
+        "goal": "Публиковать прогресс batch-задачи в сессионном стриме не чаще PROGRESS_EMIT_INTERVAL и только при значимых изменениях (или при force=true)",
+        "steps": [
+          "1. Эмиттер прогресса вычисляет processed = completed_items + failed_items",
+          "2. Эмиттер прогресса: should_emit = force || processed!=last_processed || failed_items!=last_failed || last_emit_at.elapsed() >= PROGRESS_EMIT_INTERVAL",
+          "3. Если !should_emit — return Ok",
+          "4. Эмиттер прогресса вычисляет eta_seconds = if processed>0 && elapsed>0: let rate=processed/elapsed; if rate>0 Some((remaining/rate).round() as u64) else None; else None",
+          "5. Эмиттер прогресса строит AgentJobProgressUpdate, сериализует в JSON",
+          "6. Эмиттер прогресса вызывает session.notify_background_event(turn, 'agent_job_progress:{payload}')",
+          "7. Эмиттер прогресса обновляет last_emit_at=now, last_processed, last_failed"
+        ],
+        "extensions (Cockburn)": null,
+        "edge_cases": [
+          {"condition": "первый emit при старте (last_emit_at начинается с now-PROGRESS_EMIT_INTERVAL)", "action": "должен пропускать gating по времени сразу на первом force=true вызове"},
+          {"condition": "processed=0 или elapsed=0", "action": "eta_seconds=None"},
+          {"condition": "rate=0", "action": "eta_seconds=None"}
+        ],
+        "lifecycle": null,
+        "ux": null,
+        "result": "Поток event'ов 'agent_job_progress:<JSON>' с total/pending/running/completed/failed/eta_seconds"
+      }
+    },
+    {
+      "id": "SRC-0017/uc.sub/export-agent-job-csv",
+      "src": "SRC-0017",
+      "composition": "use_case",
+      "level": "sub",
+      "strategic_domain": null,
+      "terms": {
+        "actor": "Экспортёр AgentJob в CSV",
+        "goal": "Сформировать и записать итоговый CSV со всеми items и их результатами по схеме input_headers + 10 служебных колонок",
+        "steps": [
+          "1. Экспортёр читает list_agent_job_items(job_id, status=None, limit=None)",
+          "2. Экспортёр строит output_headers = input_headers + ['job_id','item_id','row_index','source_id','status','attempt_count','last_error','result_json','reported_at','completed_at']",
+          "3. Экспортёр эскейпит каждый хедер через csv_escape и соединяет запятыми, добавляет '\\n'",
+          "4. Экспортёр для каждого item: требует row_json.as_object; для каждого input header ищет значение (value_to_csv_string: Null→'', String, Bool, Number→to_string, Array/Object→value.to_string) и csv_escape; затем добавляет 10 служебных значений (id, status, attempt_count, last_error, result_json, reported_at/completed_at в RFC3339)",
+          "5. Экспортёр: создаёт родительский каталог при необходимости (tokio::fs::create_dir_all) и tokio::fs::write",
+          "6. csv_escape: если строка содержит ',' '\\n' '\\r' или '\"' — экранирует '\"' как '\"\"' и оборачивает в кавычки; иначе оставляет как есть"
+        ],
+        "extensions (Cockburn)": [
+          {"step": 4, "condition": "row_json не object", "action": "RespondToModel 'row_json for item {id} is not a JSON object'"},
+          {"step": 1, "condition": "list_agent_job_items Err", "action": "anyhow проброс"},
+          {"step": 5, "condition": "IO Err", "action": "anyhow проброс"}
+        ],
+        "edge_cases": [
+          {"condition": "reported_at/completed_at=None", "action": "пустая ячейка"},
+          {"condition": "result_json=None", "action": "пустая ячейка (ToString на None → map_or_else String::new)"},
+          {"condition": "source_id/last_error=None", "action": "пустая ячейка"}
+        ],
+        "lifecycle": null,
+        "ux": null,
+        "result": "Файл output_csv_path содержит CSV со всеми items job; количество строк = количество items"
+      }
+    },
+    {
+      "id": "SRC-0017/uc.sub/build-wait-agent-statuses",
+      "src": "SRC-0017",
+      "composition": "use_case",
+      "level": "sub",
+      "strategic_domain": null,
+      "terms": {
+        "actor": "Агрегатор wait agent statuses (v1)",
+        "goal": "Сформировать упорядоченный список CollabAgentStatusEntry для события CollabWaitingEnd: сначала явно запрошенные агенты, затем остальные по сортировке ThreadId",
+        "steps": [
+          "1. Агрегатор если statuses пуст — возвращает []",
+          "2. Агрегатор проходит receiver_agents: для каждого помечает в seen, и если его thread_id присутствует в statuses — добавляет CollabAgentStatusEntry { thread_id, nickname, role, status }",
+          "3. Агрегатор собирает extras: все thread_id из statuses, которых нет в seen, оформляет их с nickname=None, role=None",
+          "4. Агрегатор сортирует extras по thread_id.to_string() и добавляет в entries"
+        ],
+        "extensions (Cockburn)": null,
+        "edge_cases": [
+          {"condition": "receiver_agent.thread_id отсутствует в statuses (не вернулся до deadline)", "action": "его CollabAgentStatusEntry не добавляется"}
+        ],
+        "lifecycle": null,
+        "ux": null,
+        "result": "Vec<CollabAgentStatusEntry> с детерминированным порядком"
+      }
+    }
+  ]
+}

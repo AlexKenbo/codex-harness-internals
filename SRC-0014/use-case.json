@@ -1,0 +1,447 @@
+{
+  "src": "SRC-0014",
+  "schema_version": "2.0",
+  "lens": "use_case",
+  "compositions": [
+    {
+      "id": "SRC-0014/uc.sub/dispatch-tool-call",
+      "src": "SRC-0014",
+      "composition": "use_case",
+      "level": "sub",
+      "strategic_domain": null,
+      "terms": {
+        "actor": "Реестр инструментов (ToolRegistry)",
+        "goal": "Выполнить вызов инструмента через его обработчик с hooks lifecycle",
+        "steps": [
+          "1. ToolRegistry увеличивает счётчик turn_state.tool_calls (saturating_add 1)",
+          "2. ToolRegistry находит handler по tool_name в handlers HashMap",
+          "3. ToolRegistry проверяет handler.matches_kind(payload) — совместимость вида payload с kind handler'а",
+          "4. ToolRegistry вызывает handler.pre_tool_use_payload(invocation) и при наличии — запускает PreToolUse hook (run_pre_tool_use_hooks)",
+          "5. ToolRegistry определяет is_mutating = handler.is_mutating(invocation)",
+          "6. Если is_mutating — ToolRegistry ждёт освобождения turn.tool_call_gate (wait_ready)",
+          "7. ToolRegistry вызывает handler.handle_any(invocation) и оборачивает результат в AnyToolResult с call_id, payload, Box<dyn ToolOutput>",
+          "8. ToolRegistry сохраняет preview (log_preview) и success (success_for_logging) для telemetry",
+          "9. При успехе ToolRegistry вызывает handler.post_tool_use_payload и запускает PostToolUse hook (run_post_tool_use_hooks)",
+          "10. ToolRegistry диспатчит deprecated AfterToolUse hook с output_preview, duration, success, executed, mutating"
+        ],
+        "extensions (Cockburn)": [
+          {"step": 2, "condition": "handler отсутствует для tool_name", "action": "залогировать через otel.tool_result_with_tags и вернуть FunctionCallError::RespondToModel(unsupported_tool_call_message) — 'unsupported call: {name}' или 'unsupported custom tool call: {name}' для Custom payload"},
+          {"step": 3, "condition": "handler.matches_kind вернул false (например, Mcp handler вызван с Function payload)", "action": "залогировать 'tool {name} invoked with incompatible payload' и вернуть FunctionCallError::Fatal"},
+          {"step": 4, "condition": "PreToolUse hook вернул reason", "action": "вернуть FunctionCallError::RespondToModel('Command blocked by PreToolUse hook: {reason}. Command: {command}')"},
+          {"step": 9, "condition": "PostToolUse outcome.should_stop=true", "action": "заменить результат на FunctionToolOutput::from_text с outcome.feedback_message либо stop_reason либо 'PostToolUse hook stopped execution'"},
+          {"step": 9, "condition": "PostToolUse outcome.feedback_message присутствует (без should_stop)", "action": "заменить результат на FunctionToolOutput::from_text(feedback_message, None)"},
+          {"step": 10, "condition": "AfterToolUse hook вернул HookResult::FailedAbort", "action": "залогировать warn и вернуть FunctionCallError::Fatal('after_tool_use hook {name} failed and aborted operation: {error}')"},
+          {"step": 10, "condition": "AfterToolUse hook вернул HookResult::FailedContinue", "action": "залогировать warn и продолжить выполнение (hook не блокирует)"}
+        ],
+        "edge_cases": [
+          {"condition": "MCP payload", "action": "прочитать server_origin через mcp_connection_manager.server_origin(server) для тегов otel"},
+          {"condition": "не успех (Err)", "action": "PostToolUse hook не запускается (post_tool_use_payload только при success)"},
+          {"condition": "tool produced no output (response_cell пуст после Ok)", "action": "вернуть FunctionCallError::Fatal('tool produced no output')"}
+        ],
+        "lifecycle": {
+          "entity": "SRC-0014/entity/tool-invocation",
+          "states": ["pending", "pre_hook_check", "gated_if_mutating", "handler_running", "post_hook", "after_hook", "finalized"],
+          "transition": {
+            "from": "pending",
+            "to": "finalized",
+            "guard": "handler найден + matches_kind + PreToolUse не блокирует + gate освобождён (если is_mutating)",
+            "side_effect": "активирует hooks lifecycle, обновляет turn_state.tool_calls, эмитит otel метрики"
+          }
+        },
+        "ux": null,
+        "result": "AnyToolResult возвращается (call_id, payload, Box<ToolOutput>) или FunctionCallError с привязкой к вызову модели"
+      }
+    },
+    {
+      "id": "SRC-0014/uc.sub/build-tool-call-from-response-item",
+      "src": "SRC-0014",
+      "composition": "use_case",
+      "level": "sub",
+      "strategic_domain": null,
+      "terms": {
+        "actor": "Маршрутизатор инструментов (ToolRouter)",
+        "goal": "Построить ToolCall из элемента ответа модели (ResponseItem) с определением правильного payload",
+        "steps": [
+          "1. ToolRouter принимает ResponseItem от модели",
+          "2. Для FunctionCall — ToolRouter собирает ToolName (namespace, name) и вызывает session.resolve_mcp_tool_info(tool_name)",
+          "3. Если MCP tool разрешён — ToolRouter формирует ToolCall с payload=Mcp{server, tool, raw_arguments}",
+          "4. Иначе ToolRouter формирует ToolCall с payload=Function{arguments}",
+          "5. Для ToolSearchCall с execution='client' — ToolRouter парсит arguments как SearchToolCallParams и формирует ToolCall с tool_name='tool_search' и payload=ToolSearch",
+          "6. Для CustomToolCall — ToolRouter формирует ToolCall с ToolName.plain(name) и payload=Custom{input}",
+          "7. Для LocalShellCall(Exec) — ToolRouter формирует ShellToolCallParams с SandboxPermissions::UseDefault и ToolCall с tool_name='local_shell' и payload=LocalShell{params}"
+        ],
+        "extensions (Cockburn)": [
+          {"step": 5, "condition": "не удалось распарсить SearchToolCallParams", "action": "вернуть FunctionCallError::RespondToModel('failed to parse tool_search arguments: {err}')"},
+          {"step": 5, "condition": "ToolSearchCall с execution != 'client'", "action": "вернуть Ok(None) — не обрабатывать вызов"},
+          {"step": 7, "condition": "LocalShellCall без call_id и без id", "action": "вернуть FunctionCallError::MissingLocalShellCallId"},
+          {"step": 1, "condition": "ResponseItem другого типа (не FunctionCall/ToolSearchCall/CustomToolCall/LocalShellCall)", "action": "вернуть Ok(None) — не tool call"}
+        ],
+        "edge_cases": [
+          {"condition": "LocalShellCall с id но без call_id", "action": "использовать id как call_id (fallback)"}
+        ],
+        "lifecycle": null,
+        "ux": null,
+        "result": "Option<ToolCall> с правильным payload-вариантом, готов к dispatch; или FunctionCallError при невалидных входных данных"
+      }
+    },
+    {
+      "id": "SRC-0014/uc.sub/dispatch-tool-call-with-code-mode",
+      "src": "SRC-0014",
+      "composition": "use_case",
+      "level": "sub",
+      "strategic_domain": null,
+      "terms": {
+        "actor": "Маршрутизатор инструментов (ToolRouter)",
+        "goal": "Направить построенный ToolCall в реестр с учётом режима js_repl_tools_only и источника вызова",
+        "steps": [
+          "1. ToolRouter принимает ToolCall и ToolCallSource (Direct/JsRepl/CodeMode)",
+          "2. ToolRouter определяет direct_js_repl_call = namespace отсутствует и имя в {'js_repl', 'js_repl_reset'}",
+          "3. ToolRouter собирает ToolInvocation с session, turn, tracker, call_id, tool_name, payload",
+          "4. ToolRouter вызывает registry.dispatch_any(invocation) →triggers SRC-0014/uc.sub/dispatch-tool-call"
+        ],
+        "extensions (Cockburn)": [
+          {"step": 2, "condition": "source=Direct и turn.tools_config.js_repl_tools_only=true и не direct_js_repl_call", "action": "вернуть FunctionCallError::RespondToModel('direct tool calls are disabled; use js_repl and codex.tool(...) instead')"}
+        ],
+        "edge_cases": null,
+        "lifecycle": null,
+        "ux": null,
+        "result": "AnyToolResult с результатом обработчика или FunctionCallError при нарушении policy"
+      }
+    },
+    {
+      "id": "SRC-0014/uc.sub/run-tool-with-approval-and-sandbox",
+      "src": "SRC-0014",
+      "composition": "use_case",
+      "level": "sub",
+      "strategic_domain": null,
+      "terms": {
+        "actor": "Оркестратор инструментов (ToolOrchestrator)",
+        "goal": "Выполнить инструмент через approval → sandbox selection → attempt → retry с эскалированной песочницей при denial",
+        "steps": [
+          "1. ToolOrchestrator определяет ExecApprovalRequirement через tool.exec_approval_requirement(req) или fallback на default_exec_approval_requirement(approval_policy, file_system_sandbox_policy)",
+          "2. При Skip — ToolOrchestrator записывает otel tool_decision=Approved с источником Config",
+          "3. При NeedsApproval — ToolOrchestrator собирает ApprovalCtx (с guardian_review_id если routes_approval_to_guardian), вызывает tool.start_approval_async и логирует решение в otel (источник User или AutomatedReviewer)",
+          "4. ToolOrchestrator выбирает initial sandbox: BypassSandboxFirstAttempt → SandboxType::None; иначе sandbox.select_initial(file_system_policy, network_policy, preference, windows_level, managed_network_active)",
+          "5. ToolOrchestrator собирает SandboxAttempt с policy, manager, cwd, legacy_landlock, windows_level/private_desktop",
+          "6. ToolOrchestrator вызывает run_attempt → begin_network_approval → tool.run(req, attempt, ctx) → завершение network approval (Immediate → finish_immediate_network_approval; Deferred → into_deferred или finish_deferred_network_approval при ошибке)",
+          "7. При Ok — ToolOrchestrator возвращает OrchestratorRunResult{output, deferred_network_approval}",
+          "8. При SandboxErr::Denied и tool.escalate_on_failure=true — ToolOrchestrator формирует retry_reason и просит повторное approval (если не bypass), затем повторяет attempt с SandboxType::None (escalated)"
+        ],
+        "extensions (Cockburn)": [
+          {"step": 1, "condition": "ExecApprovalRequirement::Forbidden{reason}", "action": "немедленно вернуть Err(ToolError::Rejected(reason))"},
+          {"step": 3, "condition": "ReviewDecision::Denied или Abort", "action": "вернуть Err(ToolError::Rejected(reason)) — reason = guardian_rejection_message(session, review_id) если use_guardian иначе 'rejected by user'"},
+          {"step": 3, "condition": "ReviewDecision::TimedOut", "action": "вернуть Err(ToolError::Rejected(guardian_timeout_message()))"},
+          {"step": 3, "condition": "ReviewDecision::NetworkPolicyAmendment с action=Deny", "action": "вернуть Err(ToolError::Rejected('rejected by user'))"},
+          {"step": 8, "condition": "tool.escalate_on_failure=false", "action": "вернуть исходную ошибку Sandbox(Denied) без retry"},
+          {"step": 8, "condition": "!tool.wants_no_sandbox_approval(approval_policy) и не allow_on_request_network_prompt", "action": "при approval_policy=Never/OnRequest без network prompt — вернуть исходную Denied без retry"},
+          {"step": 8, "condition": "managed_network_active и network_policy_decision присутствует но network_approval_context отсутствует", "action": "вернуть исходную Denied без попытки эскалации"},
+          {"step": 8, "condition": "повторный approval Denied/Abort", "action": "вернуть Rejected(guardian_rejection_message или 'rejected by user')"},
+          {"step": 8, "condition": "повторный approval TimedOut", "action": "вернуть Rejected(guardian_timeout_message())"}
+        ],
+        "edge_cases": [
+          {"condition": "Deferred network approval и run_result Err", "action": "вызвать finish_deferred_network_approval до возврата ошибки (чтобы не оставить висячее approval)"},
+          {"condition": "Immediate network approval finalize Err", "action": "вернуть эту ошибку вместо run_result"},
+          {"condition": "retry_reason при network denial", "action": "'Network access to \"{host}\" is blocked by policy.'"},
+          {"condition": "retry_reason без network контекста", "action": "build_denial_reason_from_output = 'command failed; retry without sandbox?'"}
+        ],
+        "lifecycle": {
+          "entity": "SRC-0014/entity/sandbox-attempt",
+          "states": ["approval_pending", "initial_attempt_under_sandbox", "denied", "retry_approval_pending", "escalated_attempt_no_sandbox", "completed_or_failed"],
+          "transition": {
+            "from": "denied",
+            "to": "escalated_attempt_no_sandbox",
+            "guard": "escalate_on_failure=true + wants_no_sandbox_approval или allow_on_request_network_prompt + повторный approval Approved",
+            "side_effect": "SandboxAttempt с SandboxType::None и codex_linux_sandbox_exe=None"
+          }
+        },
+        "ux": null,
+        "result": "OrchestratorRunResult<Out>{output, deferred_network_approval} при успехе; ToolError (Rejected или Codex) при отказе"
+      }
+    },
+    {
+      "id": "SRC-0014/uc.sub/handle-tool-call-concurrently",
+      "src": "SRC-0014",
+      "composition": "use_case",
+      "level": "sub",
+      "strategic_domain": null,
+      "terms": {
+        "actor": "Среда исполнения вызовов (ToolCallRuntime)",
+        "goal": "Исполнить tool call с поддержкой параллелизма и отменяемости через CancellationToken",
+        "steps": [
+          "1. ToolCallRuntime принимает ToolCall + CancellationToken",
+          "2. ToolCallRuntime определяет supports_parallel = router.tool_supports_parallel(call)",
+          "3. ToolCallRuntime клонирует Arc-ссылки на router, session, turn, tracker, lock",
+          "4. ToolCallRuntime фиксирует started = Instant::now() и создаёт trace_span с otel.name/tool_name/call_id/aborted=false",
+          "5. ToolCallRuntime спавнит tokio-задачу с AbortOnDropHandle, внутри tokio::select над cancellation и dispatch",
+          "6. В ветви dispatch — ToolCallRuntime берёт guard: если supports_parallel — read-lock parallel_execution, иначе write-lock",
+          "7. ToolCallRuntime вызывает router.dispatch_tool_call_with_code_mode_result(session, turn, tracker, call, source) →triggers SRC-0014/uc.sub/dispatch-tool-call-with-code-mode",
+          "8. ToolCallRuntime возвращает AnyToolResult или FunctionCallError"
+        ],
+        "extensions (Cockburn)": [
+          {"step": 5, "condition": "cancellation_token.cancelled сработал", "action": "записать aborted=true в span и вернуть Ok(Self::aborted_response(&call, secs)) где secs = started.elapsed с минимумом 0.1"},
+          {"step": 5, "condition": "join error от tokio::spawn", "action": "вернуть FunctionCallError::Fatal('tool task failed to receive: {err:?}')"},
+          {"step": 7, "condition": "FunctionCallError::Fatal(message) от handle_tool_call", "action": "преобразовать в Err(CodexErr::Fatal(message))"},
+          {"step": 7, "condition": "другая FunctionCallError от handle_tool_call", "action": "вернуть Ok(failure_response) — ResponseInputItem по типу payload с success=Some(false)"}
+        ],
+        "edge_cases": [
+          {"condition": "supports_parallel=true", "action": "read-lock позволяет нескольким параллельным вызовам; write-lock последовательных ожидает их завершения"},
+          {"condition": "supports_parallel=false", "action": "write-lock — исключительное исполнение, блокирует read-locks и другие write-locks"},
+          {"condition": "abort для shell/container.exec/local_shell/shell_command/unified_exec", "action": "сообщение 'Wall time: {secs:.1} seconds\\naborted by user'"},
+          {"condition": "abort для других инструментов", "action": "сообщение 'aborted by user after {secs:.1}s'"}
+        ],
+        "lifecycle": null,
+        "ux": null,
+        "result": "ResponseInputItem готов к возврату модели (успех, aborted, или failure_response с success=false); либо CodexErr::Fatal при критической ошибке"
+      }
+    },
+    {
+      "id": "SRC-0014/uc.sub/emit-exec-lifecycle-events",
+      "src": "SRC-0014",
+      "composition": "use_case",
+      "level": "sub",
+      "strategic_domain": null,
+      "terms": {
+        "actor": "Эмиттер событий инструмента (ToolEmitter)",
+        "goal": "Эмитить события lifecycle (begin/end) для Shell/UnifiedExec/ApplyPatch с корректным форматированием результата",
+        "steps": [
+          "1. ToolEmitter вызывает begin(ctx) — emit(ctx, ToolEventStage::Begin)",
+          "2. Для Shell/UnifiedExec — эмитить EventMsg::ExecCommandBegin с call_id, process_id, turn_id, command, cwd, parsed_cmd, source, interaction_input",
+          "3. Для ApplyPatch — обновить turn_diff_tracker.on_patch_begin(changes), эмитить EventMsg::PatchApplyBegin с call_id, turn_id, auto_approved, changes",
+          "4. По завершении — ToolEmitter вызывает finish(ctx, Result<ExecToolCallOutput, ToolError>)",
+          "5. При Ok — форматировать content (freeform для Shell freeform=true, иначе structured), создать ToolEventStage::Success; при exit_code==0 result=Ok(content), иначе Err(FunctionCallError::RespondToModel(content))",
+          "6. Для Shell/UnifiedExec — эмитить EventMsg::ExecCommandEnd с stdout, stderr, aggregated_output, exit_code, duration, formatted_output, status (Completed при exit_code==0, иначе Failed)",
+          "7. Для ApplyPatch — эмитить EventMsg::PatchApplyEnd с stdout, stderr, success, changes, status; если turn_diff_tracker доступен — эмитить EventMsg::TurnDiff с unified_diff"
+        ],
+        "extensions (Cockburn)": [
+          {"step": 4, "condition": "Err(CodexErr::Sandbox(Timeout{output})) или Err(CodexErr::Sandbox(Denied{output,...}))", "action": "форматировать output для модели, ToolEventStage::Failure(Output(*output)), Err(RespondToModel(response))"},
+          {"step": 4, "condition": "Err(CodexErr(err)) — прочие Codex-ошибки", "action": "ToolEventStage::Failure(Message('execution error: {err:?}')), Err(RespondToModel(message))"},
+          {"step": 4, "condition": "Err(ToolError::Rejected(msg)) при msg='rejected by user'", "action": "нормализовать: Shell/UnifiedExec→'exec command rejected by user'; ApplyPatch→'patch rejected by user'. ToolEventStage::Failure(Rejected(normalized)), Err(RespondToModel(normalized))"},
+          {"step": 6, "condition": "Failure(Message(m))", "action": "exec_result с stdout='', stderr=m, exit_code=-1, duration=ZERO, status=Failed; эмитить emit_exec_end"},
+          {"step": 6, "condition": "Failure(Rejected(m))", "action": "exec_result с stderr=m, exit_code=-1, status=Declined"},
+          {"step": 7, "condition": "Failure(Message(m)) или Rejected(m) для ApplyPatch", "action": "emit_patch_end с stdout='', stderr=m, success=false, status=Failed (Message) или Declined (Rejected)"},
+          {"step": 7, "condition": "ApplyPatch Success/Output с exit_code!=0", "action": "emit_patch_end с status=PatchApplyStatus::Failed"}
+        ],
+        "edge_cases": [
+          {"condition": "отсутствует turn_diff_tracker у ToolEventCtx", "action": "TurnDiff событие не эмитится"},
+          {"condition": "tracker.get_unified_diff возвращает Err или None", "action": "TurnDiff не эмитится"}
+        ],
+        "lifecycle": {
+          "entity": "SRC-0014/entity/tool-event-stage",
+          "states": ["Begin", "Success", "Failure.Output", "Failure.Message", "Failure.Rejected"],
+          "transition": {
+            "from": "Begin",
+            "to": "Success or Failure.*",
+            "guard": "результат tool.run()",
+            "side_effect": "EventMsg отправляется через session.send_event; для ApplyPatch — TurnDiff"
+          }
+        },
+        "ux": null,
+        "result": "Клиент получает ExecCommandBegin/End или PatchApplyBegin/End + TurnDiff; модель получает content (success) или Err(RespondToModel)"
+      }
+    },
+    {
+      "id": "SRC-0014/uc.sub/format-exec-output-for-model",
+      "src": "SRC-0014",
+      "composition": "use_case",
+      "level": "sub",
+      "strategic_domain": null,
+      "terms": {
+        "actor": "Форматтер вывода команды (tools::mod)",
+        "goal": "Подготовить вывод exec-команды для модели в структурированном (JSON) или свободном формате с усечением",
+        "steps": [
+          "1. Форматтер получает ExecToolCallOutput и TruncationPolicy",
+          "2. Форматтер собирает content через build_content_with_timeout — если timed_out, prepend 'command timed out after {ms} milliseconds\\n{text}', иначе aggregated_output.text",
+          "3. Для structured — Форматтер округляет duration_seconds до 0.1 (duration*10 round /10), применяет formatted_truncate_text, сериализует ExecOutput{output, metadata:{exit_code, duration_seconds}} в JSON",
+          "4. Для freeform — Форматтер считает total_lines, применяет truncate_text, собирает секции 'Exit code: {}', 'Wall time: {duration_seconds} seconds', при усечении 'Total output lines: {total_lines}', 'Output:', форматированный текст — через '\\n'"
+        ],
+        "extensions (Cockburn)": [
+          {"step": 3, "condition": "serde_json::to_string не удался", "action": "panic через expect('serialize ExecOutput') — структура гарантированно сериализуема"},
+          {"step": 4, "condition": "total_lines == formatted_output.lines().count() (не усечено)", "action": "не включать 'Total output lines' секцию"}
+        ],
+        "edge_cases": [
+          {"condition": "timed_out=true", "action": "prepend timeout message перед выводом"}
+        ],
+        "lifecycle": null,
+        "ux": null,
+        "result": "String с JSON-представлением (structured) или plain-text секциями (freeform), готов к возврату модели"
+      }
+    },
+    {
+      "id": "SRC-0014/uc.sub/build-registry-from-config",
+      "src": "SRC-0014",
+      "composition": "use_case",
+      "level": "sub",
+      "strategic_domain": null,
+      "terms": {
+        "actor": "Сборщик реестра инструментов (build_specs_with_discoverable_tools)",
+        "goal": "Построить ToolRegistryBuilder с specs и handlers на основе конфигурации, MCP, discoverable и dynamic tools",
+        "steps": [
+          "1. Сборщик создаёт новый ToolRegistryBuilder",
+          "2. Сборщик готовит McpToolPlanInputs из mcp_tools (map_mcp_tools_for_plan) — собирает mcp_tools и tool_namespaces",
+          "3. Сборщик готовит deferred_mcp_tool_sources если есть deferred_mcp_tools",
+          "4. Сборщик вызывает build_tool_registry_plan с config, mcp/deferred/namespaces, discoverable_tools, dynamic_tools, default_agent_type_description, wait_agent_timeouts(DEFAULT/MIN/MAX_WAIT_TIMEOUT_MS)",
+          "5. Сборщик кладёт в builder все plan.specs через push_spec или push_spec_with_parallel_support(true) если supports_parallel_tool_calls",
+          "6. Сборщик регистрирует handlers по ToolHandlerKind (Shell, UnifiedExec, Plan, ApplyPatch, DynamicTool, ViewImage, Mcp, McpResource, ShellCommand, RequestPermissions, RequestUserInput, ToolSearch, ToolSuggest, CodeModeExecute, CodeModeWait, JsRepl, JsReplReset, ListDir, AgentJobs, CloseAgentV1/V2, SpawnAgentV1/V2, ResumeAgentV1, SendInputV1, SendMessageV2, FollowupTaskV2, ListAgentsV2, WaitAgentV1/V2, TestSync, UnavailableTool)",
+          "7. Для deferred_mcp_tools отсутствующих в mcp_tools — Сборщик регистрирует mcp_handler",
+          "8. Для unavailable_called_tools — Сборщик добавляет placeholder spec с описанием-заглушкой и регистрирует UnavailableToolHandler"
+        ],
+        "extensions (Cockburn)": [
+          {"step": 8, "condition": "code_mode_enabled=true", "action": "применить augment_tool_spec_for_code_mode к placeholder spec"},
+          {"step": 6, "condition": "ToolHandlerKind::ToolSearch при наличии deferred_mcp_tools", "action": "создать ToolSearchHandler один раз и переиспользовать"},
+          {"step": 6, "condition": "регистрация handler с именем, которое уже есть в HashMap", "action": "warn 'overwriting handler for tool {name}'"}
+        ],
+        "edge_cases": [
+          {"condition": "spec name конфликтует с unavailable_called_tool", "action": "existing_spec_names.insert возвращает false — новый spec не добавляется, только handler"}
+        ],
+        "lifecycle": null,
+        "ux": null,
+        "result": "ToolRegistryBuilder готов к build() → (Vec<ConfiguredToolSpec>, ToolRegistry)"
+      }
+    },
+    {
+      "id": "SRC-0014/uc.sub/abort-tool-call",
+      "src": "SRC-0014",
+      "composition": "use_case",
+      "level": "sub",
+      "strategic_domain": null,
+      "terms": {
+        "actor": "Среда исполнения вызовов (ToolCallRuntime)",
+        "goal": "Корректно прервать выполнение инструмента по сигналу отмены и вернуть пользователю понятное сообщение",
+        "steps": [
+          "1. ToolCallRuntime регистрирует started = Instant::now() до spawn задачи",
+          "2. ToolCallRuntime ожидает либо cancellation_token.cancelled либо результат dispatch через tokio::select",
+          "3. При cancellation — ToolCallRuntime вычисляет secs = started.elapsed с минимумом 0.1",
+          "4. ToolCallRuntime записывает aborted=true в dispatch_span",
+          "5. ToolCallRuntime формирует abort_message: для shell-подобных инструментов 'Wall time: {secs:.1} seconds\\naborted by user'; для других 'aborted by user after {secs:.1}s'",
+          "6. ToolCallRuntime создаёт AnyToolResult с AbortedToolOutput{message}",
+          "7. AbortedToolOutput.to_response_item формирует ответ по типу payload"
+        ],
+        "extensions (Cockburn)": [
+          {"step": 7, "condition": "payload=ToolSearch", "action": "ResponseInputItem::ToolSearchOutput с tools=empty, status='completed', execution='client'"},
+          {"step": 7, "condition": "payload=Mcp", "action": "ResponseInputItem::McpToolCallOutput с output=CallToolResult::from_error_text(message)"},
+          {"step": 7, "condition": "payload=Function/Custom/LocalShell", "action": "function_tool_response с InputText=message и success=None"}
+        ],
+        "edge_cases": [
+          {"condition": "tool_name в shell-подобном множестве", "action": "множество = {'shell', 'container.exec', 'local_shell', 'shell_command', 'unified_exec'}"},
+          {"condition": "Instant.elapsed вернул меньше 0.1 сек", "action": "max(0.1) — чтобы UX не показывал 0.0 сек"}
+        ],
+        "lifecycle": null,
+        "ux": null,
+        "result": "Пользователь/модель получают сообщение об отмене с wall-time; успех логируется как false"
+      }
+    },
+    {
+      "id": "SRC-0014/uc.sub/produce-telemetry-preview",
+      "src": "SRC-0014",
+      "composition": "use_case",
+      "level": "sub",
+      "strategic_domain": null,
+      "terms": {
+        "actor": "Телеметрический форматтер (telemetry_preview)",
+        "goal": "Сформировать урезанное превью результата инструмента для log-события, чтобы не превышать бюджет модели/логов",
+        "steps": [
+          "1. Форматтер получает content String и лимиты (TELEMETRY_PREVIEW_MAX_BYTES=2048, TELEMETRY_PREVIEW_MAX_LINES=64)",
+          "2. Форматтер урезает по байтам через take_bytes_at_char_boundary до MAX_BYTES",
+          "3. Форматтер итерирует по строкам до MAX_LINES, собирает preview с '\\n' между",
+          "4. Форматтер проверяет truncated_by_lines (есть ли ещё строки после MAX_LINES)",
+          "5. Если не было урезания по байтам и строкам — вернуть content as-is",
+          "6. Иначе Форматтер добавляет trailing newline (если следующий байт в слайсе = '\\n' или preview не пуст и не заканчивается '\\n') и дописывает TELEMETRY_PREVIEW_TRUNCATION_NOTICE"
+        ],
+        "extensions (Cockburn)": [
+          {"step": 5, "condition": "truncated_by_bytes=false и truncated_by_lines=false", "action": "вернуть content.to_string() без notice"}
+        ],
+        "edge_cases": [
+          {"condition": "preview пуст (0 строк попали)", "action": "не добавлять '\\n' перед notice"},
+          {"condition": "следующий символ после последней выбранной строки = '\\n'", "action": "добавить '\\n' в preview чтобы сохранить границу строки"}
+        ],
+        "lifecycle": null,
+        "ux": null,
+        "result": "String preview ≤ 2 KiB и ≤ 64 строк, с '[... telemetry preview truncated ...]' при усечении"
+      }
+    },
+    {
+      "id": "SRC-0014/uc.sub/truncate-exec-output-to-token-budget",
+      "src": "SRC-0014",
+      "composition": "use_case",
+      "level": "sub",
+      "strategic_domain": null,
+      "terms": {
+        "actor": "Усекатель exec-вывода (ExecCommandToolOutput)",
+        "goal": "Уместить raw_output в бюджет токенов для модели",
+        "steps": [
+          "1. ExecCommandToolOutput принимает raw_output: Vec<u8>",
+          "2. Конвертирует в String через String::from_utf8_lossy (невалидные байты → placeholder)",
+          "3. Разрешает max_tokens = resolve_max_tokens(max_output_tokens)",
+          "4. Применяет formatted_truncate_text(&text, TruncationPolicy::Tokens(max_tokens))",
+          "5. Собирает response_text: секции 'Chunk ID: {}' (если chunk_id не пуст), 'Wall time: {secs:.4} seconds', 'Process exited with code {code}' (если exit_code.Some), 'Process running with session ID {pid}' (если process_id.Some), 'Original token count: {n}' (если Some), 'Output:', truncated text — через '\\n'"
+        ],
+        "extensions (Cockburn)": [
+          {"step": 5, "condition": "chunk_id пуст", "action": "пропустить секцию Chunk ID"},
+          {"step": 5, "condition": "exit_code=None", "action": "пропустить секцию exit code"},
+          {"step": 5, "condition": "process_id=None", "action": "пропустить секцию session ID"},
+          {"step": 5, "condition": "original_token_count=None", "action": "пропустить секцию Original token count"}
+        ],
+        "edge_cases": [
+          {"condition": "post_tool_use_response: process_id=None и session_command=Some", "action": "вернуть Some(JsonValue::String(truncated_output)) — это финальный ответ команды"},
+          {"condition": "post_tool_use_response: process_id=Some или session_command=None", "action": "вернуть None — ещё есть session или контекст не подходит"}
+        ],
+        "lifecycle": null,
+        "ux": null,
+        "result": "Модель получает секционированный текст с метаданными exec и усечённым output; post_tool_use_response опционально передаёт truncated_output для hooks"
+      }
+    },
+    {
+      "id": "SRC-0014/uc.sub/sanitize-mcp-output-for-model",
+      "src": "SRC-0014",
+      "composition": "use_case",
+      "level": "sub",
+      "strategic_domain": null,
+      "terms": {
+        "actor": "Санитайзер MCP-результата (McpToolOutput)",
+        "goal": "Нормализовать MCP-результат для модели — санитизация image detail и добавление заголовка с wall time",
+        "steps": [
+          "1. McpToolOutput берёт payload через result.as_function_call_output_payload()",
+          "2. Если payload.content_items_mut есть — вызывает sanitize_original_image_detail(original_image_detail_supported, items)",
+          "3. Собирает заголовок 'Wall time: {wall_time_seconds:.4} seconds\\nOutput:'",
+          "4. Для Text body — если text пуст, text=header; иначе text='{header}\\n{text}'",
+          "5. Для ContentItems body — вставляет FunctionCallOutputContentItem::InputText{header} в начало списка",
+          "6. Возвращает изменённый FunctionCallOutputPayload"
+        ],
+        "extensions (Cockburn)": [
+          {"step": 2, "condition": "original_image_detail_supported=false", "action": "sanitize_original_image_detail удаляет/нормализует detail поля на изображениях"}
+        ],
+        "edge_cases": null,
+        "lifecycle": null,
+        "ux": null,
+        "result": "FunctionCallOutputPayload с заголовком 'Wall time' и очищенным image detail"
+      }
+    },
+    {
+      "id": "SRC-0014/uc.sub/convert-response-to-code-mode-result",
+      "src": "SRC-0014",
+      "composition": "use_case",
+      "level": "sub",
+      "strategic_domain": null,
+      "terms": {
+        "actor": "Конвертер в code_mode result (response_input_to_code_mode_result)",
+        "goal": "Преобразовать ResponseInputItem в JsonValue для использования в code_mode (js_repl сценарии)",
+        "steps": [
+          "1. Конвертер принимает ResponseInputItem",
+          "2. Для Message{content} — мапит ContentItem::InputText/OutputText в InputText, InputImage в InputImage, затем content_items_to_code_mode_result",
+          "3. Для FunctionCallOutput или CustomToolCallOutput — Text body → JsonValue::String(text); ContentItems → content_items_to_code_mode_result",
+          "4. Для ToolSearchOutput{tools} — JsonValue::Array(tools)",
+          "5. Для McpToolCallOutput{output} — output.code_mode_result(&ToolPayload::Mcp{empty})"
+        ],
+        "extensions (Cockburn)": null,
+        "edge_cases": [
+          {"condition": "InputText.text.trim().is_empty()", "action": "отфильтровать элемент (None)"},
+          {"condition": "InputImage.image_url.trim().is_empty()", "action": "отфильтровать элемент (None)"},
+          {"condition": "пустой items после фильтра", "action": "вернуть JsonValue::String('' — пустая строка)"}
+        ],
+        "lifecycle": null,
+        "ux": null,
+        "result": "JsonValue удобного для js_repl формата (строка склеенная '\\n' или массив tools)"
+      }
+    }
+  ]
+}

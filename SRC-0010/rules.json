@@ -1,0 +1,602 @@
+{
+  "src": "SRC-0010",
+  "schema_version": "2.0",
+  "lens": "rule",
+  "compositions": [
+    {
+      "id": "SRC-0010/rule/responses-websocket-enabled",
+      "src": "SRC-0010",
+      "composition": "rule",
+      "terms": {
+        "condition": "Responses-over-WebSocket транспорт активен в сессии, только если одновременно выполняются ТРИ условия: provider.supports_websockets = true И disable_websockets (AtomicBool в session state) = false И CODEX_RS_SSE_FIXTURE окружение НЕ установлено (OnceLock<Option<...>>.is_some() = false). Если любое из трёх не выполнено — WebSocket отключён для сессии и stream() выбирает HTTP путь",
+        "numbers": null,
+        "formula": "websocket_enabled = provider.supports_websockets AND NOT disable_websockets.load(Relaxed) AND NOT CODEX_RS_SSE_FIXTURE.is_some()",
+        "gwt": {
+          "given": "provider.supports_websockets=true, disable_websockets=false, CODEX_RS_SSE_FIXTURE=None",
+          "when": "responses_websocket_enabled() вызван",
+          "then": "возвращает true; stream() пробует stream_responses_websocket перед HTTP"
+        }
+      }
+    },
+    {
+      "id": "SRC-0010/rule/websocket-connect-timeout",
+      "src": "SRC-0010",
+      "composition": "rule",
+      "terms": {
+        "condition": "WebSocket handshake должен завершиться в пределах provider.websocket_connect_timeout() (per-provider value), иначе connect возвращает ApiError::Transport(TransportError::Timeout) и websocket_session сбрасывается. В тестовой конфигурации (cfg(test)) WEBSOCKET_CONNECT_TIMEOUT = Duration::from_millis(DEFAULT_WEBSOCKET_CONNECT_TIMEOUT_MS) из codex_model_provider_info",
+        "numbers": [
+          {"value": "DEFAULT_WEBSOCKET_CONNECT_TIMEOUT_MS", "kind": "timeout (ms, дефолт из codex_model_provider_info, используется только в cfg(test))"}
+        ],
+        "formula": "elapsed = now() - start; если elapsed > provider.websocket_connect_timeout() → Timeout error",
+        "gwt": {
+          "given": "provider.websocket_connect_timeout() возвращает Duration; WebSocket сервер не отвечает дольше этого интервала",
+          "when": "tokio::time::timeout(timeout, client.connect(...))  истекает",
+          "then": "result = Err(ApiError::Transport(TransportError::Timeout)); reset_websocket_session очищает connection/last_request/last_response_rx, connection_reused=false; telemetry записана с endpoint и error_message"
+        }
+      }
+    },
+    {
+      "id": "SRC-0010/rule/request-compression-policy",
+      "src": "SRC-0010",
+      "composition": "rule",
+      "terms": {
+        "condition": "Сжатие Zstd применяется к Responses API запросу, только если одновременно выполняются ТРИ условия: state.enable_request_compression = true И текущий auth является ChatGPT auth (CodexAuth::is_chatgpt_auth) И провайдер является OpenAI (ModelProviderInfo.is_openai). Если хотя бы одно не выполнено — compression = Compression::None",
+        "numbers": null,
+        "formula": "compression = if (enable_request_compression AND auth.is_some_and(is_chatgpt_auth) AND provider.is_openai()) then Zstd else None",
+        "gwt": {
+          "given": "enable_request_compression=true, auth=Some(ChatGPT), provider.is_openai()=true",
+          "when": "responses_request_compression вызван",
+          "then": "Compression::Zstd; включается в ApiResponsesOptions.compression для HTTP и WebSocket запросов"
+        }
+      }
+    },
+    {
+      "id": "SRC-0010/rule/service-tier-priority-mapping",
+      "src": "SRC-0010",
+      "composition": "rule",
+      "terms": {
+        "condition": "При построении ResponsesApiRequest.service_tier применяется mapping: ServiceTier::Fast → 'priority', прочие варианты → service_tier.to_string(), None → None. Сериализация Fast в 'priority' — явное отличие от обычной Display реализации",
+        "numbers": null,
+        "formula": "service_tier_str = match service_tier { Some(Fast) => Some('priority'), Some(other) => Some(other.to_string()), None => None }",
+        "gwt": {
+          "given": "service_tier = Some(ServiceTier::Fast)",
+          "when": "build_responses_request формирует ResponsesApiRequest",
+          "then": "request.service_tier = Some('priority'); сервер видит строку 'priority' вместо Fast Display-формы"
+        }
+      }
+    },
+    {
+      "id": "SRC-0010/rule/reasoning-inclusion-rule",
+      "src": "SRC-0010",
+      "composition": "rule",
+      "terms": {
+        "condition": "Reasoning блок включается в ResponsesApiRequest, только если model_info.supports_reasoning_summaries = true. В этом случае: effort = effort.or(model_info.default_reasoning_level); summary = None если передан ReasoningSummaryConfig::None, иначе Some(summary). Также include в запросе получает 'reasoning.encrypted_content' когда reasoning is Some, иначе пустой Vec",
+        "numbers": null,
+        "formula": "reasoning = if supports_reasoning_summaries { Some(Reasoning{effort: effort.or(default_reasoning_level), summary: if ReasoningSummaryConfig::None { None } else { Some(summary) }}) } else { None }; include = if reasoning.is_some() { ['reasoning.encrypted_content'] } else { [] }",
+        "gwt": {
+          "given": "model_info.supports_reasoning_summaries=true, effort=None, default_reasoning_level=Some(Medium), summary=ReasoningSummaryConfig::None",
+          "when": "build_responses_request вызван",
+          "then": "reasoning = Some(Reasoning{effort: Some(Medium), summary: None}); include = ['reasoning.encrypted_content']"
+        }
+      }
+    },
+    {
+      "id": "SRC-0010/rule/verbosity-support-gating",
+      "src": "SRC-0010",
+      "composition": "rule",
+      "terms": {
+        "condition": "Verbosity параметр применяется к запросу только если model_info.support_verbosity = true. Если true — verbosity = state.model_verbosity.or(model_info.default_verbosity). Если false и state.model_verbosity is_some — warn лог 'model_verbosity is set but ignored as the model does not support verbosity: {slug}'; verbosity = None",
+        "numbers": null,
+        "formula": "verbosity = if support_verbosity { model_verbosity.or(default_verbosity) } else { if model_verbosity.is_some() warn!; None }",
+        "gwt": {
+          "given": "model_info.support_verbosity=false, state.model_verbosity=Some(High), model_info.slug='o1-preview'",
+          "when": "build_responses_request вызван",
+          "then": "warn лог: 'model_verbosity is set but ignored as the model does not support verbosity: o1-preview'; verbosity=None; text param НЕ содержит verbosity override"
+        }
+      }
+    },
+    {
+      "id": "SRC-0010/rule/store-flag-azure-only",
+      "src": "SRC-0010",
+      "composition": "rule",
+      "terms": {
+        "condition": "Флаг ResponsesApiRequest.store устанавливается true ТОЛЬКО если provider является Azure Responses endpoint (provider.is_azure_responses_endpoint() = true). Для всех прочих провайдеров store = false",
+        "numbers": null,
+        "formula": "store = provider.is_azure_responses_endpoint()",
+        "gwt": {
+          "given": "provider.is_azure_responses_endpoint()=true",
+          "when": "build_responses_request формирует request",
+          "then": "request.store = true"
+        }
+      }
+    },
+    {
+      "id": "SRC-0010/rule/stream-always-true",
+      "src": "SRC-0010",
+      "composition": "rule",
+      "terms": {
+        "condition": "ResponsesApiRequest.stream ВСЕГДА = true (hardcoded в build_responses_request). Этот клиент не поддерживает unary-вариант Responses endpoint — только streaming",
+        "numbers": null,
+        "formula": "stream = true (константа)",
+        "gwt": {
+          "given": "любой prompt",
+          "when": "build_responses_request вызван",
+          "then": "request.stream = true; client получает поток SSE/WebSocket событий"
+        }
+      }
+    },
+    {
+      "id": "SRC-0010/rule/tool-choice-auto",
+      "src": "SRC-0010",
+      "composition": "rule",
+      "terms": {
+        "condition": "ResponsesApiRequest.tool_choice всегда = 'auto' (hardcoded). Модель сама решает когда использовать tools",
+        "numbers": null,
+        "formula": "tool_choice = 'auto' (константа)",
+        "gwt": {
+          "given": "любой prompt с tools",
+          "when": "build_responses_request вызван",
+          "then": "request.tool_choice = 'auto'"
+        }
+      }
+    },
+    {
+      "id": "SRC-0010/rule/prompt-cache-key-conversation-id",
+      "src": "SRC-0010",
+      "composition": "rule",
+      "terms": {
+        "condition": "ResponsesApiRequest.prompt_cache_key = Some(conversation_id.to_string()). Кеш prompt'ов на стороне сервера ключуется по conversation_id; все запросы в одном разговоре имеют одинаковый cache key",
+        "numbers": null,
+        "formula": "prompt_cache_key = Some(state.conversation_id.to_string())",
+        "gwt": {
+          "given": "conversation_id установлен для сессии",
+          "when": "build_responses_request вызван",
+          "then": "request.prompt_cache_key = Some(<conversation_id как строка>); два последовательных запроса в этой сессии разделяют server-side prompt cache"
+        }
+      }
+    },
+    {
+      "id": "SRC-0010/rule/window-id-format",
+      "src": "SRC-0010",
+      "composition": "rule",
+      "terms": {
+        "condition": "x-codex-window-id заголовок формируется как '{conversation_id}:{window_generation}'. window_generation инкрементируется через advance_window_generation или устанавливается через set_window_generation и любое изменение сбрасывает cached_websocket_session",
+        "numbers": [
+          {"value": 0, "kind": "initial window_generation (AtomicU64::new(0) в ModelClient::new)"}
+        ],
+        "formula": "window_id = format!(\"{conversation_id}:{window_generation}\")",
+        "gwt": {
+          "given": "conversation_id='abc-123', window_generation=0 (начальное)",
+          "when": "current_window_id() вызван",
+          "then": "возвращает 'abc-123:0'; этот же формат используется в x-codex-window-id header и client_metadata"
+        }
+      }
+    },
+    {
+      "id": "SRC-0010/rule/shell-tool-recognition",
+      "src": "SRC-0010",
+      "composition": "rule",
+      "terms": {
+        "condition": "Имя tool считается shell tool name если точно равно 'shell' ИЛИ 'container.exec'. Функция is_shell_tool_name используется в reserialize_shell_outputs для распознавания FunctionCall'ов, чей output нужно структурировать при наличии Freeform apply_patch",
+        "numbers": null,
+        "formula": "is_shell = matches!(name, 'shell' | 'container.exec')",
+        "gwt": {
+          "given": "ResponseItem::FunctionCall { name: 'shell', call_id: 'c1' }",
+          "when": "is_shell_tool_name('shell')",
+          "then": "возвращает true; call_id 'c1' добавляется в shell_call_ids и matching output будет структурирован"
+        }
+      }
+    },
+    {
+      "id": "SRC-0010/rule/apply-patch-tool-as-shell",
+      "src": "SRC-0010",
+      "composition": "rule",
+      "terms": {
+        "condition": "Имя tool 'apply_patch' трактуется как shell-подобный tool: CustomToolCall с name='apply_patch' или FunctionCall с name='apply_patch' добавляются в shell_call_ids (помимо shell/container.exec). Reserialization outputs работает для всех трёх",
+        "numbers": null,
+        "formula": "treat_as_shell = (name == 'apply_patch') OR is_shell_tool_name(name)",
+        "gwt": {
+          "given": "ResponseItem::FunctionCall { name: 'apply_patch', call_id: 'c2' }",
+          "when": "reserialize_shell_outputs проходит items",
+          "then": "shell_call_ids.insert('c2'); при встрече FunctionCallOutput с call_id='c2' — output структурируется"
+        }
+      }
+    },
+    {
+      "id": "SRC-0010/rule/structured-shell-output-trigger",
+      "src": "SRC-0010",
+      "composition": "rule",
+      "terms": {
+        "condition": "Reserialization shell outputs (JSON → структурированный текст) выполняется ТОЛЬКО если в prompt.tools присутствует ToolSpec::Freeform(f) с f.name == 'apply_patch'. При Function-варианте apply_patch (не Freeform) — reserialize не вызывается, outputs остаются в JSON",
+        "numbers": null,
+        "formula": "is_freeform_apply_patch_tool_present = tools.iter().any(|t| match t { ToolSpec::Freeform(f) => f.name == 'apply_patch', _ => false })",
+        "gwt": {
+          "given": "prompt.tools содержит ToolSpec::Freeform{name: 'apply_patch'}",
+          "when": "Prompt::get_formatted_input вызван",
+          "then": "reserialize_shell_outputs(&mut input) вызван; shell/container.exec/apply_patch outputs конвертируются в текст с секциями Exit code / Wall time / [Total output lines] / Output"
+        }
+      }
+    },
+    {
+      "id": "SRC-0010/rule/structured-output-format",
+      "src": "SRC-0010",
+      "composition": "rule",
+      "terms": {
+        "condition": "Формат структурированного shell output состоит из секций, объединённых '\\n': 'Exit code: {exit_code}', 'Wall time: {duration_seconds} seconds', опционально 'Total output lines: {N}' (если префикс 'Total output lines: <N>\\n' найден в raw output), 'Output:', <stripped_or_raw output>",
+        "numbers": null,
+        "formula": "structured = ['Exit code: {exit_code}', 'Wall time: {duration_seconds} seconds', opt('Total output lines: {total_lines}'), 'Output:', output].join('\\n')",
+        "gwt": {
+          "given": "ExecOutputJson {output: 'Total output lines: 42\\n\\nhello\\nworld', metadata: {exit_code: 0, duration_seconds: 1.5}}",
+          "when": "build_structured_output вызван",
+          "then": "результат = 'Exit code: 0\\nWall time: 1.5 seconds\\nTotal output lines: 42\\nOutput:\\nhello\\nworld'"
+        }
+      }
+    },
+    {
+      "id": "SRC-0010/rule/incremental-request-same-properties",
+      "src": "SRC-0010",
+      "composition": "rule",
+      "terms": {
+        "condition": "Incremental запрос по WebSocket разрешён только если previous_request и current_request совпадают по ВСЕМ non-input полям (model, instructions, tools, tool_choice, parallel_tool_calls, reasoning, store, stream, include, service_tier, prompt_cache_key, text, client_metadata). Проверка: previous_without_input == request_without_input. Если не равны — trace 'properties didn't match', отправляется полный payload без previous_response_id",
+        "numbers": null,
+        "formula": "incremental_allowed_properties = (previous_request.clone().input=[]) == (request.clone().input=[])",
+        "gwt": {
+          "given": "previous_request и current_request отличаются только по input (prompt_cache_key, tools, reasoning и т.д. одинаковы)",
+          "when": "get_incremental_items вызван",
+          "then": "properties сравнение проходит; переходит к проверке baseline prefix"
+        }
+      }
+    },
+    {
+      "id": "SRC-0010/rule/incremental-request-input-is-extension",
+      "src": "SRC-0010",
+      "composition": "rule",
+      "terms": {
+        "condition": "Incremental запрос разрешён только если request.input является strict extension previous_baseline (baseline = previous_request.input + last_response.items_added). Проверка: request.input.starts_with(&baseline) AND (allow_empty_delta OR baseline.len() < request.input.len()). Если не выполнено — trace 'items didn't match', полный payload. Server-returned output items (items_added) входят в baseline и повторно не отправляются",
+        "numbers": null,
+        "formula": "delta = if request.input.starts_with(baseline) AND (allow_empty_delta OR len(baseline) < len(request.input)) then request.input[len(baseline)..] else NONE; baseline = previous_request.input + last_response.items_added",
+        "gwt": {
+          "given": "previous_request.input = [A, B], last_response.items_added = [C], current_request.input = [A, B, C, D], allow_empty_delta=true",
+          "when": "get_incremental_items вызван",
+          "then": "baseline = [A, B, C]; starts_with=true; delta = [D]; возвращается Some([D])"
+        }
+      }
+    },
+    {
+      "id": "SRC-0010/rule/incremental-requires-response-id",
+      "src": "SRC-0010",
+      "composition": "rule",
+      "terms": {
+        "condition": "Даже если incremental_items успешно вычислен, при last_response.response_id.is_empty() — trace 'no previous response id' и отправляется полный payload без previous_response_id. previous_response_id обязателен для валидной incremental-привязки",
+        "numbers": null,
+        "formula": "if last_response.response_id.is_empty() → full_payload; else → ResponseCreateWsRequest{previous_response_id: Some(last_response.response_id), input: incremental_items, ..payload}",
+        "gwt": {
+          "given": "last_response.response_id='', incremental_items=[D]",
+          "when": "prepare_websocket_request вызван",
+          "then": "возвращается ResponsesWsRequest::ResponseCreate(full_payload) без previous_response_id"
+        }
+      }
+    },
+    {
+      "id": "SRC-0010/rule/fallback-on-upgrade-required",
+      "src": "SRC-0010",
+      "composition": "rule",
+      "terms": {
+        "condition": "WebSocket handshake, возвращающий HTTP 426 UPGRADE_REQUIRED, триггерит fallback на HTTP для текущего запроса (WebsocketStreamOutcome::FallbackToHttp). Stream() активирует try_switch_fallback_transport, который через force_http_fallback отключает WebSocket для ВСЕЙ сессии (disable_websockets.swap(true)). Последующие turn'ы сессии пойдут по HTTP",
+        "numbers": [
+          {"value": 426, "kind": "HTTP status (StatusCode::UPGRADE_REQUIRED)"}
+        ],
+        "formula": "if websocket_connect_error == Http{status: 426} → return WebsocketStreamOutcome::FallbackToHttp; try_switch_fallback_transport → disable_websockets.swap(true); counter('codex.transport.fallback_to_http', 1, ['from_wire_api=responses_websocket'])",
+        "gwt": {
+          "given": "WebSocket handshake получает HTTP 426 UPGRADE_REQUIRED",
+          "when": "stream_responses_websocket в loop attempt",
+          "then": "возврат Ok(FallbackToHttp); stream() вызывает try_switch_fallback_transport; disable_websockets=true; counter fallback_to_http инкрементирован ровно один раз (swap(true) возвращает previous false); все последующие stream вызовы идут через stream_responses_api"
+        }
+      }
+    },
+    {
+      "id": "SRC-0010/rule/retry-once-after-unauthorized-recovery",
+      "src": "SRC-0010",
+      "composition": "rule",
+      "terms": {
+        "condition": "При получении HTTP 401 UNAUTHORIZED для HTTP или WebSocket запроса — выполняется ровно один recovery step через AuthManager.unauthorized_recovery() (если auth_manager is_some И recovery.has_next()). При успехе — loop continue с pending_retry=from_recovery (retry_after_unauthorized=true). При отсутствии auth_manager ИЛИ !has_next() — recovery_not_run, возврат mapped 401 ошибки без retry",
+        "numbers": null,
+        "formula": "if unauthorized { if auth_recovery.has_next() { step_result = recovery.next().await; match step_result { Ok → continue loop with pending_retry, Permanent → CodexErr::RefreshTokenFailed, Transient → CodexErr::Io } } else { recovery_not_run → map_api_error(401) } }",
+        "gwt": {
+          "given": "Первый WebSocket connect вернул 401; auth_recovery.has_next()=true; recovery.next() возвращает Ok(step_result)",
+          "when": "stream_responses_websocket обрабатывает 401",
+          "then": "record_auth_recovery('recovery_succeeded'); pending_retry = PendingUnauthorizedRetry{retry_after_unauthorized:true, recovery_mode:'...', recovery_phase:'...'}; loop continue; next attempt имеет telemetry tag retry_after_unauthorized=true"
+        }
+      }
+    },
+    {
+      "id": "SRC-0010/rule/recovery-permanent-vs-transient",
+      "src": "SRC-0010",
+      "composition": "rule",
+      "terms": {
+        "condition": "Классификация ошибок refresh token: RefreshTokenError::Permanent → CodexErr::RefreshTokenFailed(failed) и telemetry recovery_failed_permanent; RefreshTokenError::Transient(other) → CodexErr::Io(other) и telemetry recovery_failed_transient. Обе прекращают retry (нет continue)",
+        "numbers": null,
+        "formula": "match recovery.next() { Ok → succeeded; Err(Permanent) → RefreshTokenFailed + telemetry 'recovery_failed_permanent'; Err(Transient) → CodexErr::Io + telemetry 'recovery_failed_transient' }",
+        "gwt": {
+          "given": "recovery.next() возвращает Err(RefreshTokenError::Permanent(failed_info))",
+          "when": "handle_unauthorized обрабатывает результат",
+          "then": "session_telemetry.record_auth_recovery(mode, phase, 'recovery_failed_permanent', ..., auth_state_changed=None); emit_feedback_auth_recovery_tags; Err(CodexErr::RefreshTokenFailed(failed_info)); caller прекращает loop"
+        }
+      }
+    },
+    {
+      "id": "SRC-0010/rule/recovery-reason-classification",
+      "src": "SRC-0010",
+      "composition": "rule",
+      "terms": {
+        "condition": "Когда recovery не запускается — classified reason определяется: если auth_recovery=Some(r) но !r.has_next() → recovery_reason = Some(r.unavailable_reason()), mode=r.mode_name(), phase=r.step_name(). Если auth_recovery=None → mode='none', phase='none', recovery_reason=Some('auth_manager_missing')",
+        "numbers": null,
+        "formula": "if auth_recovery.is_some() && !has_next() { (r.mode_name(), r.step_name(), Some(r.unavailable_reason())) } else if auth_recovery.is_none() { ('none', 'none', Some('auth_manager_missing')) }",
+        "gwt": {
+          "given": "auth_manager=None (создан ModelClient без auth_manager)",
+          "when": "stream_responses_api получает 401 и вызывает handle_unauthorized",
+          "then": "record_auth_recovery('none', 'none', 'recovery_not_run', ..., recovery_reason=Some('auth_manager_missing'), auth_state_changed=None); возврат Err(401 mapped)"
+        }
+      }
+    },
+    {
+      "id": "SRC-0010/rule/beta-features-header-non-empty",
+      "src": "SRC-0010",
+      "composition": "rule",
+      "terms": {
+        "condition": "Заголовок 'x-codex-beta-features' добавляется в запрос ТОЛЬКО если state.beta_features_header.is_some() И value != '' И HeaderValue::from_str(value) = Ok. Пустая строка не добавляется. Невалидный header value тоже не добавляется",
+        "numbers": null,
+        "formula": "if let Some(value) = beta_features_header, && !value.is_empty(), && let Ok(header_value) = HeaderValue::from_str(value) → headers.insert('x-codex-beta-features', header_value)",
+        "gwt": {
+          "given": "beta_features_header=Some(''), т.е. пустая строка",
+          "when": "build_responses_headers вызван",
+          "then": "x-codex-beta-features header НЕ добавляется; остальные headers формируются нормально"
+        }
+      }
+    },
+    {
+      "id": "SRC-0010/rule/websockets-v2-beta-header",
+      "src": "SRC-0010",
+      "composition": "rule",
+      "terms": {
+        "condition": "При построении WebSocket handshake headers обязательно добавляется заголовок OpenAI-Beta: 'responses_websockets=2026-02-06' (константа RESPONSES_WEBSOCKETS_V2_BETA_HEADER_VALUE). Этот header подтверждает серверу участие в WebSocket v2 beta. Используется ТОЛЬКО в build_websocket_headers, не в HTTP-пути",
+        "numbers": [
+          {"value": "2026-02-06", "kind": "дата версии beta-фичи WebSocket v2 в OpenAI-Beta header"}
+        ],
+        "formula": "headers.insert('OpenAI-Beta', HeaderValue::from_static('responses_websockets=2026-02-06'))",
+        "gwt": {
+          "given": "build_websocket_headers вызван в context connect_websocket",
+          "when": "handshake headers формируются",
+          "then": "OpenAI-Beta header присутствует со значением 'responses_websockets=2026-02-06'"
+        }
+      }
+    },
+    {
+      "id": "SRC-0010/rule/timing-metrics-header-opt-in",
+      "src": "SRC-0010",
+      "composition": "rule",
+      "terms": {
+        "condition": "Заголовок 'x-responsesapi-include-timing-metrics: true' добавляется в WebSocket handshake headers ТОЛЬКО если state.include_timing_metrics = true. По умолчанию (false) — не отправляется",
+        "numbers": null,
+        "formula": "if state.include_timing_metrics { headers.insert('x-responsesapi-include-timing-metrics', HeaderValue::from_static('true')) }",
+        "gwt": {
+          "given": "include_timing_metrics=true (передан при ModelClient::new)",
+          "when": "build_websocket_headers вызван",
+          "then": "x-responsesapi-include-timing-metrics: true присутствует в handshake"
+        }
+      }
+    },
+    {
+      "id": "SRC-0010/rule/subagent-header-value-mapping",
+      "src": "SRC-0010",
+      "composition": "rule",
+      "terms": {
+        "condition": "x-openai-subagent header заполняется ТОЛЬКО для SessionSource::SubAgent(subagent_source). Маппинг значений: SubAgentSource::Review → 'review', SubAgentSource::Compact → 'compact', SubAgentSource::MemoryConsolidation → 'memory_consolidation', SubAgentSource::ThreadSpawn{..} → 'collab_spawn', SubAgentSource::Other(label) → label.clone(). Для всех прочих SessionSource (Cli/VSCode/Exec/Mcp/Custom/Unknown) header = None",
+        "numbers": null,
+        "formula": "match session_source { SubAgent(Review) → 'review', SubAgent(Compact) → 'compact', SubAgent(MemoryConsolidation) → 'memory_consolidation', SubAgent(ThreadSpawn{..}) → 'collab_spawn', SubAgent(Other(label)) → label, _ → None }",
+        "gwt": {
+          "given": "session_source = SessionSource::SubAgent(SubAgentSource::Compact)",
+          "when": "subagent_header_value(&session_source) вызван",
+          "then": "возвращает Some('compact'); x-openai-subagent: compact добавляется в запросы"
+        }
+      }
+    },
+    {
+      "id": "SRC-0010/rule/parent-thread-id-thread-spawn-only",
+      "src": "SRC-0010",
+      "composition": "rule",
+      "terms": {
+        "condition": "x-codex-parent-thread-id header добавляется ТОЛЬКО для SessionSource::SubAgent(SubAgentSource::ThreadSpawn{parent_thread_id, ..}) → parent_thread_id.to_string(). Для прочих вариантов (включая другие SubAgent типы Review/Compact/MemoryConsolidation/Other) — header = None",
+        "numbers": null,
+        "formula": "match session_source { SubAgent(ThreadSpawn{parent_thread_id, ..}) → Some(parent_thread_id.to_string()), _ (Cli | VSCode | Exec | Mcp | Custom | SubAgent(_) прочие | Unknown) → None }",
+        "gwt": {
+          "given": "session_source = SessionSource::SubAgent(SubAgentSource::ThreadSpawn{parent_thread_id: 'thr-42', ...})",
+          "when": "parent_thread_id_header_value(&session_source) вызван",
+          "then": "возвращает Some('thr-42'); x-codex-parent-thread-id: thr-42 добавляется в запросы"
+        }
+      }
+    },
+    {
+      "id": "SRC-0010/rule/auth-mode-telemetry-label",
+      "src": "SRC-0010",
+      "composition": "rule",
+      "terms": {
+        "condition": "В телеметрии AuthRequestTelemetryContext auth_mode принимает значения: AuthMode::ApiKey → 'ApiKey', AuthMode::Chatgpt и AuthMode::ChatgptAuthTokens → 'Chatgpt' (оба варианта мапятся в одно значение), отсутствие auth → None",
+        "numbers": null,
+        "formula": "match auth_mode { Some(ApiKey) → 'ApiKey', Some(Chatgpt) | Some(ChatgptAuthTokens) → 'Chatgpt', None → None }",
+        "gwt": {
+          "given": "CodexAuth.auth_mode() = AuthMode::ChatgptAuthTokens",
+          "when": "AuthRequestTelemetryContext::new(Some(ChatgptAuthTokens), ...)",
+          "then": "auth_mode = Some('Chatgpt'); telemetry записывает auth_mode='Chatgpt' независимо от внутреннего ChatgptAuthTokens"
+        }
+      }
+    },
+    {
+      "id": "SRC-0010/rule/mpsc-event-channel-buffer",
+      "src": "SRC-0010",
+      "composition": "rule",
+      "terms": {
+        "condition": "Канал доставки событий ResponseEvent от фонового map_response_stream task к consumer ResponseStream имеет ёмкость 1600. При достижении лимита producer блокируется (backpressure) пока consumer не освободит слот",
+        "numbers": [
+          {"value": 1600, "kind": "mpsc channel capacity (client.rs:1571)"}
+        ],
+        "formula": "(tx_event, rx_event) = mpsc::channel::<Result<ResponseEvent>>(1600)",
+        "gwt": {
+          "given": "map_response_stream запущен; consumer не читает события",
+          "when": "producer накопил 1600 событий",
+          "then": "следующая tx_event.send(...).await блокируется до освобождения слота consumer'ом; если rx dropped — send возвращает Err и task завершается"
+        }
+      }
+    },
+    {
+      "id": "SRC-0010/rule/last-response-single-take",
+      "src": "SRC-0010",
+      "composition": "rule",
+      "terms": {
+        "condition": "LastResponse отправляется через oneshot::channel ровно один раз при первом ResponseEvent::Completed (tx_last_response.take() делает Option::None). Последующие Completed события НЕ отсылают новый LastResponse. response_id берётся из первого Completed, items_added — всё накопленное до этого события (std::mem::take)",
+        "numbers": null,
+        "formula": "if let Some(sender) = tx_last_response.take() { sender.send(LastResponse{response_id: response_id.clone(), items_added: std::mem::take(&mut items_added)}) }",
+        "gwt": {
+          "given": "stream выдаёт [OutputItemDone(A), Completed{id='r1'}, OutputItemDone(B), Completed{id='r2'}]",
+          "when": "map_response_stream обрабатывает события",
+          "then": "LastResponse{response_id='r1', items_added=[A]} отправлен один раз; второй Completed не отправляет LastResponse (sender уже None); items_added после take()=[B] — не используется"
+        }
+      }
+    },
+    {
+      "id": "SRC-0010/rule/sse-event-completed-failed-single-log",
+      "src": "SRC-0010",
+      "composition": "rule",
+      "terms": {
+        "condition": "В map_response_stream при получении Err из API stream — session_telemetry.see_event_completed_failed(&mapped) вызывается ТОЛЬКО на первой ошибке (logged_error=false → true). Последующие Err в том же stream продолжают форвардиться в tx_event, но телеметрия failed фиксируется один раз",
+        "numbers": null,
+        "formula": "if !logged_error { session_telemetry.see_event_completed_failed(&mapped); logged_error = true; }",
+        "gwt": {
+          "given": "API stream выдаёт [Err(E1), Err(E2), Err(E3)]",
+          "when": "map_response_stream обрабатывает",
+          "then": "see_event_completed_failed(E1) вызван; E2 и E3 только форвардятся в tx_event без повторного telemetry call; logged_error=true после первой ошибки"
+        }
+      }
+    },
+    {
+      "id": "SRC-0010/rule/warmup-disables-generation",
+      "src": "SRC-0010",
+      "composition": "rule",
+      "terms": {
+        "condition": "При warmup=true в stream_responses_websocket — ws_payload.generate устанавливается в Some(false), что сообщает серверу выполнить только setup без генерации ответа. Ожидается что сервер вернёт Completed после warmup-фазы",
+        "numbers": null,
+        "formula": "if warmup { ws_payload.generate = Some(false) }",
+        "gwt": {
+          "given": "prewarm_websocket вызывает stream_responses_websocket(..., warmup=true, ...)",
+          "when": "ResponseCreateWsRequest формируется",
+          "then": "payload.generate = Some(false); сервер получает v2 response.create с generate=false и возвращает Completed после setup; prewarm ожидает этот Completed через while loop"
+        }
+      }
+    },
+    {
+      "id": "SRC-0010/rule/prewarm-idempotent",
+      "src": "SRC-0010",
+      "composition": "rule",
+      "terms": {
+        "condition": "prewarm_websocket идемпотентен: если last_request уже Some — ранний Ok(()) без повторного прогрева. Если !responses_websocket_enabled() — ранний Ok(()). preconnect_websocket идемпотентен аналогично: если connection уже Some — noop",
+        "numbers": null,
+        "formula": "if !responses_websocket_enabled() || websocket_session.last_request.is_some() { return Ok(()) }",
+        "gwt": {
+          "given": "prewarm_websocket уже вызван успешно (last_request установлен после stream_responses_websocket)",
+          "when": "prewarm_websocket вызван повторно",
+          "then": "ранний Ok(()); без сетевых вызовов"
+        }
+      }
+    },
+    {
+      "id": "SRC-0010/rule/strip-total-output-header-format",
+      "src": "SRC-0010",
+      "composition": "rule",
+      "terms": {
+        "condition": "strip_total_output_header успешен ТОЛЬКО если output начинается с префикса 'Total output lines: ', затем число парсится как u32, затем идёт '\\n'. Ведущий '\\n' после разделителя также удаляется. Если любой шаг fail — возвращается None и original output не изменяется",
+        "numbers": null,
+        "formula": "output.strip_prefix('Total output lines: ')? → split_once('\\n')? → parse::<u32>()? → remainder.strip_prefix('\\n').unwrap_or(remainder)",
+        "gwt": {
+          "given": "output = 'Total output lines: 150\\n\\nline1\\nline2'",
+          "when": "strip_total_output_header(output)",
+          "then": "возвращает Some(('line1\\nline2', 150)); ведущий \\n после '150\\n' удалён"
+        }
+      }
+    },
+    {
+      "id": "SRC-0010/rule/responses-endpoint-routing",
+      "src": "SRC-0010",
+      "composition": "rule",
+      "terms": {
+        "condition": "Request Route telemetry endpoint для разных операций: compact_conversation_history → '/responses/compact' (RESPONSES_COMPACT_ENDPOINT); summarize_memories → '/memories/trace_summarize' (MEMORIES_SUMMARIZE_ENDPOINT); stream_responses_api и stream_responses_websocket и preconnect/connect_websocket → '/responses' (RESPONSES_ENDPOINT)",
+        "numbers": null,
+        "formula": "endpoint = match operation { compact → '/responses/compact', summarize_memories → '/memories/trace_summarize', stream/websocket/preconnect → '/responses' }",
+        "gwt": {
+          "given": "compact_conversation_history вызван",
+          "when": "build_request_telemetry формирует AuthRequestTelemetryContext",
+          "then": "RequestRouteTelemetry::for_endpoint('/responses/compact'); telemetry записывает endpoint='/responses/compact'"
+        }
+      }
+    },
+    {
+      "id": "SRC-0010/rule/window-generation-invalidates-cache",
+      "src": "SRC-0010",
+      "composition": "rule",
+      "terms": {
+        "condition": "Любое изменение window_generation (set_window_generation или advance_window_generation) ОБЯЗАТЕЛЬНО вызывает store_cached_websocket_session(WebsocketSession::default()) — кешированная сессия сбрасывается. Это инвариант: WebSocket-соединение из старого window нельзя переиспользовать в новом window (sticky routing нарушается)",
+        "numbers": null,
+        "formula": "on_window_generation_change { window_generation.store(val) OR fetch_add(1); store_cached_websocket_session(WebsocketSession::default()) }",
+        "gwt": {
+          "given": "window_generation=0, cached_websocket_session содержит валидное connection",
+          "when": "advance_window_generation() вызван",
+          "then": "window_generation=1 (fetch_add); cached_websocket_session = WebsocketSession::default() (connection=None, last_request=None, last_response_rx=None, connection_reused=false); следующий new_session() получит пустую WebsocketSession"
+        }
+      }
+    },
+    {
+      "id": "SRC-0010/rule/connect-reused-false-on-new-connection",
+      "src": "SRC-0010",
+      "composition": "rule",
+      "terms": {
+        "condition": "При успешном открытии нового WebSocket connection (needs_new=true) — connection_reused устанавливается в false. При переиспользовании существующего (needs_new=false, conn.is_closed()=false) — connection_reused=true. В connect_websocket сам telemetry всегда записывается с connection_reused=false (это первичное подключение)",
+        "numbers": null,
+        "formula": "if needs_new { connection = Some(new_conn); set_connection_reused(false) } else { set_connection_reused(true) }",
+        "gwt": {
+          "given": "websocket_session.connection=Some(conn); conn.is_closed()=false",
+          "when": "websocket_connection(params) вызван",
+          "then": "needs_new=false; connection_reused=true; НЕ вызывается ModelClient.connect_websocket; telemetry на уровне WebsocketTelemetry::on_ws_request получит connection_reused=true"
+        }
+      }
+    },
+    {
+      "id": "SRC-0010/rule/drop-restores-cached-session",
+      "src": "SRC-0010",
+      "composition": "rule",
+      "terms": {
+        "condition": "При Drop ModelClientSession — websocket_session (std::mem::take) сохраняется в ModelClient.cached_websocket_session через store_cached_websocket_session. Это позволяет следующему new_session() переиспользовать соединение, если оно ещё живо. Исключение: если force_http_fallback активировал HTTP fallback или window_generation изменилось — cached сбрасывается перед Drop следующей сессии",
+        "numbers": null,
+        "formula": "impl Drop for ModelClientSession { fn drop(&mut self) { let websocket_session = std::mem::take(&mut self.websocket_session); self.client.store_cached_websocket_session(websocket_session); } }",
+        "gwt": {
+          "given": "ModelClientSession завершает turn с активным WebSocket connection",
+          "when": "ModelClientSession выходит из scope (Drop)",
+          "then": "websocket_session перемещается в ModelClient.cached_websocket_session; следующий new_session() получит это connection через take_cached_websocket_session"
+        }
+      }
+    },
+    {
+      "id": "SRC-0010/rule/turn-state-sticky-routing-contract",
+      "src": "SRC-0010",
+      "composition": "rule",
+      "terms": {
+        "condition": "turn_state (Arc<OnceLock<String>>) — sticky routing token с контрактом: получается один раз от сервера в 'x-codex-turn-state' response header в начале turn; затем отправляется обратно без изменений в 'x-codex-turn-state' request header во ВСЕХ последующих запросах того же turn (retry, incremental append, continuation). Между разными turns token НЕ передаётся. Повторное использование ModelClientSession между turns нарушит контракт",
+        "numbers": null,
+        "formula": "turn_state: Arc<OnceLock<String>> — one-write-many-read; header insert если OnceLock::get().is_some() && HeaderValue::from_str(state).is_ok()",
+        "gwt": {
+          "given": "Первый запрос turn'а получил response header 'x-codex-turn-state: token-abc'",
+          "when": "последующие stream/prewarm/connect запросы того же turn формируют headers",
+          "then": "build_responses_headers добавляет 'x-codex-turn-state: token-abc' в каждый запрос; сервер маршрутизирует запросы на тот же backend; в следующем turn новая ModelClientSession создаёт новый Arc<OnceLock::new()> и token не утекает"
+        }
+      }
+    }
+  ]
+}
