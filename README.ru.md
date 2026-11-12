@@ -1,6 +1,6 @@
 # codex-harness-internals
 
-**Язык:** Русский · [English](./README.md)
+**Язык:** Русский · [English](./README.md) · [简体中文](./README.zh-CN.md)
 
 Reverse-engineered спецификация harness Codex CLI (OpenAI) — механики агентского цикла, tools registry, компакции и управления контекстом. Извлечена из исходников репозитория и оформлена как навигируемый knowledge graph для тех, кто строит AI-агенты или пишет инструкции для них.
 
